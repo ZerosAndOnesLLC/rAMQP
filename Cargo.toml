@@ -1,6 +1,6 @@
 [package]
 name = "ramqp"
-version = "0.5.1"
+version = "0.5.2"
 edition = "2024"
 rust-version = "1.85"
 description = "A from-scratch, clean-room AMQP 1.0 client."
@@ -8,6 +8,10 @@ license = "MIT"
 repository = "https://github.com/ZerosAndOnesLLC/rAMQP"
 keywords = ["amqp", "amqp1", "messaging", "tokio", "async"]
 categories = ["network-programming", "asynchronous"]
+
+# Document every feature-gated API (TLS / WebSocket / SCRAM / transactions) on docs.rs.
+[package.metadata.docs.rs]
+all-features = true
 
 [lib]
 name = "ramqp"

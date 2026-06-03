@@ -22,6 +22,10 @@ clients.
   `is_retryable()`/`is_fatal()`, and typed access to any peer-sent error.
 - **Pluggable observability** — a `Metrics` trait and a connection-event stream,
   usable without enabling `tracing`.
+- **Transparent reconnect** — opt in with `ConnectionBuilder::reconnecting(true)`
+  and your `Producer`/`Consumer` handles survive a broker drop: the connection is
+  re-established with backoff, sessions/links are re-attached, and in-flight sends
+  are replayed — all behind the scenes.
 - **`#![forbid(unsafe_code)]`** throughout.
 
 ## Quick start
@@ -88,7 +92,11 @@ Working today (with tests):
 - Link attach/detach, credit/window-gated send with multi-frame split,
   delivery assembly, first/second-stage settlement; producer/consumer handles
   with graceful drop.
-- Reconnect backoff + resilient connect + a health-aware connection pool.
+- Resilience: jittered reconnect backoff, resilient connect, a health-aware
+  connection pool, a bounded fire-and-forget outbox, and **transparent
+  mid-stream reconnect** (re-attach + unsettled replay) via
+  `ConnectionBuilder::reconnecting(true)`.
+- Custom-CA / mutual-TLS / SNI-override `amqps` (`rustls` or `native-tls`).
 - Feature-gated transaction coordinator.
 - Pluggable metrics + connection-event subscription.
 
@@ -105,16 +113,17 @@ RAMQP_BROKER_ADDRESS=/queues/my-queue \
     cargo test --test broker -- --test-threads=1
 ```
 
-**Verified against RabbitMQ 4.3.1**: SASL PLAIN, open/begin/attach over
-`/queues/…` addressing, credit flow, transfer, settlement, and a 100-message
-bulk round-trip all interoperate (the broker identifies the connection as
-AMQP 1.0 and the queue drains cleanly).
+**Verified against live RabbitMQ 4.x and ActiveMQ Artemis**: SASL PLAIN,
+open/begin/attach, credit flow, transfer, settlement, the accept/reject/release/
+modify outcomes, and 100-message bulk round-trips — plus `amqps` (custom-CA TLS),
+AMQP-over-WebSocket, and a transparent reconnect across a mid-stream drop. A 45-second
+soak sustained ~170k messages with flat memory.
 
-In progress: transparent *mid-stream* reconnect with unsettled replay. The
-building blocks are in place — jittered backoff, resilient connect, connection
-pool, snapshot-able settlement state, and the
-[resume decision matrix](src/link/resume.rs) (resend/resume/settle/abort) — the
-remaining work is the supervisor that drives re-attach + replay end to end.
+Roadmap: wire-level link resumption (`transfer.resume` + unsettled-map exchange)
+to upgrade the current re-attach + at-least-once resend to in-place resume, and
+interop coverage for more brokers (Azure Service Bus, Qpid). The
+[resume decision matrix](src/link/resume.rs) (resend/resume/settle/abort) is
+already in place for it.
 
 ## License
 

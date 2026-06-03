@@ -2,7 +2,7 @@
 //!
 //! Both entry points take an established [`TcpStream`] and a DNS name and return
 //! a TLS stream that satisfies [`IoStream`](super::IoStream). Trust and identity
-//! are driven by [`TlsConfig`](super::TlsConfig): the webpki root set by default,
+//! are driven by [`TlsConfig`]: the webpki root set by default,
 //! plus optional private CAs, a client certificate for mutual TLS, an SNI
 //! override, or (test-only) verification bypass.
 
