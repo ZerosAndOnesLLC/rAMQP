@@ -79,6 +79,35 @@ impl Connection {
         })
     }
 
+    /// Build a connection handle around an already-running command sink + driver
+    /// task. Used by the transparent-reconnect supervisor, which presents itself
+    /// as a "virtual driver" so ordinary [`Session`]/producer/consumer handles
+    /// survive reconnects unchanged.
+    pub(crate) fn from_parts(
+        commands: mpsc::Sender<DriverCommand>,
+        events: EventBus,
+        config: Arc<Config>,
+        driver: JoinHandle<Result<(), ConnectError>>,
+    ) -> Connection {
+        Connection {
+            commands,
+            events,
+            config,
+            driver: Some(driver),
+        }
+    }
+
+    /// Decompose into the driver command sink + its join handle, for a
+    /// supervisor that manages the connection lifecycle itself.
+    pub(crate) fn into_driver_parts(
+        self,
+    ) -> (
+        mpsc::Sender<DriverCommand>,
+        JoinHandle<Result<(), ConnectError>>,
+    ) {
+        (self.commands, self.driver.expect("driver present"))
+    }
+
     /// Begin a new session on this connection.
     pub async fn begin_session(&self) -> Result<Session, SessionError> {
         let begin = Begin {
@@ -386,6 +415,171 @@ mod tests {
         session.end().await.unwrap();
         conn.close().await.unwrap();
         broker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn transparent_reconnect_survives_drop() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        // A broker that accepts repeatedly. On the FIRST connection it drops the
+        // socket right after accepting one message; later connections behave
+        // normally. The producer handle must survive the drop transparently.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let url = format!("amqp://127.0.0.1:{port}");
+        let conns = Arc::new(AtomicUsize::new(0));
+
+        let broker = tokio::spawn({
+            let conns = conns.clone();
+            async move {
+                loop {
+                    let Ok((sock, _)) = listener.accept().await else { break };
+                    let epoch = conns.fetch_add(1, Ordering::SeqCst);
+                    // Scope `framed` so it (and its socket) is dropped the moment
+                    // this connection's handling ends — that EOF is how the client
+                    // observes the simulated mid-stream drop.
+                    let mut framed = broker_handshake(sock).await;
+                    let mut delivered = 0u32;
+                    loop {
+                        let frame = match framed.read_frame().await {
+                            Ok(f) => f,
+                            Err(_) => break,
+                        };
+                        match frame.body {
+                            FrameBody::Amqp(Performative::Attach(a), _) => {
+                                framed
+                                    .send_amqp(
+                                        0,
+                                        &Performative::Attach(Attach {
+                                            name: a.name.clone(),
+                                            handle: 0,
+                                            role: Role::Receiver,
+                                            source: Some(Source::default()),
+                                            target: Some(TargetArchetype::from(Target::new("queue"))),
+                                            ..Default::default()
+                                        }),
+                                        None,
+                                    )
+                                    .await
+                                    .unwrap();
+                                framed
+                                    .send_amqp(
+                                        0,
+                                        &Performative::Flow(Flow {
+                                            next_incoming_id: Some(0),
+                                            incoming_window: 100,
+                                            next_outgoing_id: 0,
+                                            outgoing_window: 100,
+                                            handle: Some(0),
+                                            delivery_count: Some(0),
+                                            link_credit: Some(50),
+                                            ..Default::default()
+                                        }),
+                                        None,
+                                    )
+                                    .await
+                                    .unwrap();
+                            }
+                            FrameBody::Amqp(Performative::Transfer(t), _) => {
+                                if let Some(id) = t.delivery_id {
+                                    framed
+                                        .send_amqp(
+                                            0,
+                                            &Performative::Disposition(Disposition {
+                                                role: Role::Receiver,
+                                                first: id,
+                                                last: None,
+                                                settled: true,
+                                                state: Some(DeliveryState::Accepted(Accepted::default())),
+                                                batchable: false,
+                                            }),
+                                            None,
+                                        )
+                                        .await
+                                        .unwrap();
+                                }
+                                delivered += 1;
+                                // Simulate a mid-stream drop on the first connection.
+                                if epoch == 0 && delivered >= 1 {
+                                    break; // drop the socket
+                                }
+                            }
+                            FrameBody::Amqp(Performative::Detach(d), _) => {
+                                framed
+                                    .send_amqp(
+                                        0,
+                                        &Performative::Detach(Detach {
+                                            handle: d.handle,
+                                            closed: true,
+                                            error: None,
+                                        }),
+                                        None,
+                                    )
+                                    .await
+                                    .ok();
+                            }
+                            FrameBody::Amqp(Performative::End(_), _) => {
+                                framed
+                                    .send_amqp(0, &Performative::End(End { error: None }), None)
+                                    .await
+                                    .ok();
+                            }
+                            FrameBody::Amqp(Performative::Close(_), _) => {
+                                framed
+                                    .send_amqp(0, &Performative::Close(Close { error: None }), None)
+                                    .await
+                                    .ok();
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                    // Close this connection's socket now (drop EOF) and accept the
+                    // next (the supervisor's reconnect).
+                    drop(framed);
+                }
+            }
+        });
+
+        let mut config = Config::default();
+        config.connection.reconnect.initial_backoff = Duration::from_millis(20);
+        config.connection.reconnect.max_retries = Some(50);
+        let conn = crate::api::client::ConnectionBuilder::new(&url)
+            .config(config)
+            .reconnecting(true)
+            .connect()
+            .await
+            .unwrap();
+        let session = conn.begin_session().await.unwrap();
+        let producer = session.create_producer("queue").await.unwrap();
+
+        // First send succeeds on the original connection.
+        let o1 = producer.send(Message::text("one")).await.unwrap();
+        assert!(matches!(o1, DeliveryState::Accepted(_)));
+
+        // The broker dropped the connection; the SAME producer must keep working
+        // after the supervisor transparently reconnects + re-attaches.
+        let o2 = tokio::time::timeout(Duration::from_secs(5), producer.send(Message::text("two")))
+            .await
+            .expect("send did not survive the reconnect")
+            .expect("send two");
+        assert!(matches!(o2, DeliveryState::Accepted(_)));
+
+        let o3 = tokio::time::timeout(Duration::from_secs(5), producer.send(Message::text("three")))
+            .await
+            .expect("third send timed out")
+            .expect("send three");
+        assert!(matches!(o3, DeliveryState::Accepted(_)));
+
+        // We reconnected at least once.
+        assert!(conns.load(Ordering::SeqCst) >= 2, "expected a reconnect");
+
+        producer.detach().await.ok();
+        session.end().await.ok();
+        conn.close().await.ok();
+        broker.abort();
     }
 
     #[tokio::test]

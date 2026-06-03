@@ -24,6 +24,7 @@ pub struct ConnectionBuilder {
     metrics: SharedMetrics,
     sasl: Option<SaslProfile>,
     tls: TlsConfig,
+    reconnecting: bool,
 }
 
 impl std::fmt::Debug for ConnectionBuilder {
@@ -46,6 +47,7 @@ impl ConnectionBuilder {
             metrics: noop_metrics(),
             sasl: None,
             tls: TlsConfig::default(),
+            reconnecting: false,
         }
     }
 
@@ -118,6 +120,17 @@ impl ConnectionBuilder {
         self
     }
 
+    /// Make the connection **transparently reconnect**: if the link drops, the
+    /// returned handle (and every [`Session`](crate::Session)/producer/consumer
+    /// derived from it) keeps working — the supervisor re-establishes the
+    /// connection with backoff, re-begins sessions, re-attaches links, and
+    /// replays in-flight sends. Operations issued while disconnected block until
+    /// the link is back. Backoff is governed by `config.connection.reconnect`.
+    pub fn reconnecting(mut self, enabled: bool) -> Self {
+        self.reconnecting = enabled;
+        self
+    }
+
     /// Open the connection.
     pub async fn connect(mut self) -> Result<Connection, ConnectError> {
         let addr = Address::parse(&self.url)?;
@@ -127,6 +140,17 @@ impl ConnectionBuilder {
         let profile = self.sasl.take().unwrap_or_else(|| {
             SaslProfile::from_credentials(addr.username.clone(), addr.password.clone())
         });
-        Connection::establish(addr, self.config, self.metrics, profile, self.tls).await
+        if self.reconnecting {
+            crate::resilience::transparent::connect_supervised(
+                addr,
+                self.config,
+                self.metrics,
+                profile,
+                self.tls,
+            )
+            .await
+        } else {
+            Connection::establish(addr, self.config, self.metrics, profile, self.tls).await
+        }
     }
 }
