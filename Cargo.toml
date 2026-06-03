@@ -1,6 +1,6 @@
 [package]
 name = "ramqp"
-version = "0.2.2"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.85"
 description = "A from-scratch, clean-room AMQP 1.0 client."
@@ -29,7 +29,7 @@ tracing = "0.1"
 [features]
 default = []
 # TLS backends
-rustls = ["dep:tokio-rustls", "dep:rustls", "dep:webpki-roots"]
+rustls = ["dep:tokio-rustls", "dep:rustls", "dep:webpki-roots", "dep:rustls-pemfile"]
 native-tls = ["dep:tokio-native-tls", "dep:native-tls"]
 # WebSocket transport
 ws = ["dep:tokio-tungstenite", "dep:http"]
@@ -52,6 +52,10 @@ features = ["ring", "std", "tls12"]
 
 [dependencies.webpki-roots]
 version = "0.26"
+optional = true
+
+[dependencies.rustls-pemfile]
+version = "2"
 optional = true
 
 [dependencies.tokio-native-tls]

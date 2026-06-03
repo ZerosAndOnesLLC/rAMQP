@@ -53,10 +53,11 @@ impl Connection {
         config: Config,
         metrics: SharedMetrics,
         profile: SaslProfile,
+        tls: crate::transport::TlsConfig,
     ) -> Result<Connection, ConnectError> {
         let config = Arc::new(config);
 
-        let mut stream = transport::connect(&addr).await?;
+        let mut stream = transport::connect(&addr, &tls).await?;
 
         // SASL layer: header → mechanism negotiation → AMQP header.
         ProtocolHeader::SASL.negotiate(&mut stream).await?;

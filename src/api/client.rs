@@ -5,7 +5,7 @@ use crate::config::Config;
 use crate::error::ConnectError;
 use crate::observe::{SharedMetrics, noop_metrics};
 use crate::sasl::SaslProfile;
-use crate::transport::Address;
+use crate::transport::{Address, TlsConfig};
 
 /// Fluent builder for opening a [`Connection`].
 ///
@@ -23,6 +23,7 @@ pub struct ConnectionBuilder {
     config: Config,
     metrics: SharedMetrics,
     sasl: Option<SaslProfile>,
+    tls: TlsConfig,
 }
 
 impl std::fmt::Debug for ConnectionBuilder {
@@ -31,6 +32,7 @@ impl std::fmt::Debug for ConnectionBuilder {
             .field("url", &self.url)
             .field("config", &self.config)
             .field("sasl", &self.sasl)
+            .field("tls", &self.tls)
             .finish_non_exhaustive()
     }
 }
@@ -43,6 +45,7 @@ impl ConnectionBuilder {
             config: Config::default(),
             metrics: noop_metrics(),
             sasl: None,
+            tls: TlsConfig::default(),
         }
     }
 
@@ -76,6 +79,45 @@ impl ConnectionBuilder {
         self
     }
 
+    /// Replace the full TLS configuration used for `amqps://` / `wss://`.
+    pub fn tls(mut self, tls: TlsConfig) -> Self {
+        self.tls = tls;
+        self
+    }
+
+    /// Trust an additional CA certificate (PEM) for TLS, on top of the webpki
+    /// roots. Call multiple times to add several.
+    pub fn add_root_ca_pem(mut self, pem: impl Into<Vec<u8>>) -> Self {
+        self.tls.root_ca_pem.push(pem.into());
+        self
+    }
+
+    /// Present a client certificate chain + private key (PEM) for mutual TLS.
+    pub fn client_auth_pem(mut self, cert_chain: impl Into<Vec<u8>>, key: impl Into<Vec<u8>>) -> Self {
+        self.tls.client_auth_pem = Some((cert_chain.into(), key.into()));
+        self
+    }
+
+    /// Override the server name used for SNI and certificate verification.
+    pub fn tls_server_name(mut self, name: impl Into<String>) -> Self {
+        self.tls.server_name = Some(name.into());
+        self
+    }
+
+    /// Whether the webpki (Mozilla) root set is trusted (default `true`). Turn
+    /// off to trust *only* the CAs added via [`add_root_ca_pem`](Self::add_root_ca_pem).
+    pub fn webpki_roots(mut self, enabled: bool) -> Self {
+        self.tls.webpki_roots = enabled;
+        self
+    }
+
+    /// **DANGER** — disable TLS certificate verification. Test-only; never use
+    /// against a production broker.
+    pub fn danger_accept_invalid_certs(mut self, accept: bool) -> Self {
+        self.tls.danger_accept_invalid_certs = accept;
+        self
+    }
+
     /// Open the connection.
     pub async fn connect(mut self) -> Result<Connection, ConnectError> {
         let addr = Address::parse(&self.url)?;
@@ -85,6 +127,6 @@ impl ConnectionBuilder {
         let profile = self.sasl.take().unwrap_or_else(|| {
             SaslProfile::from_credentials(addr.username.clone(), addr.password.clone())
         });
-        Connection::establish(addr, self.config, self.metrics, profile).await
+        Connection::establish(addr, self.config, self.metrics, profile, self.tls).await
     }
 }

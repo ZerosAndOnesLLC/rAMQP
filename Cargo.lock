@@ -919,7 +919,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "ramqp"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "base64",
  "bytes",
@@ -933,6 +933,7 @@ dependencies = [
  "pbkdf2",
  "pin-project-lite",
  "rustls",
+ "rustls-pemfile",
  "sha1",
  "sha2",
  "slab",
@@ -1075,6 +1076,15 @@ dependencies = [
  "rustls-webpki",
  "subtle",
  "zeroize",
+]
+
+[[package]]
+name = "rustls-pemfile"
+version = "2.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dce314e5fee3f39953d46bb63bb8a46d40c2f8fb7cc5a3b6cab2bde9721d6e50"
+dependencies = [
+ "rustls-pki-types",
 ]
 
 [[package]]

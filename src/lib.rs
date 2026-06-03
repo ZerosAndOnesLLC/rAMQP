@@ -52,4 +52,5 @@ pub use api::{Connection, ConnectionBuilder, Consumer, Producer, Session};
 pub use config::Config;
 pub use link::Delivery;
 pub use resilience::{Pool, PoolBuilder};
+pub use transport::TlsConfig;
 pub use types::messaging::Message;

@@ -25,6 +25,53 @@ use crate::error::{ConnectError, ErrorKind};
 pub trait IoStream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> IoStream for T {}
 
+/// TLS trust and identity configuration for `amqps://` / `wss://`.
+///
+/// By default the client trusts the bundled Mozilla webpki root set. Use this to
+/// add a private CA, present a client certificate for mutual TLS, override the
+/// verified server name, or — for testing only — disable verification.
+#[derive(Clone)]
+pub struct TlsConfig {
+    /// Additional trust-anchor CA certificates, PEM-encoded (one or more certs
+    /// per entry). Trusted in addition to the webpki roots when those are on.
+    pub root_ca_pem: Vec<Vec<u8>>,
+    /// Also trust the bundled Mozilla webpki roots (default: `true`).
+    pub webpki_roots: bool,
+    /// Client certificate chain + private key, PEM-encoded, for mutual TLS.
+    pub client_auth_pem: Option<(Vec<u8>, Vec<u8>)>,
+    /// Override the server name used for SNI and certificate verification
+    /// (otherwise the URL host is used).
+    pub server_name: Option<String>,
+    /// **DANGER** — accept any server certificate without verification. Intended
+    /// only for tests against self-signed brokers; never enable in production.
+    pub danger_accept_invalid_certs: bool,
+}
+
+impl Default for TlsConfig {
+    fn default() -> Self {
+        TlsConfig {
+            root_ca_pem: Vec::new(),
+            webpki_roots: true,
+            client_auth_pem: None,
+            server_name: None,
+            danger_accept_invalid_certs: false,
+        }
+    }
+}
+
+impl std::fmt::Debug for TlsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never print key material.
+        f.debug_struct("TlsConfig")
+            .field("root_ca_pem", &format_args!("[{} CA blob(s)]", self.root_ca_pem.len()))
+            .field("webpki_roots", &self.webpki_roots)
+            .field("client_auth_pem", &self.client_auth_pem.is_some())
+            .field("server_name", &self.server_name)
+            .field("danger_accept_invalid_certs", &self.danger_accept_invalid_certs)
+            .finish()
+    }
+}
+
 /// The URL scheme of a connection address.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scheme {
@@ -246,30 +293,31 @@ impl AsyncWrite for Transport {
 }
 
 /// Connect to `addr`, performing TLS and/or WebSocket layering per its scheme.
-pub async fn connect(addr: &Address) -> Result<Transport, ConnectError> {
+/// `tls` supplies trust/identity material for the `amqps://` and `wss://` paths.
+pub async fn connect(addr: &Address, tls: &TlsConfig) -> Result<Transport, ConnectError> {
     match addr.scheme {
         Scheme::Amqp => Ok(Transport::Tcp(connect_tcp(addr).await?)),
         Scheme::Amqps => {
             let tcp = connect_tcp(addr).await?;
-            connect_tls(tcp, &addr.host).await
+            connect_tls(tcp, &addr.host, tls).await
         }
         Scheme::Ws => connect_ws_plain(addr).await,
-        Scheme::Wss => connect_ws_tls(addr).await,
+        Scheme::Wss => connect_ws_tls(addr, tls).await,
     }
 }
 
 #[cfg(feature = "rustls")]
-async fn connect_tls(tcp: TcpStream, host: &str) -> Result<Transport, ConnectError> {
-    Ok(Transport::Rustls(tls::connect_rustls(tcp, host).await?))
+async fn connect_tls(tcp: TcpStream, host: &str, tls: &TlsConfig) -> Result<Transport, ConnectError> {
+    Ok(Transport::Rustls(tls::connect_rustls(tcp, host, tls).await?))
 }
 
 #[cfg(all(feature = "native-tls", not(feature = "rustls")))]
-async fn connect_tls(tcp: TcpStream, host: &str) -> Result<Transport, ConnectError> {
-    Ok(Transport::NativeTls(tls::connect_native_tls(tcp, host).await?))
+async fn connect_tls(tcp: TcpStream, host: &str, tls: &TlsConfig) -> Result<Transport, ConnectError> {
+    Ok(Transport::NativeTls(tls::connect_native_tls(tcp, host, tls).await?))
 }
 
 #[cfg(not(any(feature = "rustls", feature = "native-tls")))]
-async fn connect_tls(_tcp: TcpStream, _host: &str) -> Result<Transport, ConnectError> {
+async fn connect_tls(_tcp: TcpStream, _host: &str, _tls: &TlsConfig) -> Result<Transport, ConnectError> {
     Err(ConnectError::msg(
         ErrorKind::Tls,
         "amqps:// requires the `rustls` or `native-tls` feature",
@@ -292,15 +340,15 @@ async fn connect_ws_plain(_addr: &Address) -> Result<Transport, ConnectError> {
 }
 
 #[cfg(all(feature = "ws", feature = "rustls"))]
-async fn connect_ws_tls(addr: &Address) -> Result<Transport, ConnectError> {
+async fn connect_ws_tls(addr: &Address, tls: &TlsConfig) -> Result<Transport, ConnectError> {
     let tcp = connect_tcp(addr).await?;
-    let tls = tls::connect_rustls(tcp, &addr.host).await?;
+    let stream = tls::connect_rustls(tcp, &addr.host, tls).await?;
     let url = format!("wss://{}:{}/{}", addr.host, addr.port, addr.path);
-    Ok(Transport::Wss(ws::connect_ws(tls, &url).await?))
+    Ok(Transport::Wss(ws::connect_ws(stream, &url).await?))
 }
 
 #[cfg(not(all(feature = "ws", feature = "rustls")))]
-async fn connect_ws_tls(_addr: &Address) -> Result<Transport, ConnectError> {
+async fn connect_ws_tls(_addr: &Address, _tls: &TlsConfig) -> Result<Transport, ConnectError> {
     Err(ConnectError::msg(
         ErrorKind::Tls,
         "wss:// requires both the `ws` and `rustls` features",
