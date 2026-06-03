@@ -93,6 +93,7 @@ impl Consumer {
         self.commands
             .send(DriverCommand::SendDisposition {
                 channel: self.channel,
+                handle: self.handle,
                 first: delivery.delivery_id,
                 last: None,
                 state,

@@ -91,6 +91,8 @@ pub enum DriverCommand {
     SendDisposition {
         /// The owning session's channel.
         channel: ChannelId,
+        /// The receiver link handle (so the driver can honor its settle mode).
+        handle: Handle,
         /// First delivery id in the (inclusive) range.
         first: DeliveryId,
         /// Last delivery id in the range (defaults to `first`).

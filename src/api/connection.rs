@@ -160,11 +160,10 @@ mod tests {
     };
     use crate::types::sasl::{SaslCode, SaslFrame, SaslMechanisms, SaslOutcome};
 
-    /// A minimal AMQP broker that completes the SASL + AMQP handshakes and then
-    /// echoes one message in each direction.
-    async fn mock_broker(stream: TcpStream) {
+    /// Complete the SASL + AMQP handshakes and a `begin`, returning the framed
+    /// transport positioned just after the session is mapped.
+    async fn broker_handshake(stream: TcpStream) -> FramedTransport<TcpStream> {
         let mut stream = stream;
-        // SASL header exchange.
         let mut hdr = [0u8; 8];
         stream.read_exact(&mut hdr).await.unwrap();
         stream
@@ -186,7 +185,6 @@ mod tests {
             }))
             .await
             .unwrap();
-        // AMQP header exchange.
         let mut hdr2 = [0u8; 8];
         framed.stream_mut().read_exact(&mut hdr2).await.unwrap();
         framed
@@ -194,7 +192,6 @@ mod tests {
             .write_all(&ProtocolHeader::AMQP.to_bytes())
             .await
             .unwrap();
-        // open + begin
         let _ = framed.read_frame().await.unwrap();
         framed
             .send_amqp(0, &Performative::Open(Open::new("broker")), None)
@@ -215,7 +212,12 @@ mod tests {
             )
             .await
             .unwrap();
+        framed
+    }
 
+    /// A minimal AMQP broker that echoes one message in each direction.
+    async fn mock_broker(stream: TcpStream) {
+        let mut framed = broker_handshake(stream).await;
         let mut sent_to_consumer = false;
         let mut current_delivery: Option<u32> = None;
         loop {
@@ -474,5 +476,144 @@ mod tests {
         session.end().await.unwrap();
         conn.close().await.unwrap();
         broker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn second_mode_settlement() {
+        use crate::types::definitions::ReceiverSettleMode;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let unsettled_seen = Arc::new(AtomicBool::new(false));
+        let flag = unsettled_seen.clone();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let url = format!("amqp://127.0.0.1:{port}");
+        let broker = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let mut framed = broker_handshake(sock).await;
+            loop {
+                let frame = match framed.read_frame().await {
+                    Ok(f) => f,
+                    Err(_) => break,
+                };
+                match frame.body {
+                    FrameBody::Amqp(Performative::Attach(a), _) => {
+                        framed
+                            .send_amqp(
+                                0,
+                                &Performative::Attach(Attach {
+                                    name: a.name.clone(),
+                                    handle: 0,
+                                    role: Role::Sender,
+                                    rcv_settle_mode: ReceiverSettleMode::Second,
+                                    source: Some(Source::new("queue")),
+                                    target: Some(TargetArchetype::from(Target::default())),
+                                    initial_delivery_count: Some(0),
+                                    ..Default::default()
+                                }),
+                                None,
+                            )
+                            .await
+                            .unwrap();
+                    }
+                    FrameBody::Amqp(Performative::Flow(f), _) => {
+                        if f.link_credit.unwrap_or(0) > 0 {
+                            let body = to_vec(&Message::text("second"));
+                            framed
+                                .send_amqp(
+                                    0,
+                                    &Performative::Transfer(Transfer {
+                                        handle: 0,
+                                        delivery_id: Some(0),
+                                        delivery_tag: Some(Bytes::from_static(b"d")),
+                                        message_format: Some(0),
+                                        settled: Some(false),
+                                        more: false,
+                                        ..Default::default()
+                                    }),
+                                    Some(&body),
+                                )
+                                .await
+                                .unwrap();
+                        }
+                    }
+                    FrameBody::Amqp(Performative::Disposition(d), _) => {
+                        // In `second` mode the consumer proposes the outcome unsettled.
+                        if !d.settled {
+                            flag.store(true, Ordering::Relaxed);
+                        }
+                        // The sender then confirms (settled) to complete settlement.
+                        framed
+                            .send_amqp(
+                                0,
+                                &Performative::Disposition(Disposition {
+                                    role: Role::Sender,
+                                    first: d.first,
+                                    last: d.last,
+                                    settled: true,
+                                    state: Some(DeliveryState::Accepted(Accepted::default())),
+                                    batchable: false,
+                                }),
+                                None,
+                            )
+                            .await
+                            .unwrap();
+                    }
+                    FrameBody::Amqp(Performative::Detach(d), _) => {
+                        framed
+                            .send_amqp(
+                                0,
+                                &Performative::Detach(Detach {
+                                    handle: d.handle,
+                                    closed: true,
+                                    error: None,
+                                }),
+                                None,
+                            )
+                            .await
+                            .unwrap();
+                    }
+                    FrameBody::Amqp(Performative::End(_), _) => {
+                        framed
+                            .send_amqp(0, &Performative::End(End { error: None }), None)
+                            .await
+                            .unwrap();
+                    }
+                    FrameBody::Amqp(Performative::Close(_), _) => {
+                        framed
+                            .send_amqp(0, &Performative::Close(Close { error: None }), None)
+                            .await
+                            .unwrap();
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        let mut config = Config::default();
+        config.link.receiver_settle_mode = ReceiverSettleMode::Second;
+        let conn = crate::api::client::ConnectionBuilder::new(&url)
+            .config(config)
+            .connect()
+            .await
+            .unwrap();
+        let session = conn.begin_session().await.unwrap();
+        let mut consumer = session.create_consumer("queue").await.unwrap();
+        let delivery = consumer.recv().await.unwrap();
+        assert_eq!(delivery.message().unwrap(), Message::text("second"));
+        consumer.accept(&delivery).await.unwrap();
+
+        consumer.detach().await.unwrap();
+        session.end().await.unwrap();
+        conn.close().await.unwrap();
+        broker.await.unwrap();
+
+        assert!(
+            unsettled_seen.load(Ordering::Relaxed),
+            "a second-mode consumer must send an unsettled disposition first"
+        );
     }
 }

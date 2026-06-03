@@ -261,6 +261,7 @@ impl<S: IoStream> Driver<S> {
             }
             DriverCommand::SendDisposition {
                 channel,
+                handle,
                 first,
                 last,
                 state,
@@ -268,7 +269,14 @@ impl<S: IoStream> Driver<S> {
                 reply,
             } => {
                 if let Some(session) = self.sessions.get_mut(&channel.value()) {
-                    session.send_disposition(first, last, state, settled, &mut self.transport);
+                    session.send_disposition(
+                        handle.value(),
+                        first,
+                        last,
+                        state,
+                        settled,
+                        &mut self.transport,
+                    );
                     if let Some(reply) = reply {
                         let _ = reply.send(Ok(()));
                     }

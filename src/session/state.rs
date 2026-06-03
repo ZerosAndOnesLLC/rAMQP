@@ -26,7 +26,7 @@ use crate::session::registry::{HandleAllocator, RemoteHandleMap};
 use crate::session::window::SessionWindows;
 use crate::transport::IoStream;
 use crate::transport::frame::FramedTransport;
-use crate::types::definitions::{Error as AmqpError, Role};
+use crate::types::definitions::{Error as AmqpError, ReceiverSettleMode, Role};
 use crate::types::messaging::{Accepted, DeliveryState};
 use crate::types::performatives::{Attach, Begin, Detach, Disposition, End, Flow, Performative, Transfer};
 
@@ -234,6 +234,8 @@ impl Session {
             link.set_remote_handle(attach.handle);
             link.mark_attached();
             if let Link::Receiver(r) = link {
+                // Adopt the peer's agreed receiver settle mode (first vs second).
+                r.settle_mode = attach.rcv_settle_mode;
                 if let Some(idc) = attach.initial_delivery_count {
                     r.credit.delivery_count = idc;
                 }
@@ -561,9 +563,11 @@ impl Session {
         }
     }
 
-    /// Emit a disposition for received deliveries (consumer settle).
+    /// Emit a disposition for received deliveries (consumer settle), honoring the
+    /// link's settle mode.
     pub fn send_disposition<S: IoStream>(
         &mut self,
+        handle: u32,
         first: DeliveryId,
         last: Option<DeliveryId>,
         state: DeliveryState,
@@ -572,22 +576,31 @@ impl Session {
     ) {
         let f = first.value();
         let l = last.map(|x| x.value()).unwrap_or(f);
+
+        // A `second` receiver proposes the outcome unsettled first; the local
+        // settle happens when the sender confirms (handled in `on_disposition`).
+        let second_mode = matches!(
+            self.links.get(&handle),
+            Some(Link::Receiver(r)) if r.settle_mode == ReceiverSettleMode::Second
+        );
+        let wire_settled = settled && !second_mode;
+
         let disposition = Disposition {
             role: Role::Receiver,
             first: f,
             last: last.map(|x| x.value()),
-            settled,
+            settled: wire_settled,
             state: Some(state.clone()),
             batchable: false,
         };
         transport.queue_amqp(self.local_channel, &Performative::Disposition(disposition), None);
-        for link in self.links.values_mut() {
-            if let Link::Receiver(r) = link {
-                if !r.unsettled.is_empty() {
-                    let affected = r.unsettled.apply_disposition(f, l, Some(&state), settled);
-                    if settled {
-                        self.metrics.on_inflight(-(affected.len() as i64));
-                    }
+
+        // Apply only to the owning link (no full-table scan).
+        if let Some(Link::Receiver(r)) = self.links.get_mut(&handle) {
+            if !r.unsettled.is_empty() {
+                let affected = r.unsettled.apply_disposition(f, l, Some(&state), wire_settled);
+                if wire_settled {
+                    self.metrics.on_inflight(-(affected.len() as i64));
                 }
             }
         }
