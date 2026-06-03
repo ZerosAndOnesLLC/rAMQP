@@ -332,6 +332,37 @@ mod tests {
         assert!(decode_frame(&mut buf, 4).is_err());
     }
 
+    #[test]
+    fn malformed_frames_never_panic() {
+        use crate::types::performatives::Transfer;
+        // A valid frame, then every truncation and single-byte corruption of it,
+        // must decode to Ok/Err — never panic (fault-injection robustness).
+        let mut full = BytesMut::new();
+        encode_amqp_frame(
+            &mut full,
+            0,
+            &Performative::Transfer(Transfer {
+                handle: 1,
+                delivery_id: Some(1),
+                delivery_tag: Some(bytes::Bytes::from_static(b"t")),
+                ..Default::default()
+            }),
+            Some(b"a multi-byte payload"),
+        );
+        let full = full.freeze();
+
+        for cut in 0..=full.len() {
+            let mut buf = BytesMut::from(&full[..cut]);
+            let _ = decode_frame(&mut buf, 1 << 20);
+        }
+        for i in 0..full.len() {
+            let mut v = full.to_vec();
+            v[i] ^= 0xff;
+            let mut buf = BytesMut::from(&v[..]);
+            let _ = decode_frame(&mut buf, 1 << 20);
+        }
+    }
+
     #[tokio::test]
     async fn framed_transport_over_duplex() {
         let (client, server) = tokio::io::duplex(4096);

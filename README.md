@@ -86,11 +86,23 @@ Working today (with tests):
 - Connection open/close, heartbeat, channel mux.
 - Session begin/end with flow-control windows.
 - Link attach/detach, credit/window-gated send with multi-frame split,
-  delivery assembly, settlement; producer/consumer handles with graceful drop.
+  delivery assembly, first/second-stage settlement; producer/consumer handles
+  with graceful drop.
+- Reconnect backoff + resilient connect + a health-aware connection pool.
+- Feature-gated transaction coordinator.
 - Pluggable metrics + connection-event subscription.
 
-In progress: automatic reconnect/replay supervision, connection pool,
-transactions, broker interop suite, and benchmarks.
+### Tests & benchmarks
+
+```sh
+cargo test                                  # unit + mock-peer integration
+cargo bench --bench codec                   # codec/framing micro-benchmarks
+RAMQP_BROKER_URL=amqp://guest:guest@localhost:5672 \
+    cargo test --test broker                # real-broker interop (skipped if unset)
+```
+
+In progress: transparent *mid-stream* reconnect with unsettled replay (the
+backoff/pool building blocks and snapshot-able settlement state are in place).
 
 ## License
 
