@@ -101,8 +101,11 @@ RAMQP_BROKER_URL=amqp://guest:guest@localhost:5672 \
     cargo test --test broker                # real-broker interop (skipped if unset)
 ```
 
-In progress: transparent *mid-stream* reconnect with unsettled replay (the
-backoff/pool building blocks and snapshot-able settlement state are in place).
+In progress: transparent *mid-stream* reconnect with unsettled replay. The
+building blocks are in place — jittered backoff, resilient connect, connection
+pool, snapshot-able settlement state, and the
+[resume decision matrix](src/link/resume.rs) (resend/resume/settle/abort) — the
+remaining work is the supervisor that drives re-attach + replay end to end.
 
 ## License
 
