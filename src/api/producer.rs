@@ -66,6 +66,11 @@ impl Producer {
     }
 
     /// Send a message pre-settled (fire-and-forget; no disposition awaited).
+    ///
+    /// This trades flow control for throughput: messages are buffered locally
+    /// while awaiting broker credit, so a sustained fire-and-forget burst against
+    /// a slow broker can grow memory unbounded. Use [`send`](Producer::send) when
+    /// you need the credit→disposition loop to back-pressure the producer.
     pub async fn send_settled(&self, message: Message) -> Result<(), SendError> {
         self.commands
             .send(DriverCommand::SendTransfer {

@@ -83,3 +83,45 @@ async fn many_messages_roundtrip() {
 
     conn.close().await.expect("close");
 }
+
+/// SCRAM-SHA-256 authentication against the broker (requires the `scram`
+/// feature: `cargo test --test broker --features scram`).
+#[cfg(feature = "scram")]
+#[tokio::test]
+async fn scram_sha256_auth() {
+    let Some(url) = broker_url() else {
+        eprintln!("skipping scram test: set RAMQP_BROKER_URL to run");
+        return;
+    };
+    use ramqp::sasl::{SaslProfile, ScramMechanism};
+
+    let user = std::env::var("RAMQP_BROKER_USER").unwrap_or_else(|_| "guest".into());
+    let pass = std::env::var("RAMQP_BROKER_PASS").unwrap_or_else(|_| "guest".into());
+
+    let result = ramqp::ConnectionBuilder::new(&url)
+        .sasl(SaslProfile::Scram {
+            mechanism: ScramMechanism::Sha256,
+            username: user,
+            password: pass,
+        })
+        .connect()
+        .await;
+
+    match result {
+        Ok(conn) => {
+            // Beginning a session proves the AMQP layer came up after SCRAM auth.
+            let session = conn.begin_session().await.expect("begin");
+            session.end().await.ok();
+            conn.close().await.expect("close");
+        }
+        // Many brokers (e.g. default RabbitMQ) don't advertise SCRAM; that's a
+        // broker-config matter, not a client failure, so skip rather than fail.
+        Err(e)
+            if e.kind() == ramqp::error::ErrorKind::Sasl
+                && format!("{e}").contains("does not offer") =>
+        {
+            eprintln!("skipping scram test: broker does not offer SCRAM-SHA-256");
+        }
+        Err(e) => panic!("SCRAM-SHA-256 connect failed: {e}"),
+    }
+}
