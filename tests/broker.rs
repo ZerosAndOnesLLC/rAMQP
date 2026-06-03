@@ -15,6 +15,13 @@ fn broker_url() -> Option<String> {
     std::env::var("RAMQP_BROKER_URL").ok()
 }
 
+/// The node address to produce/consume against. Brokers differ: RabbitMQ 4.x
+/// uses `/queues/<name>`, Artemis uses the bare queue name. Override with
+/// `RAMQP_BROKER_ADDRESS`.
+fn broker_address() -> String {
+    std::env::var("RAMQP_BROKER_ADDRESS").unwrap_or_else(|_| "ramqp.integration.queue".to_string())
+}
+
 #[tokio::test]
 async fn produce_consume_roundtrip() {
     let Some(url) = broker_url() else {
@@ -22,7 +29,8 @@ async fn produce_consume_roundtrip() {
         return;
     };
 
-    let address = "ramqp.integration.queue";
+    let address = broker_address();
+    let address = address.as_str();
     let conn = Connection::open(&url).await.expect("connect");
     let session = conn.begin_session().await.expect("begin session");
 
@@ -53,7 +61,8 @@ async fn many_messages_roundtrip() {
         return;
     };
 
-    let address = "ramqp.integration.bulk";
+    let address = broker_address();
+    let address = address.as_str();
     let conn = Connection::open(&url).await.expect("connect");
     let session = conn.begin_session().await.expect("begin session");
     let producer = session.create_producer(address).await.expect("producer");

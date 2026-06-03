@@ -97,9 +97,18 @@ Working today (with tests):
 ```sh
 cargo test                                  # unit + mock-peer integration
 cargo bench --bench codec                   # codec/framing micro-benchmarks
+
+# Real-broker interop (skipped unless RAMQP_BROKER_URL is set). Example against
+# RabbitMQ 4.x (which speaks AMQP 1.0 natively); declare the queue first:
 RAMQP_BROKER_URL=amqp://guest:guest@localhost:5672 \
-    cargo test --test broker                # real-broker interop (skipped if unset)
+RAMQP_BROKER_ADDRESS=/queues/my-queue \
+    cargo test --test broker -- --test-threads=1
 ```
+
+**Verified against RabbitMQ 4.3.1**: SASL PLAIN, open/begin/attach over
+`/queues/…` addressing, credit flow, transfer, settlement, and a 100-message
+bulk round-trip all interoperate (the broker identifies the connection as
+AMQP 1.0 and the queue drains cleanly).
 
 In progress: transparent *mid-stream* reconnect with unsettled replay. The
 building blocks are in place — jittered backoff, resilient connect, connection
