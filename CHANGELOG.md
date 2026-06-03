@@ -9,9 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - Repository hygiene: community health files (`CONTRIBUTING`, `SECURITY`,
-  `CODE_OF_CONDUCT`, this changelog, issue/PR templates), GitHub Actions CI
-  (check / test / fmt / clippy `-D warnings` / docs / MSRV) and a tag-driven
-  crates.io release workflow.
+  `CODE_OF_CONDUCT`, `SUPPORT`, this changelog, issue/PR templates), GitHub
+  Actions CI (check / test / fmt / clippy `-D warnings` / docs / MSRV) and a
+  tag-driven crates.io release workflow.
 - The tree is now `cargo clippy -D warnings` and `cargo fmt` clean.
 
 No library or public-API changes from 0.5.3.
