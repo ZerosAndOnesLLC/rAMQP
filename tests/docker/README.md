@@ -37,17 +37,42 @@ RAMQP_TLS_ADDRESS=/queues/ramqp_it \
   cargo test --features rustls --test tls -- --test-threads=1
 ```
 
-## ActiveMQ Artemis (second broker; AMQP + WebSocket)
+## ActiveMQ Artemis (second broker)
 
 ```sh
-docker run -d --name ramqp-artemis -p 61616:61616 -p 5445:5445 \
+# Map the container's AMQP-only acceptor (5672) to host 5673 to avoid clashing
+# with RabbitMQ. The multiplexed 61616 acceptor mis-detects AMQP, so prefer 5672.
+docker run -d --name ramqp-artemis -p 61616:61616 -p 5673:5672 -p 8161:8161 \
   -e ARTEMIS_USER=admin -e ARTEMIS_PASSWORD=admin \
   apache/activemq-artemis:latest-alpine
 
-# Artemis auto-creates addresses; use the bare queue name.
-RAMQP_BROKER_URL=amqp://admin:admin@localhost:61616 \
+# Pre-create an ANYCAST (queue-semantics) address — Artemis auto-creates
+# MULTICAST by default, which drops messages sent before a subscriber exists:
+docker exec ramqp-artemis /var/lib/artemis-instance/bin/artemis queue create \
+  --name ramqp.it --address ramqp.it --anycast --durable \
+  --preserve-on-no-consumers --auto-create-address \
+  --url tcp://localhost:61616 --user admin --password admin --silent
+
+RAMQP_BROKER_URL=amqp://admin:admin@localhost:5673 \
 RAMQP_BROKER_ADDRESS=ramqp.it \
   cargo test --test broker -- --test-threads=1
+```
+
+Note: Artemis validates `terminus-expiry-policy` strictly (an empty symbol is
+rejected — this is what surfaced the `Default` fix). The single-node dev
+container also holds connections for a 60s TTL, so running all six tests
+back-to-back can stall fresh handshakes; the suite retries connects to absorb
+this. Interop itself (lifecycle, 100-message bulk, modify/redelivery) is solid.
+
+## WebSocket (`ws://`)
+
+Most brokers don't expose AMQP-over-WebSocket, so `tests/ws.rs` runs an
+in-process WS→TCP bridge in front of a plain-AMQP broker:
+
+```sh
+RAMQP_WS_BROKER_TCP=127.0.0.1:5672 \
+RAMQP_WS_ADDRESS=/queues/ramqp_it \
+  cargo test --features ws --test ws -- --test-threads=1
 ```
 
 ## Soak

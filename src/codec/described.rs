@@ -277,10 +277,22 @@ macro_rules! amqp_composite {
         }
     ) => {
         $(#[$meta])*
-        #[derive(Debug, Clone, PartialEq, Default)]
+        #[derive(Debug, Clone, PartialEq)]
         #[allow(missing_docs)]
         $vis struct $name {
             $( $(#[$fmeta])* pub $fname : $fty , )*
+        }
+
+        // `Default` honors each field's declared default — in particular a
+        // `default(expr)` field defaults to `expr` (the spec value), not the
+        // type's own `Default` (e.g. `expiry_policy` defaults to `session-end`,
+        // never an empty symbol, which strict brokers reject).
+        impl ::core::default::Default for $name {
+            fn default() -> Self {
+                Self {
+                    $( $fname : $crate::amqp_composite!(@default $kind ( $($karg)* )) , )*
+                }
+            }
         }
 
         impl $crate::codec::Encode for $name {
@@ -311,6 +323,13 @@ macro_rules! amqp_composite {
     (@enc $fw:ident, $self:ident, $fname:ident, default ( $def:expr )) => { $fw.field(&$self.$fname); };
     (@enc $fw:ident, $self:ident, $fname:ident, symbols ( )) => { $fw.symbols(&$self.$fname); };
     (@enc $fw:ident, $self:ident, $fname:ident, req_symbols ( $($n:tt)* )) => { $fw.symbols_required(&$self.$fname); };
+
+    // ---- default arms (field-aware `Default::default`) ----
+    (@default req ( $($n:tt)* )) => { ::core::default::Default::default() };
+    (@default opt ( )) => { ::core::option::Option::None };
+    (@default default ( $def:expr )) => { $def };
+    (@default symbols ( )) => { ::std::vec::Vec::new() };
+    (@default req_symbols ( $($n:tt)* )) => { ::std::vec::Vec::new() };
 
     // ---- decode arms ----
     (@dec $d:ident, req ( $n:expr )) => { $d.req($n)? };

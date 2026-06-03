@@ -12,13 +12,14 @@
 use std::time::Duration;
 
 use ramqp::types::messaging::{DeliveryState, Modified};
-use ramqp::{Connection, Message, Session};
+use ramqp::{Connection, Consumer, Delivery, Message, Session};
 
 fn broker_url() -> Option<String> {
     std::env::var("RAMQP_BROKER_URL").ok()
 }
 
-/// Drain any leftover messages on `address` so an outcome test starts clean.
+/// Drain any leftover messages on `address` so a test starts from a clean queue
+/// (brokers persist durable queues across runs; tests share one queue).
 /// Accepts everything until a short idle gap proves the queue is empty.
 async fn drain(session: &Session, address: &str) {
     if let Ok(mut c) = session.create_consumer(address).await {
@@ -27,6 +28,33 @@ async fn drain(session: &Session, address: &str) {
         }
         c.detach().await.ok();
     }
+}
+
+/// Receive within a bounded time so a missing delivery fails the test fast
+/// instead of hanging the whole suite.
+async fn recv_within(consumer: &mut Consumer, secs: u64) -> Delivery {
+    tokio::time::timeout(Duration::from_secs(secs), consumer.recv())
+        .await
+        .expect("recv timed out waiting for a delivery")
+        .expect("recv")
+}
+
+/// Connect, retrying a few transient failures. Single-node broker dev containers
+/// (notably Artemis, which holds connections for a 60s TTL) can briefly refuse a
+/// fresh handshake under the suite's rapid open/close churn; a real client
+/// retries, so the interop suite does too.
+async fn open_conn(url: &str) -> Connection {
+    let mut last = String::new();
+    for attempt in 0..6 {
+        match Connection::open(url).await {
+            Ok(c) => return c,
+            Err(e) => {
+                last = format!("{e:?}");
+                tokio::time::sleep(Duration::from_millis(400 * (attempt + 1))).await;
+            }
+        }
+    }
+    panic!("connect failed after retries: {last}");
 }
 
 /// The node address to produce/consume against. Brokers differ: RabbitMQ 4.x
@@ -45,8 +73,9 @@ async fn produce_consume_roundtrip() {
 
     let address = broker_address();
     let address = address.as_str();
-    let conn = Connection::open(&url).await.expect("connect");
+    let conn = open_conn(&url).await;
     let session = conn.begin_session().await.expect("begin session");
+    drain(&session, address).await;
 
     let producer = session.create_producer(address).await.expect("producer");
     let outcome = producer
@@ -59,7 +88,7 @@ async fn produce_consume_roundtrip() {
     );
 
     let mut consumer = session.create_consumer(address).await.expect("consumer");
-    let delivery = consumer.recv().await.expect("recv");
+    let delivery = recv_within(&mut consumer, 10).await;
     consumer.accept(&delivery).await.expect("accept");
 
     producer.detach().await.ok();
@@ -77,8 +106,9 @@ async fn many_messages_roundtrip() {
 
     let address = broker_address();
     let address = address.as_str();
-    let conn = Connection::open(&url).await.expect("connect");
+    let conn = open_conn(&url).await;
     let session = conn.begin_session().await.expect("begin session");
+    drain(&session, address).await;
     let producer = session.create_producer(address).await.expect("producer");
 
     const N: usize = 100;
@@ -91,7 +121,7 @@ async fn many_messages_roundtrip() {
 
     let mut consumer = session.create_consumer(address).await.expect("consumer");
     for _ in 0..N {
-        let delivery = consumer.recv().await.expect("recv");
+        let delivery = recv_within(&mut consumer, 10).await;
         consumer.accept(&delivery).await.expect("accept");
     }
 
@@ -106,7 +136,7 @@ async fn release_redelivers() {
         return;
     };
     let address = broker_address();
-    let conn = Connection::open(&url).await.expect("connect");
+    let conn = open_conn(&url).await;
     let session = conn.begin_session().await.expect("session");
     drain(&session, &address).await;
 
@@ -142,7 +172,7 @@ async fn reject_drops() {
         return;
     };
     let address = broker_address();
-    let conn = Connection::open(&url).await.expect("connect");
+    let conn = open_conn(&url).await;
     let session = conn.begin_session().await.expect("session");
     drain(&session, &address).await;
 
@@ -174,7 +204,7 @@ async fn modify_requeues() {
         return;
     };
     let address = broker_address();
-    let conn = Connection::open(&url).await.expect("connect");
+    let conn = open_conn(&url).await;
     let session = conn.begin_session().await.expect("session");
     drain(&session, &address).await;
 
@@ -219,7 +249,7 @@ async fn produce_outcome_is_accepted() {
         return;
     };
     let address = broker_address();
-    let conn = Connection::open(&url).await.expect("connect");
+    let conn = open_conn(&url).await;
     let session = conn.begin_session().await.expect("session");
     drain(&session, &address).await;
     let producer = session.create_producer(&address).await.expect("producer");
@@ -227,7 +257,7 @@ async fn produce_outcome_is_accepted() {
     assert!(matches!(outcome, DeliveryState::Accepted(_)), "got {outcome:?}");
     // clean up
     let mut c = session.create_consumer(&address).await.expect("consumer");
-    let d = c.recv().await.expect("recv");
+    let d = recv_within(&mut c, 10).await;
     c.accept(&d).await.ok();
     conn.close().await.expect("close");
 }

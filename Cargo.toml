@@ -1,6 +1,6 @@
 [package]
 name = "ramqp"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 rust-version = "1.85"
 description = "A from-scratch, clean-room AMQP 1.0 client."
@@ -103,6 +103,8 @@ optional = true
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 criterion = "0.5"
+# Server side of the WebSocket bridge used by the live `ws` interop test.
+tokio-tungstenite = "0.24"
 
 [[bench]]
 name = "codec"
