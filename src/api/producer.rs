@@ -50,6 +50,18 @@ impl Producer {
 
     /// Send a message and await its terminal delivery state (the outcome the
     /// peer settled with — `Accepted`, `Rejected`, …).
+    ///
+    /// # Examples
+    /// ```no_run
+    /// # async fn ex(producer: &ramqp::Producer) -> Result<(), Box<dyn std::error::Error>> {
+    /// use ramqp::{Message, types::messaging::DeliveryState};
+    ///
+    /// match producer.send(Message::text("order-42")).await? {
+    ///     DeliveryState::Accepted(_) => println!("durably enqueued"),
+    ///     other => eprintln!("broker did not accept: {other:?}"),
+    /// }
+    /// # Ok(()) }
+    /// ```
     pub async fn send(&self, message: Message) -> Result<DeliveryState, SendError> {
         self.send_bytes(to_bytes(&message).freeze(), false).await
     }
@@ -82,6 +94,17 @@ impl Producer {
     /// memory unbounded. Set `max_outbox = 0` to opt back into unbounded
     /// buffering. Use [`send`](Producer::send) when you need the full
     /// credit→disposition loop and the broker's terminal outcome.
+    ///
+    /// # Examples
+    /// ```no_run
+    /// # async fn ex(producer: &ramqp::Producer) -> Result<(), Box<dyn std::error::Error>> {
+    /// use ramqp::Message;
+    /// // Fire a burst; the bounded outbox back-pressures instead of buffering forever.
+    /// for i in 0..1000 {
+    ///     producer.send_settled(Message::text(format!("event-{i}"))).await?;
+    /// }
+    /// # Ok(()) }
+    /// ```
     pub async fn send_settled(&self, message: Message) -> Result<(), SendError> {
         let body = to_bytes(&message).freeze();
         match &self.outbox {

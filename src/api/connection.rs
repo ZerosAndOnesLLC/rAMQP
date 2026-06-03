@@ -31,6 +31,25 @@ pub struct Connection {
 impl Connection {
     /// Open a connection to `url` with default config (PLAIN if the URL carries
     /// credentials, else ANONYMOUS).
+    ///
+    /// # Examples
+    /// ```no_run
+    /// # async fn ex() -> Result<(), Box<dyn std::error::Error>> {
+    /// use ramqp::{Connection, Message};
+    ///
+    /// let conn = Connection::open("amqp://guest:guest@localhost:5672").await?;
+    /// let session = conn.begin_session().await?;
+    ///
+    /// let producer = session.create_producer("my-queue").await?;
+    /// producer.send(Message::text("hello")).await?;
+    ///
+    /// let mut consumer = session.create_consumer("my-queue").await?;
+    /// let delivery = consumer.recv().await?;
+    /// consumer.accept(&delivery).await?;
+    ///
+    /// conn.close().await?;
+    /// # Ok(()) }
+    /// ```
     pub async fn open(url: &str) -> Result<Connection, ConnectError> {
         crate::api::client::ConnectionBuilder::new(url).connect().await
     }

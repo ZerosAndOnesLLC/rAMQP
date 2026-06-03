@@ -59,6 +59,22 @@ impl Consumer {
     /// the broker can never push more than this handle can buffer (preventing a
     /// slow consumer from back-pressuring its whole connection). In manual mode
     /// call [`credit`](Consumer::credit) yourself.
+    ///
+    /// # Examples
+    /// ```no_run
+    /// # async fn ex(consumer: &mut ramqp::Consumer) -> Result<(), Box<dyn std::error::Error>> {
+    /// loop {
+    ///     let delivery = consumer.recv().await?;
+    ///     match delivery.message() {
+    ///         Ok(msg) => {
+    ///             println!("got {msg:?}");
+    ///             consumer.accept(&delivery).await?;   // settle: done with it
+    ///         }
+    ///         Err(_) => consumer.reject(&delivery, None).await?, // can't parse → reject
+    ///     }
+    /// }
+    /// # }
+    /// ```
     pub async fn recv(&mut self) -> Result<Delivery, RecvError> {
         loop {
             match self.events.recv().await {

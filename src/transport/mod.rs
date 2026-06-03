@@ -30,6 +30,24 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> IoStream for T {}
 /// By default the client trusts the bundled Mozilla webpki root set. Use this to
 /// add a private CA, present a client certificate for mutual TLS, override the
 /// verified server name, or — for testing only — disable verification.
+///
+/// The fields are usually set through the [`ConnectionBuilder`](crate::ConnectionBuilder)
+/// helpers (`add_root_ca_pem`, `client_auth_pem`, `tls_server_name`, …), which
+/// require the `rustls` or `native-tls` feature.
+///
+/// # Examples
+/// Connect to a broker behind a private CA:
+/// ```no_run
+/// # async fn ex() -> Result<(), Box<dyn std::error::Error>> {
+/// use ramqp::ConnectionBuilder;
+///
+/// let ca = std::fs::read("internal-ca.pem")?;
+/// let conn = ConnectionBuilder::new("amqps://broker.internal:5671")
+///     .add_root_ca_pem(ca)      // trust our CA in addition to the webpki roots
+///     .connect()
+///     .await?;
+/// # let _ = conn; Ok(()) }
+/// ```
 #[derive(Clone)]
 pub struct TlsConfig {
     /// Additional trust-anchor CA certificates, PEM-encoded (one or more certs

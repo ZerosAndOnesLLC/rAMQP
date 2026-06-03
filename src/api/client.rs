@@ -126,6 +126,24 @@ impl ConnectionBuilder {
     /// connection with backoff, re-begins sessions, re-attaches links, and
     /// replays in-flight sends. Operations issued while disconnected block until
     /// the link is back. Backoff is governed by `config.connection.reconnect`.
+    ///
+    /// # Examples
+    /// ```no_run
+    /// # async fn ex() -> Result<(), Box<dyn std::error::Error>> {
+    /// use ramqp::{ConnectionBuilder, Message};
+    ///
+    /// let conn = ConnectionBuilder::new("amqp://localhost:5672")
+    ///     .reconnecting(true)
+    ///     .connect()
+    ///     .await?;
+    /// let session = conn.begin_session().await?;
+    /// let producer = session.create_producer("durable-queue").await?;
+    ///
+    /// // If the broker restarts here, `producer` keeps working — the send simply
+    /// // waits out the reconnect instead of failing.
+    /// producer.send(Message::text("survives drops")).await?;
+    /// # Ok(()) }
+    /// ```
     pub fn reconnecting(mut self, enabled: bool) -> Self {
         self.reconnecting = enabled;
         self
