@@ -67,6 +67,7 @@ impl Session {
             self.channel,
             attached,
             evt_rx,
+            self.config.link.max_outbox,
         ))
     }
 
@@ -147,6 +148,7 @@ impl Session {
             self.channel,
             attached,
             evt_rx,
+            self.config.link.max_outbox,
         )))
     }
 

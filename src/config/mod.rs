@@ -121,6 +121,11 @@ pub struct LinkConfig {
     pub receiver_settle_mode: ReceiverSettleMode,
     /// Maximum message size we accept on the link (`None` = unlimited).
     pub max_message_size: Option<u64>,
+    /// Maximum number of unwritten fire-and-forget
+    /// ([`send_settled`](crate::Producer::send_settled)) messages buffered while
+    /// awaiting broker credit, before the call back-pressures. `0` disables the
+    /// bound (unbounded buffering — the pre-0.3 behavior).
+    pub max_outbox: usize,
 }
 
 impl Default for LinkConfig {
@@ -133,6 +138,7 @@ impl Default for LinkConfig {
             sender_settle_mode: SenderSettleMode::Mixed,
             receiver_settle_mode: ReceiverSettleMode::First,
             max_message_size: None,
+            max_outbox: 8192,
         }
     }
 }
@@ -169,6 +175,7 @@ impl Config {
                     initial: 100,
                     refill_threshold: 50,
                 },
+                max_outbox: 1024,
                 ..LinkConfig::default()
             },
         }
@@ -194,6 +201,7 @@ impl Config {
                     initial: 10_000,
                     refill_threshold: 5_000,
                 },
+                max_outbox: 65_536,
                 ..LinkConfig::default()
             },
         }

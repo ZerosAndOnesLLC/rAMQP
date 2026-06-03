@@ -1,7 +1,9 @@
 //! The [`Producer`] handle (WP-5.4): send messages on a sender link.
 
+use std::sync::Arc;
+
 use bytes::Bytes;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Semaphore, mpsc, oneshot};
 
 use crate::api::lifecycle::detach_on_drop;
 use crate::codec::to_bytes;
@@ -18,6 +20,10 @@ pub struct Producer {
     handle: Handle,
     #[allow(dead_code)]
     events: mpsc::Receiver<LinkEvent>,
+    /// Bounds buffered fire-and-forget sends: one permit per unwritten
+    /// [`send_settled`](Self::send_settled) message, released when the driver
+    /// writes it. `None` = unbounded (`max_outbox == 0`).
+    outbox: Option<Arc<Semaphore>>,
 }
 
 impl Producer {
@@ -26,12 +32,14 @@ impl Producer {
         channel: ChannelId,
         handle: Handle,
         events: mpsc::Receiver<LinkEvent>,
+        max_outbox: usize,
     ) -> Self {
         Producer {
             commands,
             channel,
             handle,
             events,
+            outbox: (max_outbox > 0).then(|| Arc::new(Semaphore::new(max_outbox))),
         }
     }
 
@@ -67,22 +75,56 @@ impl Producer {
 
     /// Send a message pre-settled (fire-and-forget; no disposition awaited).
     ///
-    /// This trades flow control for throughput: messages are buffered locally
-    /// while awaiting broker credit, so a sustained fire-and-forget burst against
-    /// a slow broker can grow memory unbounded. Use [`send`](Producer::send) when
-    /// you need the credit→disposition loop to back-pressure the producer.
+    /// This trades the disposition round-trip for throughput, but is bounded:
+    /// at most `max_outbox` (see [`LinkConfig`](crate::config::LinkConfig))
+    /// unwritten messages may be buffered while awaiting broker credit, after
+    /// which the call back-pressures (awaits an outbox slot) rather than growing
+    /// memory unbounded. Set `max_outbox = 0` to opt back into unbounded
+    /// buffering. Use [`send`](Producer::send) when you need the full
+    /// credit→disposition loop and the broker's terminal outcome.
     pub async fn send_settled(&self, message: Message) -> Result<(), SendError> {
-        self.commands
-            .send(DriverCommand::SendTransfer {
-                channel: self.channel,
-                handle: self.handle,
-                body: to_bytes(&message).freeze(),
-                settled: true,
-                message_format: 0,
-                reply: None,
-            })
-            .await
-            .map_err(|_| SendError::msg(ErrorKind::NotConnected, "connection closed"))
+        let body = to_bytes(&message).freeze();
+        match &self.outbox {
+            // Bounded: hold a permit until the driver confirms the write.
+            Some(sem) => {
+                let permit = sem
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| SendError::msg(ErrorKind::Cancelled, "producer closed"))?;
+                let (reply_tx, reply_rx) = oneshot::channel();
+                self.commands
+                    .send(DriverCommand::SendTransfer {
+                        channel: self.channel,
+                        handle: self.handle,
+                        body,
+                        settled: true,
+                        message_format: 0,
+                        reply: Some(reply_tx),
+                    })
+                    .await
+                    .map_err(|_| SendError::msg(ErrorKind::NotConnected, "connection closed"))?;
+                // Free the slot once the message is written (or the link drops).
+                tokio::spawn(async move {
+                    let _ = reply_rx.await;
+                    drop(permit);
+                });
+                Ok(())
+            }
+            // Unbounded (opt-in): pure fire-and-forget, no completion tracked.
+            None => self
+                .commands
+                .send(DriverCommand::SendTransfer {
+                    channel: self.channel,
+                    handle: self.handle,
+                    body,
+                    settled: true,
+                    message_format: 0,
+                    reply: None,
+                })
+                .await
+                .map_err(|_| SendError::msg(ErrorKind::NotConnected, "connection closed")),
+        }
     }
 
     /// Detach the link and await completion.

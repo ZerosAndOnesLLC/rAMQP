@@ -389,6 +389,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn send_settled_outbox_backpressures_without_credit() {
+        use std::time::Duration;
+        // A broker that attaches the sender but never grants credit, so nothing
+        // can be written: the bounded outbox must back-pressure rather than
+        // buffer without limit.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let url = format!("amqp://127.0.0.1:{port}");
+        let broker = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let mut framed = broker_handshake(sock).await;
+            while let Ok(frame) = framed.read_frame().await {
+                if let FrameBody::Amqp(Performative::Attach(a), _) = frame.body {
+                    framed
+                        .send_amqp(
+                            0,
+                            &Performative::Attach(Attach {
+                                name: a.name.clone(),
+                                handle: 0,
+                                role: Role::Receiver,
+                                source: Some(Source::default()),
+                                target: Some(TargetArchetype::from(Target::new("queue"))),
+                                ..Default::default()
+                            }),
+                            None,
+                        )
+                        .await
+                        .unwrap();
+                    // Deliberately grant NO link credit.
+                }
+            }
+        });
+
+        let mut config = Config::default();
+        config.link.max_outbox = 2;
+        let conn = crate::api::client::ConnectionBuilder::new(&url)
+            .config(config)
+            .connect()
+            .await
+            .unwrap();
+        let session = conn.begin_session().await.unwrap();
+        let producer = session.create_producer("queue").await.unwrap();
+
+        // Two fire-and-forget sends fill the bounded outbox (unwritten: no credit).
+        producer.send_settled(Message::text("a")).await.unwrap();
+        producer.send_settled(Message::text("b")).await.unwrap();
+        // The third must block until a slot frees — which never happens here.
+        let blocked = tokio::time::timeout(
+            Duration::from_millis(300),
+            producer.send_settled(Message::text("c")),
+        )
+        .await;
+        assert!(
+            blocked.is_err(),
+            "send_settled must back-pressure once the bounded outbox is full"
+        );
+
+        drop(producer);
+        drop(session);
+        drop(conn);
+        broker.abort();
+    }
+
+    #[tokio::test]
     async fn metrics_are_emitted() {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicU64, Ordering};
