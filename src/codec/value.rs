@@ -6,9 +6,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 use ordered_float::OrderedFloat;
 use uuid::Uuid;
 
-use super::decode::{
-    Decode, DecodeError, read_bytes, read_u8, read_u16, read_u32, read_u64,
-};
+use super::decode::{Decode, DecodeError, read_bytes, read_u8, read_u16, read_u32, read_u64};
 use super::encode::{Encode, close_compound, encode_null, open_compound};
 use super::primitives::{OrderedMap, Symbol, codes};
 
@@ -302,7 +300,11 @@ fn decode_value_body(buf: &mut Bytes, code: u8) -> Result<Value, DecodeError> {
         BOOL => Value::Bool(match read_u8(buf)? {
             0 => false,
             1 => true,
-            n => return Err(DecodeError::InvalidValue(format!("invalid boolean byte {n}"))),
+            n => {
+                return Err(DecodeError::InvalidValue(format!(
+                    "invalid boolean byte {n}"
+                )));
+            }
         }),
         UBYTE => Value::Ubyte(read_u8(buf)?),
         BYTE => Value::Byte(read_u8(buf)? as i8),
@@ -440,7 +442,10 @@ fn decode_array(buf: &mut Bytes, count: u32) -> Result<Vec<Value>, DecodeError> 
         let mut out = Vec::with_capacity(cap_hint(count, buf.len()));
         for _ in 0..count {
             let body = decode_value_body(buf, elem_ctor)?;
-            out.push(Value::Described(Box::new(descriptor.clone()), Box::new(body)));
+            out.push(Value::Described(
+                Box::new(descriptor.clone()),
+                Box::new(body),
+            ));
         }
         Ok(out)
     } else {
@@ -487,7 +492,9 @@ mod tests {
         round_trip(Value::Char('Z'));
         round_trip(Value::Char('🦀'));
         round_trip(Value::Timestamp(1_700_000_000_000));
-        round_trip(Value::Uuid(Uuid::from_u128(0x1234_5678_9abc_def0_1122_3344_5566_7788)));
+        round_trip(Value::Uuid(Uuid::from_u128(
+            0x1234_5678_9abc_def0_1122_3344_5566_7788,
+        )));
         round_trip(Value::Binary(Bytes::from_static(b"\x00\x01\x02hello")));
         round_trip(Value::String("héllo".into()));
         round_trip(Value::Symbol(Symbol::new("amqp:accepted:list")));
@@ -576,8 +583,8 @@ mod tests {
         // 0x56 (one-byte boolean) with a byte other than 0/1 is invalid.
         assert!(from_slice::<Value>(&[0x56, 0x02]).is_err());
         assert!(from_slice::<bool>(&[0x56, 0xff]).is_err());
-        assert_eq!(from_slice::<bool>(&[0x56, 0x01]).unwrap(), true);
-        assert_eq!(from_slice::<bool>(&[0x56, 0x00]).unwrap(), false);
+        assert!(from_slice::<bool>(&[0x56, 0x01]).unwrap());
+        assert!(!from_slice::<bool>(&[0x56, 0x00]).unwrap());
     }
 
     #[test]
@@ -606,7 +613,10 @@ mod tests {
         assert_eq!(to_vec(&Value::Bool(false)), [0x42]);
         assert_eq!(to_vec(&Value::Uint(0)), [0x43]);
         assert_eq!(to_vec(&Value::Uint(5)), [0x52, 0x05]);
-        assert_eq!(to_vec(&Value::Uint(0x1_0000)), [0x70, 0x00, 0x01, 0x00, 0x00]);
+        assert_eq!(
+            to_vec(&Value::Uint(0x1_0000)),
+            [0x70, 0x00, 0x01, 0x00, 0x00]
+        );
         assert_eq!(to_vec(&Value::Ulong(0)), [0x44]);
         assert_eq!(to_vec(&Value::Ulong(0x10)), [0x53, 0x10]);
         assert_eq!(to_vec(&Value::Long(-1)), [0x55, 0xff]);

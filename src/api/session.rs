@@ -142,7 +142,9 @@ impl Session {
             ..Default::default()
         };
         let (evt_tx, evt_rx) = mpsc::channel(64);
-        let attached = self.attach(attach, self.config.link.credit_mode, evt_tx).await?;
+        let attached = self
+            .attach(attach, self.config.link.credit_mode, evt_tx)
+            .await?;
         Ok(crate::txn::TransactionController::new(Producer::new(
             self.commands.clone(),
             self.channel,

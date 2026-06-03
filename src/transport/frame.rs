@@ -216,7 +216,12 @@ impl<S: IoStream> FramedTransport<S> {
     }
 
     /// Queue an AMQP frame in the write buffer (does not flush).
-    pub fn queue_amqp(&mut self, channel: u16, performative: &Performative, payload: Option<&[u8]>) {
+    pub fn queue_amqp(
+        &mut self,
+        channel: u16,
+        performative: &Performative,
+        payload: Option<&[u8]>,
+    ) {
         encode_amqp_frame(&mut self.write_buf, channel, performative, payload);
     }
 
@@ -275,7 +280,10 @@ mod tests {
         let perf = Performative::Open(Open::new("c1"));
         encode_amqp_frame(&mut buf, 0, &perf, None);
         // header size field equals the buffer length
-        assert_eq!(u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize, buf.len());
+        assert_eq!(
+            u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize,
+            buf.len()
+        );
 
         let frame = decode_frame(&mut buf, 1 << 20).unwrap().unwrap();
         assert_eq!(frame.channel, 0);

@@ -191,8 +191,11 @@ where
     // mandatory RFC 6455 headers (Host, Upgrade, Connection, Sec-WebSocket-Key,
     // Sec-WebSocket-Version).
     let uri: Uri = url.parse().map_err(|e: http::uri::InvalidUri| {
-        ConnectError::msg(ErrorKind::ProtocolViolation, format!("invalid ws url: {url}"))
-            .with_source(e)
+        ConnectError::msg(
+            ErrorKind::ProtocolViolation,
+            format!("invalid ws url: {url}"),
+        )
+        .with_source(e)
     })?;
     let mut request = uri.into_client_request().map_err(|e| {
         ConnectError::msg(ErrorKind::ProtocolViolation, "invalid websocket request")

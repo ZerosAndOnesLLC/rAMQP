@@ -76,7 +76,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ramqp::types::messaging::Body::Data(parts) => {
             let len: usize = parts.iter().map(|p| p.len()).sum();
             assert_eq!(len, big.len(), "large message length mismatch");
-            println!("large message: {} KiB round-tripped + reassembled OK", len / 1024);
+            println!(
+                "large message: {} KiB round-tripped + reassembled OK",
+                len / 1024
+            );
         }
         other => panic!("unexpected body: {other:?}"),
     }

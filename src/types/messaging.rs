@@ -150,10 +150,18 @@ impl Encode for Outcome {
 impl Decode for Outcome {
     fn decode(buf: &mut Bytes) -> Result<Self, DecodeError> {
         match peek_descriptor(buf)? {
-            Descriptor::Code(descriptors::ACCEPTED) => Ok(Outcome::Accepted(Accepted::decode(buf)?)),
-            Descriptor::Code(descriptors::REJECTED) => Ok(Outcome::Rejected(Rejected::decode(buf)?)),
-            Descriptor::Code(descriptors::RELEASED) => Ok(Outcome::Released(Released::decode(buf)?)),
-            Descriptor::Code(descriptors::MODIFIED) => Ok(Outcome::Modified(Modified::decode(buf)?)),
+            Descriptor::Code(descriptors::ACCEPTED) => {
+                Ok(Outcome::Accepted(Accepted::decode(buf)?))
+            }
+            Descriptor::Code(descriptors::REJECTED) => {
+                Ok(Outcome::Rejected(Rejected::decode(buf)?))
+            }
+            Descriptor::Code(descriptors::RELEASED) => {
+                Ok(Outcome::Released(Released::decode(buf)?))
+            }
+            Descriptor::Code(descriptors::MODIFIED) => {
+                Ok(Outcome::Modified(Modified::decode(buf)?))
+            }
             other => Err(DecodeError::InvalidValue(format!(
                 "unexpected outcome descriptor {other}"
             ))),

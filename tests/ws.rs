@@ -21,6 +21,9 @@ use tokio::net::{TcpListener, TcpStream};
 
 /// Accept WebSocket connections and relay their AMQP byte stream to `broker`
 /// (a `host:port` plain-AMQP endpoint). Returns the `ws://` URL to dial.
+// The subprotocol-select callback's `Result<_, ErrorResponse>` error type is
+// dictated by tungstenite's handshake callback trait, not ours.
+#[allow(clippy::result_large_err)]
 async fn spawn_ws_bridge(broker: String) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -33,8 +36,10 @@ async fn spawn_ws_bridge(broker: String) -> String {
                 // A compliant AMQP-WS server must select the `amqp` subprotocol;
                 // the client rejects the handshake otherwise.
                 let select_amqp = |_req: &Request, mut resp: Response| {
-                    resp.headers_mut()
-                        .insert(header::SEC_WEBSOCKET_PROTOCOL, HeaderValue::from_static("amqp"));
+                    resp.headers_mut().insert(
+                        header::SEC_WEBSOCKET_PROTOCOL,
+                        HeaderValue::from_static("amqp"),
+                    );
                     Ok(resp)
                 };
                 let ws = match tokio_tungstenite::accept_hdr_async(sock, select_amqp).await {
@@ -76,7 +81,10 @@ async fn ws_roundtrip_via_bridge() {
         .send(Message::text("ws-hello"))
         .await
         .expect("send over websocket");
-    assert!(matches!(outcome, DeliveryState::Accepted(_)), "got {outcome:?}");
+    assert!(
+        matches!(outcome, DeliveryState::Accepted(_)),
+        "got {outcome:?}"
+    );
 
     let mut consumer = session.create_consumer(&address).await.expect("consumer");
     let d = consumer.recv().await.expect("recv over websocket");

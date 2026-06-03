@@ -149,7 +149,10 @@ async fn release_redelivers() {
 
     let mut consumer = session.create_consumer(&address).await.expect("consumer");
     let first = consumer.recv().await.expect("recv1");
-    assert_eq!(first.message().unwrap().body, Message::text("release-me").body);
+    assert_eq!(
+        first.message().unwrap().body,
+        Message::text("release-me").body
+    );
     consumer.release(&first).await.expect("release");
 
     // The released message must come back (to this or a fresh consumer).
@@ -157,7 +160,10 @@ async fn release_redelivers() {
         .await
         .expect("released message should be redelivered")
         .expect("recv2");
-    assert_eq!(second.message().unwrap().body, Message::text("release-me").body);
+    assert_eq!(
+        second.message().unwrap().body,
+        Message::text("release-me").body
+    );
     consumer.accept(&second).await.expect("accept");
 
     conn.close().await.expect("close");
@@ -233,7 +239,10 @@ async fn modify_requeues() {
         .await
         .expect("modified message should be redelivered")
         .expect("recv2");
-    assert_eq!(redelivered.message().unwrap().body, Message::text("modify-me").body);
+    assert_eq!(
+        redelivered.message().unwrap().body,
+        Message::text("modify-me").body
+    );
     // Drain it so the test leaves the queue empty.
     consumer.accept(&redelivered).await.expect("accept");
 
@@ -254,7 +263,10 @@ async fn produce_outcome_is_accepted() {
     drain(&session, &address).await;
     let producer = session.create_producer(&address).await.expect("producer");
     let outcome = producer.send(Message::text("x")).await.expect("send");
-    assert!(matches!(outcome, DeliveryState::Accepted(_)), "got {outcome:?}");
+    assert!(
+        matches!(outcome, DeliveryState::Accepted(_)),
+        "got {outcome:?}"
+    );
     // clean up
     let mut c = session.create_consumer(&address).await.expect("consumer");
     let d = recv_within(&mut c, 10).await;

@@ -71,9 +71,10 @@ pub fn reconcile(local: &Open, remote: &Open) -> Negotiated {
 
 /// Map a peer `close` into a connection error (or `None` for a graceful close).
 pub fn close_to_error(close: &Close) -> Option<ConnectError> {
-    close.error.as_ref().map(|e| {
-        ConnectError::from_remote(ErrorKind::PeerClosed, RemoteError::new(e.clone()))
-    })
+    close
+        .error
+        .as_ref()
+        .map(|e| ConnectError::from_remote(ErrorKind::PeerClosed, RemoteError::new(e.clone())))
 }
 
 #[cfg(test)]
@@ -106,14 +107,19 @@ mod tests {
         local.max_frame_size = 256;
         let mut remote = Open::new("them");
         remote.max_frame_size = 256;
-        assert_eq!(reconcile(&local, &remote).max_frame_size, MIN_MAX_FRAME_SIZE);
+        assert_eq!(
+            reconcile(&local, &remote).max_frame_size,
+            MIN_MAX_FRAME_SIZE
+        );
     }
 
     #[test]
     fn build_open_carries_config() {
-        let mut cfg = ConnectionConfig::default();
-        cfg.container_id = ContainerId::new("my-id");
-        cfg.max_frame_size = 65_536;
+        let cfg = ConnectionConfig {
+            container_id: ContainerId::new("my-id"),
+            max_frame_size: 65_536,
+            ..Default::default()
+        };
         let open = build_open(&cfg);
         assert_eq!(open.container_id, "my-id");
         assert_eq!(open.max_frame_size, 65_536);

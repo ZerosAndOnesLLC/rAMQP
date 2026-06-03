@@ -216,7 +216,10 @@ impl<S: IoStream> Driver<S> {
                 if let Some(session) = self.sessions.get_mut(&channel.value()) {
                     session.attach_link(*attach, credit_mode, events, reply, &mut self.transport);
                 } else {
-                    let _ = reply.send(Err(LinkError::msg(ErrorKind::NotConnected, "no such session")));
+                    let _ = reply.send(Err(LinkError::msg(
+                        ErrorKind::NotConnected,
+                        "no such session",
+                    )));
                 }
                 Ok(false)
             }
@@ -230,7 +233,10 @@ impl<S: IoStream> Driver<S> {
                 if let Some(session) = self.sessions.get_mut(&channel.value()) {
                     session.detach_link(handle.value(), closed, error, reply, &mut self.transport);
                 } else {
-                    let _ = reply.send(Err(LinkError::msg(ErrorKind::NotConnected, "no such session")));
+                    let _ = reply.send(Err(LinkError::msg(
+                        ErrorKind::NotConnected,
+                        "no such session",
+                    )));
                 }
                 Ok(false)
             }
@@ -255,7 +261,10 @@ impl<S: IoStream> Driver<S> {
                     );
                     self.metrics.on_transfer_sent();
                 } else if let Some(reply) = reply {
-                    let _ = reply.send(Err(SendError::msg(ErrorKind::NotConnected, "no such session")));
+                    let _ = reply.send(Err(SendError::msg(
+                        ErrorKind::NotConnected,
+                        "no such session",
+                    )));
                 }
                 Ok(false)
             }
@@ -281,7 +290,10 @@ impl<S: IoStream> Driver<S> {
                         let _ = reply.send(Ok(()));
                     }
                 } else if let Some(reply) = reply {
-                    let _ = reply.send(Err(RecvError::msg(ErrorKind::NotConnected, "no such session")));
+                    let _ = reply.send(Err(RecvError::msg(
+                        ErrorKind::NotConnected,
+                        "no such session",
+                    )));
                 }
                 Ok(false)
             }
@@ -508,7 +520,10 @@ mod tests {
         let mut st = FramedTransport::new(server, 1 << 16);
         // expect open, reply open
         let open = st.read_frame().await.unwrap();
-        assert!(matches!(open.body, FrameBody::Amqp(Performative::Open(_), _)));
+        assert!(matches!(
+            open.body,
+            FrameBody::Amqp(Performative::Open(_), _)
+        ));
         st.send_amqp(
             0,
             &Performative::Open(crate::types::performatives::Open::new("server")),
@@ -517,17 +532,12 @@ mod tests {
         .await
         .unwrap();
         // expect close, reply close
-        loop {
-            match st.read_frame().await {
-                Ok(f) => {
-                    if matches!(f.body, FrameBody::Amqp(Performative::Close(_), _)) {
-                        st.send_amqp(0, &Performative::Close(Close { error: None }), None)
-                            .await
-                            .unwrap();
-                        break;
-                    }
-                }
-                Err(_) => break,
+        while let Ok(f) = st.read_frame().await {
+            if matches!(f.body, FrameBody::Amqp(Performative::Close(_), _)) {
+                st.send_amqp(0, &Performative::Close(Close { error: None }), None)
+                    .await
+                    .unwrap();
+                break;
             }
         }
     }
@@ -540,15 +550,9 @@ mod tests {
         let transport = FramedTransport::new(client, 1 << 16);
         let config = Arc::new(Config::default());
         let (tx, rx) = mpsc::channel(16);
-        let driver = Driver::open(
-            transport,
-            config,
-            noop_metrics(),
-            EventBus::default(),
-            rx,
-        )
-        .await
-        .unwrap();
+        let driver = Driver::open(transport, config, noop_metrics(), EventBus::default(), rx)
+            .await
+            .unwrap();
 
         let run = tokio::spawn(driver.run());
 
@@ -589,7 +593,9 @@ mod tests {
                 outgoing_window: 100,
                 ..Default::default()
             };
-            st.send_amqp(0, &Performative::Begin(begin), None).await.unwrap();
+            st.send_amqp(0, &Performative::Begin(begin), None)
+                .await
+                .unwrap();
             // end
             let f = st.read_frame().await.unwrap();
             assert!(matches!(f.body, FrameBody::Amqp(Performative::End(_), _)));

@@ -95,7 +95,11 @@ impl ConnectionBuilder {
     }
 
     /// Present a client certificate chain + private key (PEM) for mutual TLS.
-    pub fn client_auth_pem(mut self, cert_chain: impl Into<Vec<u8>>, key: impl Into<Vec<u8>>) -> Self {
+    pub fn client_auth_pem(
+        mut self,
+        cert_chain: impl Into<Vec<u8>>,
+        key: impl Into<Vec<u8>>,
+    ) -> Self {
         self.tls.client_auth_pem = Some((cert_chain.into(), key.into()));
         self
     }

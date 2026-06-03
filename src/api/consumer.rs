@@ -9,9 +9,7 @@ use crate::ids::{ChannelId, Handle};
 use crate::link::Delivery;
 use crate::proto::{DriverCommand, LinkEvent};
 use crate::types::definitions::Error as AmqpError;
-use crate::types::messaging::{
-    Accepted, DeliveryState, Modified, Outcome, Rejected, Released,
-};
+use crate::types::messaging::{Accepted, DeliveryState, Modified, Outcome, Rejected, Released};
 
 /// A handle for receiving and settling deliveries on a receiver link.
 #[derive(Debug)]
@@ -125,7 +123,11 @@ impl Consumer {
     }
 
     /// Reject a delivery with an optional error.
-    pub async fn reject(&self, delivery: &Delivery, error: Option<AmqpError>) -> Result<(), RecvError> {
+    pub async fn reject(
+        &self,
+        delivery: &Delivery,
+        error: Option<AmqpError>,
+    ) -> Result<(), RecvError> {
         self.dispose(delivery, DeliveryState::Rejected(Rejected { error }))
             .await
     }
@@ -138,7 +140,8 @@ impl Consumer {
 
     /// Modify a delivery (with disposition hints).
     pub async fn modify(&self, delivery: &Delivery, modified: Modified) -> Result<(), RecvError> {
-        self.dispose(delivery, DeliveryState::Modified(modified)).await
+        self.dispose(delivery, DeliveryState::Modified(modified))
+            .await
     }
 
     /// Settle a delivery with an arbitrary terminal [`Outcome`].

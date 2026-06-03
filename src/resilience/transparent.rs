@@ -112,7 +112,13 @@ async fn establish(
     metrics: &SharedMetrics,
     profile: &SaslProfile,
     tls: &TlsConfig,
-) -> Result<(mpsc::Sender<DriverCommand>, JoinHandle<Result<(), ConnectError>>), ConnectError> {
+) -> Result<
+    (
+        mpsc::Sender<DriverCommand>,
+        JoinHandle<Result<(), ConnectError>>,
+    ),
+    ConnectError,
+> {
     let conn = Connection::establish(
         addr.clone(),
         (**config).clone(),
@@ -246,7 +252,10 @@ impl Supervisor {
             } => {
                 let vchan = channel.value();
                 let Some(session) = self.sessions.get_mut(&vchan) else {
-                    let _ = reply.send(Err(LinkError::msg(ErrorKind::NotConnected, "no such session")));
+                    let _ = reply.send(Err(LinkError::msg(
+                        ErrorKind::NotConnected,
+                        "no such session",
+                    )));
                     return;
                 };
                 let vhandle = session.next_vhandle;
@@ -336,8 +345,15 @@ impl Supervisor {
                 message_format,
                 reply,
             } => {
-                self.send_transfer(channel.value(), handle.value(), body, settled, message_format, reply)
-                    .await;
+                self.send_transfer(
+                    channel.value(),
+                    handle.value(),
+                    body,
+                    settled,
+                    message_format,
+                    reply,
+                )
+                .await;
             }
             DriverCommand::SendDisposition {
                 channel,
@@ -347,7 +363,10 @@ impl Supervisor {
                 state,
                 settled,
                 reply,
-            } => match (self.inner.clone(), self.real_ids(channel.value(), handle.value())) {
+            } => match (
+                self.inner.clone(),
+                self.real_ids(channel.value(), handle.value()),
+            ) {
                 (Some(inner), Some((rc, rh))) => {
                     let _ = inner
                         .send(DriverCommand::SendDisposition {
@@ -382,7 +401,12 @@ impl Supervisor {
                     }),
                 ) {
                     flow.handle = real_handle;
-                    let _ = inner.send(DriverCommand::SendFlow { channel: ChannelId(rc), flow }).await;
+                    let _ = inner
+                        .send(DriverCommand::SendFlow {
+                            channel: ChannelId(rc),
+                            flow,
+                        })
+                        .await;
                 }
             }
             DriverCommand::GrantCredit {
@@ -390,9 +414,10 @@ impl Supervisor {
                 handle,
                 credit,
             } => {
-                if let (Some(inner), Some((rc, rh))) =
-                    (self.inner.clone(), self.real_ids(channel.value(), handle.value()))
-                {
+                if let (Some(inner), Some((rc, rh))) = (
+                    self.inner.clone(),
+                    self.real_ids(channel.value(), handle.value()),
+                ) {
                     let _ = inner
                         .send(DriverCommand::GrantCredit {
                             channel: ChannelId(rc),
@@ -406,7 +431,9 @@ impl Supervisor {
                 self.stopping = true;
                 match self.inner.clone() {
                     Some(inner) => {
-                        let _ = inner.send(DriverCommand::CloseConnection { error, reply }).await;
+                        let _ = inner
+                            .send(DriverCommand::CloseConnection { error, reply })
+                            .await;
                         if let Some(join) = self.driver_join.take() {
                             let _ = join.await;
                         }
@@ -435,7 +462,10 @@ impl Supervisor {
         let routed = self.inner.clone().zip(self.real_ids(vchan, vhandle));
         let Some((inner, (rc, rh))) = routed else {
             if let Some(reply) = reply {
-                let _ = reply.send(Err(SendError::msg(ErrorKind::NotConnected, "connection lost")));
+                let _ = reply.send(Err(SendError::msg(
+                    ErrorKind::NotConnected,
+                    "connection lost",
+                )));
             }
             return;
         };
@@ -456,7 +486,10 @@ impl Supervisor {
                     .await
                     .is_err()
                 {
-                    let _ = handle_reply.send(Err(SendError::msg(ErrorKind::NotConnected, "connection lost")));
+                    let _ = handle_reply.send(Err(SendError::msg(
+                        ErrorKind::NotConnected,
+                        "connection lost",
+                    )));
                     return;
                 }
                 let replay_tx = self.replay_tx.clone();
@@ -621,7 +654,15 @@ impl Supervisor {
             self.events.publish(ConnectionEvent::Reconnecting {
                 attempt: backoff.attempt() + 1,
             });
-            match establish(&self.addr, &self.config, &self.metrics, &self.profile, &self.tls).await {
+            match establish(
+                &self.addr,
+                &self.config,
+                &self.metrics,
+                &self.profile,
+                &self.tls,
+            )
+            .await
+            {
                 Ok((inner, join)) => {
                     self.inner = Some(inner);
                     self.driver_join = Some(join);

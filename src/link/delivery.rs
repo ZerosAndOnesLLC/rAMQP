@@ -123,7 +123,12 @@ mod tests {
     fn lazy_body_and_typed_decode() {
         let msg = Message::text("hello");
         let bytes = Bytes::from(to_vec(&msg));
-        let d = Delivery::new(DeliveryId(1), Bytes::from_static(b"tag"), false, bytes.clone());
+        let d = Delivery::new(
+            DeliveryId(1),
+            Bytes::from_static(b"tag"),
+            false,
+            bytes.clone(),
+        );
         assert_eq!(d.raw(), &bytes);
         assert_eq!(d.message().unwrap(), msg);
     }

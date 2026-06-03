@@ -129,7 +129,9 @@ impl Decode for bool {
             codes::BOOL => match read_u8(buf)? {
                 0 => Ok(false),
                 1 => Ok(true),
-                n => Err(DecodeError::InvalidValue(format!("invalid boolean byte {n}"))),
+                n => Err(DecodeError::InvalidValue(format!(
+                    "invalid boolean byte {n}"
+                ))),
             },
             c => Err(bad(c, "boolean")),
         }
@@ -286,8 +288,8 @@ impl Decode for Symbol {
             c => return Err(bad(c, "symbol")),
         };
         let raw = read_bytes(buf, len)?;
-        let s =
-            String::from_utf8(raw.to_vec()).map_err(|_| DecodeError::InvalidUtf8 { kind: "symbol" })?;
+        let s = String::from_utf8(raw.to_vec())
+            .map_err(|_| DecodeError::InvalidUtf8 { kind: "symbol" })?;
         Ok(Symbol(s))
     }
 }

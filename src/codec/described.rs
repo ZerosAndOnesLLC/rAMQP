@@ -5,8 +5,8 @@
 use bytes::Bytes;
 
 use super::decode::{
-    Decode, DecodeError, peek_code, read_array_header, read_bytes, read_list_header, read_u32,
-    read_u8,
+    Decode, DecodeError, peek_code, read_array_header, read_bytes, read_list_header, read_u8,
+    read_u32,
 };
 use super::primitives::{Symbol, codes};
 

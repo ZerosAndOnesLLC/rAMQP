@@ -103,7 +103,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut last_c = 0u64;
     let mut rss_max = rss0;
     println!("soak: {secs}s, {size}B msgs, start RSS {rss0} KiB");
-    while !stop.load(Ordering::Relaxed) || consumed.load(Ordering::Relaxed) < produced.load(Ordering::Relaxed) {
+    while !stop.load(Ordering::Relaxed)
+        || consumed.load(Ordering::Relaxed) < produced.load(Ordering::Relaxed)
+    {
         tokio::time::sleep(Duration::from_secs(5)).await;
         let p = produced.load(Ordering::Relaxed);
         let c = consumed.load(Ordering::Relaxed);
@@ -135,10 +137,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dur = start.elapsed().as_secs_f64();
     let rss1 = rss_kib();
     println!("\nsoak done in {dur:.1}s");
-    println!("  produced={p}  consumed={c}  ({:.0} msg/s sustained)", p as f64 / dur);
-    println!("  RSS: start {rss0} KiB, peak {rss_max} KiB, end {rss1} KiB (growth {} KiB)", rss1 as i64 - rss0 as i64);
+    println!(
+        "  produced={p}  consumed={c}  ({:.0} msg/s sustained)",
+        p as f64 / dur
+    );
+    println!(
+        "  RSS: start {rss0} KiB, peak {rss_max} KiB, end {rss1} KiB (growth {} KiB)",
+        rss1 as i64 - rss0 as i64
+    );
     if c < p {
-        eprintln!("  WARNING: consumer did not fully catch up ({} missing)", p - c);
+        eprintln!(
+            "  WARNING: consumer did not fully catch up ({} missing)",
+            p - c
+        );
     }
     Ok(())
 }

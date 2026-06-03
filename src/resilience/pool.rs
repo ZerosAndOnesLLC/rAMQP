@@ -34,7 +34,10 @@ impl std::fmt::Debug for Pool {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Pool")
             .field("url", &self.inner.url)
-            .field("size", &self.inner.slots.lock().map(|s| s.len()).unwrap_or(0))
+            .field(
+                "size",
+                &self.inner.slots.lock().map(|s| s.len()).unwrap_or(0),
+            )
             .finish_non_exhaustive()
     }
 }

@@ -28,8 +28,8 @@ async fn amqps_roundtrip_with_private_ca() {
         eprintln!("skipping tls test: set RAMQP_TLS_BROKER_URL");
         return;
     };
-    let ca_path = std::env::var("RAMQP_TLS_CA_PEM")
-        .expect("set RAMQP_TLS_CA_PEM to the broker CA pem path");
+    let ca_path =
+        std::env::var("RAMQP_TLS_CA_PEM").expect("set RAMQP_TLS_CA_PEM to the broker CA pem path");
     let ca = std::fs::read(ca_path).expect("read CA pem");
 
     let conn = ConnectionBuilder::new(&url)
@@ -46,7 +46,10 @@ async fn amqps_roundtrip_with_private_ca() {
         .send(Message::text("tls-hello"))
         .await
         .expect("send over tls");
-    assert!(matches!(outcome, DeliveryState::Accepted(_)), "got {outcome:?}");
+    assert!(
+        matches!(outcome, DeliveryState::Accepted(_)),
+        "got {outcome:?}"
+    );
 
     let mut consumer = session.create_consumer(&address).await.expect("consumer");
     let d = consumer.recv().await.expect("recv over tls");
@@ -72,8 +75,14 @@ async fn amqps_roundtrip_insecure_bypass() {
 
     let session = conn.begin_session().await.expect("session");
     let producer = session.create_producer(&address()).await.expect("producer");
-    let outcome = producer.send(Message::text("tls-insecure")).await.expect("send");
-    assert!(matches!(outcome, DeliveryState::Accepted(_)), "got {outcome:?}");
+    let outcome = producer
+        .send(Message::text("tls-insecure"))
+        .await
+        .expect("send");
+    assert!(
+        matches!(outcome, DeliveryState::Accepted(_)),
+        "got {outcome:?}"
+    );
     // clean up
     let mut c = session.create_consumer(&address()).await.expect("consumer");
     let d = c.recv().await.expect("recv");

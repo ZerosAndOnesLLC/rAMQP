@@ -81,11 +81,17 @@ impl std::fmt::Debug for TlsConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Never print key material.
         f.debug_struct("TlsConfig")
-            .field("root_ca_pem", &format_args!("[{} CA blob(s)]", self.root_ca_pem.len()))
+            .field(
+                "root_ca_pem",
+                &format_args!("[{} CA blob(s)]", self.root_ca_pem.len()),
+            )
             .field("webpki_roots", &self.webpki_roots)
             .field("client_auth_pem", &self.client_auth_pem.is_some())
             .field("server_name", &self.server_name)
-            .field("danger_accept_invalid_certs", &self.danger_accept_invalid_certs)
+            .field(
+                "danger_accept_invalid_certs",
+                &self.danger_accept_invalid_certs,
+            )
             .finish()
     }
 }
@@ -166,9 +172,7 @@ impl Address {
         let port = parsed.port().unwrap_or_else(|| scheme.default_port());
         let username = match parsed.username() {
             "" => None,
-            u => Some(
-                percent_decode(u),
-            ),
+            u => Some(percent_decode(u)),
         };
         let password = parsed.password().map(percent_decode);
         let path = parsed.path().trim_start_matches('/').to_owned();
@@ -325,17 +329,33 @@ pub async fn connect(addr: &Address, tls: &TlsConfig) -> Result<Transport, Conne
 }
 
 #[cfg(feature = "rustls")]
-async fn connect_tls(tcp: TcpStream, host: &str, tls: &TlsConfig) -> Result<Transport, ConnectError> {
-    Ok(Transport::Rustls(tls::connect_rustls(tcp, host, tls).await?))
+async fn connect_tls(
+    tcp: TcpStream,
+    host: &str,
+    tls: &TlsConfig,
+) -> Result<Transport, ConnectError> {
+    Ok(Transport::Rustls(
+        tls::connect_rustls(tcp, host, tls).await?,
+    ))
 }
 
 #[cfg(all(feature = "native-tls", not(feature = "rustls")))]
-async fn connect_tls(tcp: TcpStream, host: &str, tls: &TlsConfig) -> Result<Transport, ConnectError> {
-    Ok(Transport::NativeTls(tls::connect_native_tls(tcp, host, tls).await?))
+async fn connect_tls(
+    tcp: TcpStream,
+    host: &str,
+    tls: &TlsConfig,
+) -> Result<Transport, ConnectError> {
+    Ok(Transport::NativeTls(
+        tls::connect_native_tls(tcp, host, tls).await?,
+    ))
 }
 
 #[cfg(not(any(feature = "rustls", feature = "native-tls")))]
-async fn connect_tls(_tcp: TcpStream, _host: &str, _tls: &TlsConfig) -> Result<Transport, ConnectError> {
+async fn connect_tls(
+    _tcp: TcpStream,
+    _host: &str,
+    _tls: &TlsConfig,
+) -> Result<Transport, ConnectError> {
     Err(ConnectError::msg(
         ErrorKind::Tls,
         "amqps:// requires the `rustls` or `native-tls` feature",

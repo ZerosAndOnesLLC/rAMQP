@@ -163,8 +163,10 @@ mod tests {
 
     #[test]
     fn disabled_policy_never_retries() {
-        let mut policy = ReconnectConfig::default();
-        policy.enabled = false;
+        let policy = ReconnectConfig {
+            enabled: false,
+            ..Default::default()
+        };
         let mut b = Backoff::new(policy);
         assert!(b.next_delay().is_none());
     }

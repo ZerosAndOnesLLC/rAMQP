@@ -13,9 +13,9 @@ use crate::error::{ConnectError, ErrorKind, SessionError};
 use crate::observe::{ConnectionEvent, EventBus, SharedMetrics};
 use crate::proto::DriverCommand;
 use crate::sasl::SaslProfile;
+use crate::transport::frame::FramedTransport;
 use crate::transport::header::ProtocolHeader;
 use crate::transport::{self, Address};
-use crate::transport::frame::FramedTransport;
 use crate::types::performatives::Begin;
 
 /// An open AMQP connection. Dropping the last handle (this plus all sessions)
@@ -51,7 +51,9 @@ impl Connection {
     /// # Ok(()) }
     /// ```
     pub async fn open(url: &str) -> Result<Connection, ConnectError> {
-        crate::api::client::ConnectionBuilder::new(url).connect().await
+        crate::api::client::ConnectionBuilder::new(url)
+            .connect()
+            .await
     }
 
     /// Start building a connection to `url`.
@@ -169,7 +171,10 @@ impl Connection {
 
     /// Whether the driver task is still running (used by the connection pool).
     pub fn is_alive(&self) -> bool {
-        self.driver.as_ref().map(|j| !j.is_finished()).unwrap_or(false)
+        self.driver
+            .as_ref()
+            .map(|j| !j.is_finished())
+            .unwrap_or(false)
     }
 
     /// Gracefully close the connection and await the driver's shutdown,
@@ -203,7 +208,9 @@ mod tests {
     use crate::codec::{Symbol, to_vec};
     use crate::transport::frame::FrameBody;
     use crate::types::definitions::Role;
-    use crate::types::messaging::{Accepted, DeliveryState, Message, Source, Target, TargetArchetype};
+    use crate::types::messaging::{
+        Accepted, DeliveryState, Message, Source, Target, TargetArchetype,
+    };
     use crate::types::performatives::{
         Attach, Begin, Close, Detach, Disposition, End, Flow, Open, Performative, Transfer,
     };
@@ -330,9 +337,9 @@ mod tests {
                             .unwrap();
                     }
                 }
-                FrameBody::Amqp(Performative::Flow(f), _) => {
+                FrameBody::Amqp(Performative::Flow(f), _)
                     // Consumer granted us credit: deliver one message.
-                    if !sent_to_consumer && f.link_credit.unwrap_or(0) > 0 {
+                    if !sent_to_consumer && f.link_credit.unwrap_or(0) > 0 => {
                         sent_to_consumer = true;
                         let body = to_vec(&Message::text("from-broker"));
                         framed
@@ -352,7 +359,6 @@ mod tests {
                             .await
                             .unwrap();
                     }
-                }
                 FrameBody::Amqp(Performative::Transfer(t), _) => {
                     // Track the delivery id (present only on the first frame) and
                     // settle once the final (more = false) frame arrives.
@@ -454,7 +460,9 @@ mod tests {
             let conns = conns.clone();
             async move {
                 loop {
-                    let Ok((sock, _)) = listener.accept().await else { break };
+                    let Ok((sock, _)) = listener.accept().await else {
+                        break;
+                    };
                     let epoch = conns.fetch_add(1, Ordering::SeqCst);
                     // Scope `framed` so it (and its socket) is dropped the moment
                     // this connection's handling ends — that EOF is how the client
@@ -476,7 +484,9 @@ mod tests {
                                             handle: 0,
                                             role: Role::Receiver,
                                             source: Some(Source::default()),
-                                            target: Some(TargetArchetype::from(Target::new("queue"))),
+                                            target: Some(TargetArchetype::from(Target::new(
+                                                "queue",
+                                            ))),
                                             ..Default::default()
                                         }),
                                         None,
@@ -511,7 +521,9 @@ mod tests {
                                                 first: id,
                                                 last: None,
                                                 settled: true,
-                                                state: Some(DeliveryState::Accepted(Accepted::default())),
+                                                state: Some(DeliveryState::Accepted(
+                                                    Accepted::default(),
+                                                )),
                                                 batchable: false,
                                             }),
                                             None,
@@ -586,10 +598,13 @@ mod tests {
             .expect("send two");
         assert!(matches!(o2, DeliveryState::Accepted(_)));
 
-        let o3 = tokio::time::timeout(Duration::from_secs(5), producer.send(Message::text("three")))
-            .await
-            .expect("third send timed out")
-            .expect("send three");
+        let o3 = tokio::time::timeout(
+            Duration::from_secs(5),
+            producer.send(Message::text("three")),
+        )
+        .await
+        .expect("third send timed out")
+        .expect("send three");
         assert!(matches!(o3, DeliveryState::Accepted(_)));
 
         // We reconnected at least once.
@@ -796,26 +811,24 @@ mod tests {
                             .await
                             .unwrap();
                     }
-                    FrameBody::Amqp(Performative::Flow(f), _) => {
-                        if f.link_credit.unwrap_or(0) > 0 {
-                            let body = to_vec(&Message::text("second"));
-                            framed
-                                .send_amqp(
-                                    0,
-                                    &Performative::Transfer(Transfer {
-                                        handle: 0,
-                                        delivery_id: Some(0),
-                                        delivery_tag: Some(Bytes::from_static(b"d")),
-                                        message_format: Some(0),
-                                        settled: Some(false),
-                                        more: false,
-                                        ..Default::default()
-                                    }),
-                                    Some(&body),
-                                )
-                                .await
-                                .unwrap();
-                        }
+                    FrameBody::Amqp(Performative::Flow(f), _) if f.link_credit.unwrap_or(0) > 0 => {
+                        let body = to_vec(&Message::text("second"));
+                        framed
+                            .send_amqp(
+                                0,
+                                &Performative::Transfer(Transfer {
+                                    handle: 0,
+                                    delivery_id: Some(0),
+                                    delivery_tag: Some(Bytes::from_static(b"d")),
+                                    message_format: Some(0),
+                                    settled: Some(false),
+                                    more: false,
+                                    ..Default::default()
+                                }),
+                                Some(&body),
+                            )
+                            .await
+                            .unwrap();
                     }
                     FrameBody::Amqp(Performative::Disposition(d), _) => {
                         // In `second` mode the consumer proposes the outcome unsettled.

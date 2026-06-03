@@ -4,11 +4,11 @@
 
 use bytes::Bytes;
 
+use crate::codec::Symbol;
 use crate::error::{ConnectError, ErrorKind};
 use crate::transport::IoStream;
 use crate::transport::frame::{Frame, FrameBody, FramedTransport};
 use crate::types::sasl::{SaslCode, SaslFrame, SaslInit, SaslResponse};
-use crate::codec::Symbol;
 
 #[cfg(feature = "scram")]
 use scram::ScramClient;
@@ -72,7 +72,9 @@ impl SaslProfile {
                 (Some(plain_response(authcid, passwd)), MechState::Simple)
             }
             SaslProfile::External { authzid } => (
-                Some(Bytes::from(authzid.clone().unwrap_or_default().into_bytes())),
+                Some(Bytes::from(
+                    authzid.clone().unwrap_or_default().into_bytes(),
+                )),
                 MechState::Simple,
             ),
             #[cfg(feature = "scram")]
@@ -336,8 +338,11 @@ mod scram {
         }
 
         pub(super) fn client_first(&mut self) -> Bytes {
-            self.client_first_bare =
-                format!("n={},r={}", escape_username(&self.username), self.client_nonce);
+            self.client_first_bare = format!(
+                "n={},r={}",
+                escape_username(&self.username),
+                self.client_nonce
+            );
             // gs2 header "n,," = no channel binding.
             Bytes::from(format!("n,,{}", self.client_first_bare).into_bytes())
         }
@@ -411,7 +416,9 @@ mod scram {
                 .map_err(|_| sasl_err("scram server signature is not base64"))?;
             match &self.server_signature {
                 Some(expected) if ct_eq(expected, &got) => Ok(()),
-                Some(_) => Err(sasl_err("scram server signature mismatch (server not authentic)")),
+                Some(_) => Err(sasl_err(
+                    "scram server signature mismatch (server not authentic)",
+                )),
                 None => Err(sasl_err("scram server-final received before server-first")),
             }
         }
@@ -459,7 +466,8 @@ mod scram {
             );
 
             // server-final verifier from the RFC.
-            c.verify_server_final(b"v=rmF9pqV8S7suAoZWja4dJRkFsKQ=").unwrap();
+            c.verify_server_final(b"v=rmF9pqV8S7suAoZWja4dJRkFsKQ=")
+                .unwrap();
             assert!(c.verify_server_final(b"v=AAAA").is_err());
         }
     }
@@ -492,10 +500,7 @@ mod tests {
             .unwrap();
             // expect init
             let init = st.read_frame().await.unwrap();
-            assert!(matches!(
-                init.body,
-                FrameBody::Sasl(SaslFrame::Init(_))
-            ));
+            assert!(matches!(init.body, FrameBody::Sasl(SaslFrame::Init(_))));
             // success
             st.send_sasl(&SaslFrame::Outcome(SaslOutcome {
                 code: SaslCode::Ok,

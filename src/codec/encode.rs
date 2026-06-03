@@ -42,7 +42,11 @@ fn encode_var(buf: &mut BytesMut, code8: u8, code32: u8, bytes: &[u8]) {
 
 impl Encode for bool {
     fn encode(&self, buf: &mut BytesMut) {
-        buf.put_u8(if *self { codes::BOOL_TRUE } else { codes::BOOL_FALSE });
+        buf.put_u8(if *self {
+            codes::BOOL_TRUE
+        } else {
+            codes::BOOL_FALSE
+        });
     }
 }
 
@@ -310,7 +314,11 @@ pub fn encode_described_list(
     let mut count = total;
     while count > 0 {
         let start = starts[count - 1];
-        let end = if count < total { starts[count] } else { buf.len() };
+        let end = if count < total {
+            starts[count]
+        } else {
+            buf.len()
+        };
         if end - start == 1 && buf[start] == codes::NULL {
             count -= 1;
         } else {

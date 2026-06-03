@@ -84,9 +84,7 @@ impl SessionWindows {
             // Peer has not received anything yet: window is just its incoming-window.
             self.remote_incoming_window = flow.incoming_window.wrapping_sub(self.next_outgoing_id);
         }
-        self.next_incoming_id = self
-            .next_incoming_id
-            .max(flow.next_outgoing_id);
+        self.next_incoming_id = self.next_incoming_id.max(flow.next_outgoing_id);
         self.remote_outgoing_window = flow.outgoing_window;
     }
 
@@ -120,10 +118,12 @@ mod tests {
         let mut w = windows();
         assert!(!w.can_send()); // peer window unknown until begin
 
-        let mut begin = Begin::default();
-        begin.next_outgoing_id = 5;
-        begin.incoming_window = 2;
-        begin.outgoing_window = 8;
+        let begin = Begin {
+            next_outgoing_id: 5,
+            incoming_window: 2,
+            outgoing_window: 8,
+            ..Default::default()
+        };
         w.on_peer_begin(&begin);
 
         assert!(w.can_send());
@@ -138,19 +138,20 @@ mod tests {
     #[test]
     fn flow_reopens_window() {
         let mut w = windows();
-        let mut begin = Begin::default();
-        begin.incoming_window = 0;
+        let begin = Begin {
+            incoming_window: 0,
+            ..Default::default()
+        };
         w.on_peer_begin(&begin);
         assert!(!w.can_send());
 
-        let mut flow = Flow {
+        let flow = Flow {
             next_incoming_id: Some(0),
             incoming_window: 4,
             next_outgoing_id: 0,
             outgoing_window: 10,
             ..Default::default()
         };
-        flow.incoming_window = 4;
         w.on_peer_flow(&flow);
         assert_eq!(w.remote_incoming_window, 4);
         assert!(w.can_send());
@@ -159,8 +160,10 @@ mod tests {
     #[test]
     fn incoming_window_replenish() {
         let mut w = windows();
-        let mut begin = Begin::default();
-        begin.incoming_window = 1;
+        let begin = Begin {
+            incoming_window: 1,
+            ..Default::default()
+        };
         w.on_peer_begin(&begin);
         for _ in 0..9 {
             w.record_incoming(0);

@@ -13,8 +13,7 @@ pub mod value;
 
 pub use decode::{Decode, DecodeError, peek_code};
 pub use described::{
-    Descriptor, ListDecoder, decode_described_list, decode_descriptor, descriptors,
-    peek_descriptor,
+    Descriptor, ListDecoder, decode_described_list, decode_descriptor, descriptors, peek_descriptor,
 };
 pub use encode::{
     Encode, FieldWriter, encode_described_list, encode_descriptor, encode_map_entries, encode_null,

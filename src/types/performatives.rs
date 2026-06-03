@@ -317,4 +317,3 @@ mod tests {
         assert!(matches!(r, Err(DecodeError::MissingField("name"))));
     }
 }
-

@@ -19,16 +19,16 @@ use crate::link::delivery::PartialDelivery;
 use crate::link::receiver::ReceiverLink;
 use crate::link::sender::{PendingSend, SenderLink};
 use crate::observe::SharedMetrics;
-use crate::proto::{
-    IncomingDelivery, LinkAttached, LinkEvent, Reply, SessionEvent, SessionOpened,
-};
+use crate::proto::{IncomingDelivery, LinkAttached, LinkEvent, Reply, SessionEvent, SessionOpened};
 use crate::session::registry::{HandleAllocator, RemoteHandleMap};
 use crate::session::window::SessionWindows;
 use crate::transport::IoStream;
 use crate::transport::frame::FramedTransport;
 use crate::types::definitions::{Error as AmqpError, ReceiverSettleMode, Role};
 use crate::types::messaging::{Accepted, DeliveryState};
-use crate::types::performatives::{Attach, Begin, Detach, Disposition, End, Flow, Performative, Transfer};
+use crate::types::performatives::{
+    Attach, Begin, Detach, Disposition, End, Flow, Performative, Transfer,
+};
 
 /// The lifecycle phase of a session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -215,7 +215,11 @@ impl Session {
 
     /// Handle the peer's responding `attach`: bind handles, mark attached, grant
     /// initial receiver credit, and complete the attach reply.
-    pub fn on_peer_attach<S: IoStream>(&mut self, attach: Attach, transport: &mut FramedTransport<S>) {
+    pub fn on_peer_attach<S: IoStream>(
+        &mut self,
+        attach: Attach,
+        transport: &mut FramedTransport<S>,
+    ) {
         let local = self.links.iter().find_map(|(h, l)| {
             let name = match l {
                 Link::Sender(s) => &s.name,
@@ -314,7 +318,7 @@ impl Session {
                 break;
             }
 
-                let pending = sender.outbox.pop_front().expect("non-empty");
+            let pending = sender.outbox.pop_front().expect("non-empty");
             let delivery_id = windows.next_outgoing_id;
             let tag = sender.next_delivery_tag();
             send_message_frames(
@@ -369,7 +373,9 @@ impl Session {
         let Some(local) = self.remote_handles.resolve(transfer.handle) else {
             return Ok(());
         };
-        let need_session_flow = self.windows.record_incoming(transfer.delivery_id.unwrap_or(0));
+        let need_session_flow = self
+            .windows
+            .record_incoming(transfer.delivery_id.unwrap_or(0));
 
         let local_channel = self.local_channel;
 
@@ -436,7 +442,8 @@ impl Session {
 
         // Replenish the session incoming-window if exhausted.
         if need_session_flow {
-            self.windows.replenish_incoming(self.windows.outgoing_window.max(1));
+            self.windows
+                .replenish_incoming(self.windows.outgoing_window.max(1));
             let flow = self.windows.build_flow();
             transport.queue_amqp(local_channel, &Performative::Flow(flow), None);
         }
@@ -508,7 +515,9 @@ impl Session {
                         if s.unsettled.is_empty() {
                             continue; // disposition can't reference this link's deliveries
                         }
-                        let affected = s.unsettled.apply_disposition(first, last, state.as_ref(), settled);
+                        let affected =
+                            s.unsettled
+                                .apply_disposition(first, last, state.as_ref(), settled);
                         for id in affected {
                             // Complete the send future only on a TERMINAL outcome
                             // (or once the delivery is settled).
@@ -542,7 +551,8 @@ impl Session {
                 for link in self.links.values_mut() {
                     if let Link::Receiver(r) = link {
                         if !r.unsettled.is_empty() {
-                            r.unsettled.apply_disposition(first, last, state.as_ref(), settled);
+                            r.unsettled
+                                .apply_disposition(first, last, state.as_ref(), settled);
                         }
                     }
                 }
@@ -580,12 +590,18 @@ impl Session {
             state: Some(state.clone()),
             batchable: false,
         };
-        transport.queue_amqp(self.local_channel, &Performative::Disposition(disposition), None);
+        transport.queue_amqp(
+            self.local_channel,
+            &Performative::Disposition(disposition),
+            None,
+        );
 
         // Apply only to the owning link (no full-table scan).
         if let Some(Link::Receiver(r)) = self.links.get_mut(&handle) {
             if !r.unsettled.is_empty() {
-                let affected = r.unsettled.apply_disposition(f, l, Some(&state), wire_settled);
+                let affected = r
+                    .unsettled
+                    .apply_disposition(f, l, Some(&state), wire_settled);
                 if wire_settled {
                     self.metrics.on_inflight(-(affected.len() as i64));
                 }
@@ -622,8 +638,11 @@ impl Session {
         if let Some(peer_handle) = flow.handle {
             if let Some(local) = self.remote_handles.resolve(peer_handle) {
                 if let Some(Link::Sender(s)) = self.links.get_mut(&local) {
-                    s.credit
-                        .apply_flow_as_sender(flow.delivery_count, flow.link_credit, flow.drain);
+                    s.credit.apply_flow_as_sender(
+                        flow.delivery_count,
+                        flow.link_credit,
+                        flow.drain,
+                    );
                     self.metrics.on_credit(local, s.credit.link_credit);
                     let _ = s.events.try_send(LinkEvent::Credit {
                         credit: s.credit.link_credit,
@@ -707,7 +726,11 @@ impl Session {
     }
 
     /// Handle the peer's `detach`.
-    pub fn on_peer_detach<S: IoStream>(&mut self, detach: Detach, transport: &mut FramedTransport<S>) {
+    pub fn on_peer_detach<S: IoStream>(
+        &mut self,
+        detach: Detach,
+        transport: &mut FramedTransport<S>,
+    ) {
         let Some(local) = self.remote_handles.resolve(detach.handle) else {
             return;
         };

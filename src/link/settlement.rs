@@ -124,8 +124,8 @@ impl UnsettledMap {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::messaging::{Accepted, Rejected};
     use crate::types::definitions::AmqpError;
+    use crate::types::messaging::{Accepted, Rejected};
 
     #[test]
     fn insert_settle_and_range() {
@@ -151,7 +151,10 @@ mod tests {
             1,
             1,
             Some(&DeliveryState::Rejected(Rejected {
-                error: Some(crate::types::definitions::Error::new(AmqpError::NotFound, None)),
+                error: Some(crate::types::definitions::Error::new(
+                    AmqpError::NotFound,
+                    None,
+                )),
             })),
             false,
         );
@@ -163,11 +166,22 @@ mod tests {
     #[test]
     fn snapshot_preserves_states_in_order() {
         let mut m = UnsettledMap::new();
-        m.insert(2, Bytes::from_static(b"b"), Some(DeliveryState::Accepted(Accepted::default())));
-        m.insert(1, Bytes::from_static(b"a"), Some(DeliveryState::Accepted(Accepted::default())));
+        m.insert(
+            2,
+            Bytes::from_static(b"b"),
+            Some(DeliveryState::Accepted(Accepted::default())),
+        );
+        m.insert(
+            1,
+            Bytes::from_static(b"a"),
+            Some(DeliveryState::Accepted(Accepted::default())),
+        );
         let snap = m.snapshot();
         // ordered by delivery-id (1 then 2)
         let tags: Vec<_> = snap.iter().map(|(k, _)| k.clone()).collect();
-        assert_eq!(tags, vec![Bytes::from_static(b"a"), Bytes::from_static(b"b")]);
+        assert_eq!(
+            tags,
+            vec![Bytes::from_static(b"a"), Bytes::from_static(b"b")]
+        );
     }
 }
