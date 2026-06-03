@@ -47,8 +47,9 @@ pub struct SenderLink {
     pub credit: LinkCredit,
     /// Unsettled (sent, awaiting disposition) deliveries.
     pub unsettled: UnsettledMap,
-    /// Per-delivery settle-awaiting replies.
-    pub pending: HashMap<u32, Reply<DeliveryState, SendError>>,
+    /// Per-delivery settle-awaiting replies, with the send instant (for the
+    /// send-to-settle latency metric).
+    pub pending: HashMap<u32, (Reply<DeliveryState, SendError>, std::time::Instant)>,
     /// Messages queued because there was no credit/window when sent.
     pub outbox: VecDeque<PendingSend>,
     /// Our requested sender settle mode.

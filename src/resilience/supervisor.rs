@@ -104,7 +104,10 @@ pub async fn connect_with_retry(
         match attempt {
             Ok(conn) => return Ok(conn),
             Err(e) if e.is_retryable() => match backoff.next_delay() {
-                Some(delay) => tokio::time::sleep(delay).await,
+                Some(delay) => {
+                    metrics.on_reconnect(backoff.attempt());
+                    tokio::time::sleep(delay).await;
+                }
                 None => return Err(e),
             },
             Err(e) => return Err(e),

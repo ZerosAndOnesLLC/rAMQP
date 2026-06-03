@@ -217,6 +217,7 @@ mod tests {
             .unwrap();
 
         let mut sent_to_consumer = false;
+        let mut current_delivery: Option<u32> = None;
         loop {
             let frame = match framed.read_frame().await {
                 Ok(f) => f,
@@ -302,21 +303,29 @@ mod tests {
                     }
                 }
                 FrameBody::Amqp(Performative::Transfer(t), _) => {
-                    framed
-                        .send_amqp(
-                            0,
-                            &Performative::Disposition(Disposition {
-                                role: Role::Receiver,
-                                first: t.delivery_id.unwrap(),
-                                last: None,
-                                settled: true,
-                                state: Some(DeliveryState::Accepted(Accepted::default())),
-                                batchable: false,
-                            }),
-                            None,
-                        )
-                        .await
-                        .unwrap();
+                    // Track the delivery id (present only on the first frame) and
+                    // settle once the final (more = false) frame arrives.
+                    if let Some(id) = t.delivery_id {
+                        current_delivery = Some(id);
+                    }
+                    if !t.more {
+                        let id = current_delivery.take().unwrap();
+                        framed
+                            .send_amqp(
+                                0,
+                                &Performative::Disposition(Disposition {
+                                    role: Role::Receiver,
+                                    first: id,
+                                    last: None,
+                                    settled: true,
+                                    state: Some(DeliveryState::Accepted(Accepted::default())),
+                                    batchable: false,
+                                }),
+                                None,
+                            )
+                            .await
+                            .unwrap();
+                    }
                 }
                 FrameBody::Amqp(Performative::Detach(d), _) => {
                     framed
@@ -386,6 +395,7 @@ mod tests {
             frames_in: AtomicU64,
             frames_out: AtomicU64,
             sent: AtomicU64,
+            settle_latencies: AtomicU64,
         }
         impl crate::observe::Metrics for Counters {
             fn on_frame_received(&self, _bytes: usize) {
@@ -396,6 +406,9 @@ mod tests {
             }
             fn on_transfer_sent(&self) {
                 self.sent.fetch_add(1, Ordering::Relaxed);
+            }
+            fn on_send_to_settle(&self, _latency: std::time::Duration) {
+                self.settle_latencies.fetch_add(1, Ordering::Relaxed);
             }
         }
 
@@ -417,6 +430,8 @@ mod tests {
         assert!(counters.frames_in.load(Ordering::Relaxed) > 0);
         assert!(counters.frames_out.load(Ordering::Relaxed) > 0);
         assert_eq!(counters.sent.load(Ordering::Relaxed), 1);
+        // the send-to-settle latency metric fired once for the settled delivery
+        assert_eq!(counters.settle_latencies.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
@@ -431,6 +446,31 @@ mod tests {
         consumer.accept(&delivery).await.unwrap();
 
         consumer.detach().await.unwrap();
+        session.end().await.unwrap();
+        conn.close().await.unwrap();
+        broker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn end_to_end_produce_multiframe() {
+        let (url, broker) = spawn_broker().await;
+        let mut config = Config::default();
+        config.connection.max_frame_size = 512; // force multi-frame splitting
+        let conn = crate::api::client::ConnectionBuilder::new(&url)
+            .config(config)
+            .connect()
+            .await
+            .unwrap();
+        let session = conn.begin_session().await.unwrap();
+        let producer = session.create_producer("queue").await.unwrap();
+
+        // A body well over the frame size must split into multiple transfers and
+        // be reassembled by the peer.
+        let big = "x".repeat(4000);
+        let outcome = producer.send(Message::text(&big)).await.unwrap();
+        assert!(matches!(outcome, DeliveryState::Accepted(_)));
+
+        producer.detach().await.unwrap();
         session.end().await.unwrap();
         conn.close().await.unwrap();
         broker.await.unwrap();

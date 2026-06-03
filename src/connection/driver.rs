@@ -303,7 +303,14 @@ impl<S: IoStream> Driver<S> {
             }
         };
         begin.remote_channel = None;
-        let session = Session::new(SessionId::next(), channel, &begin, events, reply);
+        let session = Session::new(
+            SessionId::next(),
+            channel,
+            &begin,
+            events,
+            reply,
+            self.metrics.clone(),
+        );
         self.transport
             .send_amqp(channel, &Performative::Begin(begin), None)
             .await?;

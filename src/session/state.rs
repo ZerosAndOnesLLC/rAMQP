@@ -18,6 +18,7 @@ use crate::link::credit::LinkCredit;
 use crate::link::delivery::PartialDelivery;
 use crate::link::receiver::ReceiverLink;
 use crate::link::sender::{PendingSend, SenderLink};
+use crate::observe::SharedMetrics;
 use crate::proto::{
     IncomingDelivery, LinkAttached, LinkEvent, Reply, SessionEvent, SessionOpened,
 };
@@ -43,7 +44,6 @@ pub enum SessionPhase {
 }
 
 /// Per-session protocol state owned by the driver.
-#[derive(Debug)]
 pub struct Session {
     /// Process-local logical id (stable across reconnects).
     pub session_id: SessionId,
@@ -59,6 +59,18 @@ pub struct Session {
     events: mpsc::UnboundedSender<SessionEvent>,
     pending_begin: Option<Reply<SessionOpened, SessionError>>,
     pending_end: Option<Reply<(), SessionError>>,
+    metrics: SharedMetrics,
+}
+
+impl std::fmt::Debug for Session {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Session")
+            .field("session_id", &self.session_id)
+            .field("local_channel", &self.local_channel)
+            .field("phase", &self.phase)
+            .field("links", &self.links.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Session {
@@ -70,6 +82,7 @@ impl Session {
         begin: &Begin,
         events: mpsc::UnboundedSender<SessionEvent>,
         pending_begin: Reply<SessionOpened, SessionError>,
+        metrics: SharedMetrics,
     ) -> Self {
         let mut windows = SessionWindows::new(&SessionConfig {
             incoming_window: begin.incoming_window,
@@ -89,6 +102,7 @@ impl Session {
             events,
             pending_begin: Some(pending_begin),
             pending_end: None,
+            metrics,
         }
     }
 
@@ -226,6 +240,7 @@ impl Session {
                 let grant = r.initial_credit();
                 if grant > 0 {
                     r.credit.set_credit(grant);
+                    self.metrics.on_credit(r.handle, r.credit.link_credit);
                     flow_to_send = Some(link_flow(r.handle, &r.credit, &windows));
                 }
             }
@@ -319,8 +334,11 @@ impl Session {
                 }
             } else {
                 sender.unsettled.insert(delivery_id, tag, None);
+                self.metrics.on_inflight(1);
                 if let Some(reply) = pending.reply {
-                    sender.pending.insert(delivery_id, reply);
+                    sender
+                        .pending
+                        .insert(delivery_id, (reply, std::time::Instant::now()));
                 }
             }
         }
@@ -367,6 +385,7 @@ impl Session {
                 r.credit.record_received();
                 if let Some(grant) = r.credit.auto_refill() {
                     r.credit.grant(grant);
+                    self.metrics.on_credit(r.handle, r.credit.link_credit);
                     link_flow_to_send = Some(link_flow(r.handle, &r.credit, &windows));
                 }
             } else {
@@ -405,6 +424,7 @@ impl Session {
                             delivery.delivery_tag.clone(),
                             None,
                         );
+                        self.metrics.on_inflight(1);
                     }
                     let event = LinkEvent::Delivery(IncomingDelivery {
                         delivery_id: delivery.delivery_id,
@@ -416,6 +436,7 @@ impl Session {
 
                     if let Some(grant) = r.credit.auto_refill() {
                         r.credit.grant(grant);
+                        self.metrics.on_credit(r.handle, r.credit.link_credit);
                         link_flow_to_send = Some(link_flow(r.handle, &r.credit, &windows));
                     }
                 }
@@ -508,9 +529,13 @@ impl Session {
                                 _ => None,
                             };
                             if let Some(rs) = resolve {
-                                if let Some(reply) = s.pending.remove(&id) {
+                                if let Some((reply, sent_at)) = s.pending.remove(&id) {
                                     let _ = reply.send(Ok(rs));
+                                    self.metrics.on_send_to_settle(sent_at.elapsed());
                                 }
+                            }
+                            if settled {
+                                self.metrics.on_inflight(-1);
                             }
                             if let Some(st) = &state {
                                 let _ = s.events.try_send(LinkEvent::Disposition {
@@ -559,7 +584,10 @@ impl Session {
         for link in self.links.values_mut() {
             if let Link::Receiver(r) = link {
                 if !r.unsettled.is_empty() {
-                    r.unsettled.apply_disposition(f, l, Some(&state), settled);
+                    let affected = r.unsettled.apply_disposition(f, l, Some(&state), settled);
+                    if settled {
+                        self.metrics.on_inflight(-(affected.len() as i64));
+                    }
                 }
             }
         }
@@ -578,6 +606,7 @@ impl Session {
                 if let Some(Link::Sender(s)) = self.links.get_mut(&local) {
                     s.credit
                         .apply_flow_as_sender(flow.delivery_count, flow.link_credit, flow.drain);
+                    self.metrics.on_credit(local, s.credit.link_credit);
                     let _ = s.events.try_send(LinkEvent::Credit {
                         credit: s.credit.link_credit,
                         drain: s.credit.drain,
