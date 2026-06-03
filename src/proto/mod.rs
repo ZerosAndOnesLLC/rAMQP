@@ -111,6 +111,17 @@ pub enum DriverCommand {
         /// The `flow` performative.
         flow: Box<Flow>,
     },
+    /// Grant *additional* receiver credit (consumer-driven auto-replenish). Keeps
+    /// outstanding credit bounded so the broker never overruns the delivery
+    /// channel.
+    GrantCredit {
+        /// The owning session's channel.
+        channel: ChannelId,
+        /// The receiver link handle.
+        handle: Handle,
+        /// Credit units to add.
+        credit: u32,
+    },
     /// Close the whole connection.
     CloseConnection {
         /// Optional error to send in `close`.

@@ -20,6 +20,11 @@ pub struct Consumer {
     channel: ChannelId,
     handle: Handle,
     events: mpsc::Receiver<LinkEvent>,
+    /// Target outstanding credit for auto mode (0 = manual; no auto-replenish).
+    credit_window: u32,
+    /// Replenish once this many deliveries have been consumed since the last top-up.
+    replenish_every: u32,
+    consumed: u32,
 }
 
 impl Consumer {
@@ -28,12 +33,17 @@ impl Consumer {
         channel: ChannelId,
         handle: Handle,
         events: mpsc::Receiver<LinkEvent>,
+        credit_window: u32,
+        low_water: u32,
     ) -> Self {
         Consumer {
             commands,
             channel,
             handle,
             events,
+            credit_window,
+            replenish_every: credit_window.saturating_sub(low_water).max(1),
+            consumed: 0,
         }
     }
 
@@ -42,13 +52,21 @@ impl Consumer {
         self.handle
     }
 
-    /// Await the next delivery (auto-credit keeps the link fed; for manual
-    /// credit, call [`credit`](Consumer::credit) first).
+    /// Await the next delivery.
+    ///
+    /// Credit is **consumer-driven**: in auto mode the link is granted
+    /// `credit_window` credit and topped back up as deliveries are consumed, so
+    /// the broker can never push more than this handle can buffer (preventing a
+    /// slow consumer from back-pressuring its whole connection). In manual mode
+    /// call [`credit`](Consumer::credit) yourself.
     pub async fn recv(&mut self) -> Result<Delivery, RecvError> {
         loop {
             match self.events.recv().await {
                 Some(LinkEvent::Delivery(d)) => {
-                    return Ok(Delivery::new(d.delivery_id, d.delivery_tag, d.settled, d.message));
+                    let delivery =
+                        Delivery::new(d.delivery_id, d.delivery_tag, d.settled, d.message);
+                    self.after_consume().await;
+                    return Ok(delivery);
                 }
                 Some(LinkEvent::Detached { error }) => {
                     return Err(detached_error(error));
@@ -57,6 +75,30 @@ impl Consumer {
                 Some(_) => continue,
                 None => return Err(RecvError::msg(ErrorKind::Detached, "link closed")),
             }
+        }
+    }
+
+    /// Top up auto-credit as the application drains deliveries.
+    ///
+    /// Grants are *additive* (exactly what was consumed), so outstanding credit
+    /// stays ≈ `credit_window` and the broker can never put more in flight than
+    /// the delivery channel can hold.
+    async fn after_consume(&mut self) {
+        if self.credit_window == 0 {
+            return; // manual credit mode
+        }
+        self.consumed += 1;
+        if self.consumed >= self.replenish_every {
+            let grant = self.consumed;
+            self.consumed = 0;
+            let _ = self
+                .commands
+                .send(DriverCommand::GrantCredit {
+                    channel: self.channel,
+                    handle: self.handle,
+                    credit: grant,
+                })
+                .await;
         }
     }
 

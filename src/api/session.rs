@@ -93,10 +93,17 @@ impl Session {
             max_message_size: self.config.link.max_message_size,
             ..Default::default()
         };
-        let capacity = match credit_mode {
-            CreditMode::Auto { initial, .. } => (initial as usize) + 64,
-            CreditMode::Manual => 256,
+        let (window, low_water) = match credit_mode {
+            CreditMode::Auto {
+                initial,
+                refill_threshold,
+            } => (initial, refill_threshold),
+            CreditMode::Manual => (0, 0),
         };
+        // The delivery channel must hold the full credit window so the driver
+        // never blocks handing off a delivery (no connection-wide head-of-line
+        // blocking from a slow consumer).
+        let capacity = (window as usize).max(1) + 64;
         let (evt_tx, evt_rx) = mpsc::channel(capacity);
         let attached = self.attach(attach, credit_mode, evt_tx).await?;
         Ok(Consumer::new(
@@ -104,6 +111,8 @@ impl Session {
             self.channel,
             attached,
             evt_rx,
+            window,
+            low_water,
         ))
     }
 

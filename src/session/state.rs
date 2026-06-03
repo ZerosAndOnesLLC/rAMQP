@@ -314,7 +314,7 @@ impl Session {
                 break;
             }
 
-            let pending = sender.outbox.pop_front().expect("non-empty");
+                let pending = sender.outbox.pop_front().expect("non-empty");
             let delivery_id = windows.next_outgoing_id;
             let tag = sender.next_delivery_tag();
             send_message_frames(
@@ -371,25 +371,20 @@ impl Session {
         };
         let need_session_flow = self.windows.record_incoming(transfer.delivery_id.unwrap_or(0));
 
-        let windows = self.windows;
         let local_channel = self.local_channel;
 
         // Synchronous assembly + state updates; collect what to emit/queue.
+        // Credit is consumer-driven (the Consumer replenishes as it reads), so
+        // the driver never grants credit here — that decoupling is what caused a
+        // slow consumer to back-pressure (and deadlock) the whole connection.
         let mut emit: Option<(LinkEvent, mpsc::Sender<LinkEvent>)> = None;
-        let mut link_flow_to_send = None;
         let mut size_exceeded = false;
 
         if let Some(Link::Receiver(r)) = self.links.get_mut(&local) {
             if transfer.aborted {
-                // Abandoned delivery: drop any partial, consume the credit, emit
-                // nothing, and refill credit if due.
+                // Abandoned delivery: drop any partial, account the credit, emit nothing.
                 r.partial = None;
                 r.credit.record_received();
-                if let Some(grant) = r.credit.auto_refill() {
-                    r.credit.grant(grant);
-                    self.metrics.on_credit(r.handle, r.credit.link_credit);
-                    link_flow_to_send = Some(link_flow(r.handle, &r.credit, &windows));
-                }
             } else {
                 // A continuation transfer must carry the same delivery-id (or none).
                 if let (Some(partial), Some(did)) = (r.partial.as_ref(), transfer.delivery_id) {
@@ -435,12 +430,6 @@ impl Session {
                         message: delivery.into_raw(),
                     });
                     emit = Some((event, r.events.clone()));
-
-                    if let Some(grant) = r.credit.auto_refill() {
-                        r.credit.grant(grant);
-                        self.metrics.on_credit(r.handle, r.credit.link_credit);
-                        link_flow_to_send = Some(link_flow(r.handle, &r.credit, &windows));
-                    }
                 }
             }
         }
@@ -451,12 +440,10 @@ impl Session {
             let flow = self.windows.build_flow();
             transport.queue_amqp(local_channel, &Performative::Flow(flow), None);
         }
-        if let Some(flow) = link_flow_to_send {
-            transport.queue_amqp(local_channel, &Performative::Flow(flow), None);
-        }
         if let Some((event, sender)) = emit {
-            // Non-blocking on the common path; only a momentarily-full consumer
-            // channel falls back to an awaited send (back-pressure without loss).
+            // Consumer-driven credit guarantees the channel has room, so this is
+            // non-blocking on the common path; the awaited fallback is a safety
+            // net that never blocks indefinitely under correct credit accounting.
             match sender.try_send(event) {
                 Ok(()) => {}
                 Err(mpsc::error::TrySendError::Full(event)) => {
@@ -603,6 +590,24 @@ impl Session {
                     self.metrics.on_inflight(-(affected.len() as i64));
                 }
             }
+        }
+    }
+
+    /// Grant *additional* receiver credit and advertise it (consumer-driven
+    /// auto-replenish; keeps outstanding credit ≈ the channel window).
+    pub fn grant_credit<S: IoStream>(
+        &mut self,
+        handle: u32,
+        credit: u32,
+        transport: &mut FramedTransport<S>,
+    ) {
+        let windows = self.windows;
+        let local_channel = self.local_channel;
+        if let Some(Link::Receiver(r)) = self.links.get_mut(&handle) {
+            r.credit.grant(credit);
+            self.metrics.on_credit(handle, r.credit.link_credit);
+            let flow = link_flow(handle, &r.credit, &windows);
+            transport.queue_amqp(local_channel, &Performative::Flow(flow), None);
         }
     }
 

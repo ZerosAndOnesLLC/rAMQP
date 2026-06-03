@@ -291,6 +291,16 @@ impl<S: IoStream> Driver<S> {
                 }
                 Ok(false)
             }
+            DriverCommand::GrantCredit {
+                channel,
+                handle,
+                credit,
+            } => {
+                if let Some(session) = self.sessions.get_mut(&channel.value()) {
+                    session.grant_credit(handle.value(), credit, &mut self.transport);
+                }
+                Ok(false)
+            }
         }
     }
 
