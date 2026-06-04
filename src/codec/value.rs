@@ -472,7 +472,9 @@ fn decode_array(buf: &mut Bytes, count: u32, depth: u32) -> Result<Vec<Value>, D
         for i in 0..count {
             let body = decode_value_body(buf, elem_ctor, depth)?;
             let d = if i + 1 == count {
-                descriptor.take().expect("descriptor present until last element")
+                descriptor
+                    .take()
+                    .expect("descriptor present until last element")
             } else {
                 descriptor.as_ref().expect("descriptor present").clone()
             };

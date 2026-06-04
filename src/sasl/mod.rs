@@ -129,7 +129,9 @@ fn sasl_outcome_error(code: SaslCode, additional: Option<&[u8]>) -> ConnectError
         SaslCode::Ok => "ok",
         SaslCode::Auth => "authentication failed (bad credentials)",
         SaslCode::Sys => "system error",
-        SaslCode::SysPerm => "permanent system error (a retry with the same information will not succeed)",
+        SaslCode::SysPerm => {
+            "permanent system error (a retry with the same information will not succeed)"
+        }
         SaslCode::SysTemp => "transient system error (a retry may succeed)",
     };
     let mut message = format!("SASL authentication failed: {detail}");
@@ -360,7 +362,9 @@ mod scram {
         stringprep::saslprep(s)
             .map(|c| c.into_owned())
             .map_err(|_| {
-                sasl_err("username or password contains characters prohibited by SASLprep (RFC 4013)")
+                sasl_err(
+                    "username or password contains characters prohibited by SASLprep (RFC 4013)",
+                )
             })
     }
 

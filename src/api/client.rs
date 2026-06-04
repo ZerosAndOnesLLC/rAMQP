@@ -206,7 +206,10 @@ mod tests {
         // no credentials → unchanged
         assert_eq!(redact_url("amqp://broker:5672"), "amqp://broker:5672");
         // username only
-        assert_eq!(redact_url("amqps://user@host/path"), "amqps://***@host/path");
+        assert_eq!(
+            redact_url("amqps://user@host/path"),
+            "amqps://***@host/path"
+        );
     }
 
     #[test]

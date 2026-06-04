@@ -323,7 +323,8 @@ impl Session {
             // queued) rather than growing the unsettled/pending maps without
             // limit. Pre-settled sends never accumulate, so they are not gated.
             let front = sender.outbox.front().expect("non-empty");
-            if !front.settled && sender.unsettled.len() >= crate::link::sender::MAX_UNSETTLED_PER_LINK
+            if !front.settled
+                && sender.unsettled.len() >= crate::link::sender::MAX_UNSETTLED_PER_LINK
             {
                 break;
             }

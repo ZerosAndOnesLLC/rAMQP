@@ -85,7 +85,11 @@ impl UnsettledMap {
         if settled {
             // The entries are about to be dropped, so skip cloning the state into
             // them — just collect the affected ids and remove them.
-            let ids: Vec<u32> = self.entries.range(first..=last).map(|(id, _)| *id).collect();
+            let ids: Vec<u32> = self
+                .entries
+                .range(first..=last)
+                .map(|(id, _)| *id)
+                .collect();
             for id in &ids {
                 self.entries.remove(id);
             }
