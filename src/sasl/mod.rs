@@ -64,9 +64,10 @@ impl SaslProfile {
     }
 
     /// Produce the `sasl-init` initial response and the per-mechanism state used
-    /// to answer any challenges.
-    fn start(&self) -> (Option<Bytes>, MechState) {
-        match self {
+    /// to answer any challenges. Errors if SCRAM credential preparation
+    /// (SASLprep) rejects the username or password.
+    fn start(&self) -> Result<(Option<Bytes>, MechState), ConnectError> {
+        Ok(match self {
             SaslProfile::Anonymous => (Some(Bytes::from_static(b"anonymous")), MechState::Simple),
             SaslProfile::Plain { authcid, passwd } => {
                 (Some(plain_response(authcid, passwd)), MechState::Simple)
@@ -83,12 +84,37 @@ impl SaslProfile {
                 username,
                 password,
             } => {
-                let mut client = ScramClient::new(*mechanism, username, password);
+                let mut client = ScramClient::new(*mechanism, username, password)?;
                 let first = client.client_first();
                 (Some(first), MechState::Scram(client))
             }
+        })
+    }
+}
+
+/// Build a classified error from a non-OK SASL outcome, naming the specific
+/// `sasl-code` so callers can tell a credential failure (`auth`) and a permanent
+/// system error (`sys-perm`) from a transient one (`sys` / `sys-temp`, where a
+/// later retry may succeed). SASL failures remain classified as fatal so the
+/// supervisor does not auto-hammer authentication; a caller may retry a
+/// transient failure deliberately after inspecting this message.
+fn sasl_outcome_error(code: SaslCode, additional: Option<&[u8]>) -> ConnectError {
+    let detail = match code {
+        SaslCode::Ok => "ok",
+        SaslCode::Auth => "authentication failed (bad credentials)",
+        SaslCode::Sys => "system error",
+        SaslCode::SysPerm => "permanent system error (a retry with the same information will not succeed)",
+        SaslCode::SysTemp => "transient system error (a retry may succeed)",
+    };
+    let mut message = format!("SASL authentication failed: {detail}");
+    if let Some(text) = additional.and_then(|d| std::str::from_utf8(d).ok()) {
+        let text = text.trim();
+        if !text.is_empty() {
+            message.push_str(" — ");
+            message.push_str(text);
         }
     }
+    ConnectError::msg(ErrorKind::Sasl, message)
 }
 
 fn plain_response(authcid: &str, passwd: &str) -> Bytes {
@@ -161,7 +187,7 @@ pub async fn negotiate<S: IoStream>(
     }
 
     // 2. Send sasl-init.
-    let (initial_response, mut state) = profile.start();
+    let (initial_response, mut state) = profile.start()?;
     transport
         .send_sasl(&SaslFrame::Init(SaslInit {
             mechanism: Symbol::new(chosen),
@@ -180,16 +206,11 @@ pub async fn negotiate<S: IoStream>(
                     .await?;
             }
             FrameBody::Sasl(SaslFrame::Outcome(o)) => {
-                return match o.code {
-                    SaslCode::Ok => {
-                        state.verify_outcome(o.additional_data.as_deref())?;
-                        Ok(())
-                    }
-                    code => Err(ConnectError::msg(
-                        ErrorKind::Sasl,
-                        format!("SASL authentication failed: {code:?}"),
-                    )),
-                };
+                if o.code == SaslCode::Ok {
+                    state.verify_outcome(o.additional_data.as_deref())?;
+                    return Ok(());
+                }
+                return Err(sasl_outcome_error(o.code, o.additional_data.as_deref()));
             }
             other => {
                 return Err(ConnectError::msg(
@@ -306,10 +327,15 @@ mod scram {
         STANDARD_NO_PAD.encode(bytes)
     }
 
-    fn saslprep(s: &str) -> String {
+    /// Apply the SASLprep stringprep profile (RFC 4013) to a username/password.
+    /// RFC 5802 mandates that a SASLprep failure abort authentication rather than
+    /// silently using the unprepared input, so this propagates the error.
+    fn saslprep(s: &str) -> Result<String, ConnectError> {
         stringprep::saslprep(s)
             .map(|c| c.into_owned())
-            .unwrap_or_else(|_| s.to_owned())
+            .map_err(|_| {
+                sasl_err("username or password contains characters prohibited by SASLprep (RFC 4013)")
+            })
     }
 
     fn escape_username(s: &str) -> String {
@@ -317,7 +343,11 @@ mod scram {
     }
 
     impl ScramClient {
-        pub(super) fn new(mechanism: ScramMechanism, username: &str, password: &str) -> Self {
+        pub(super) fn new(
+            mechanism: ScramMechanism,
+            username: &str,
+            password: &str,
+        ) -> Result<Self, ConnectError> {
             Self::with_nonce(mechanism, username, password, gen_nonce())
         }
 
@@ -326,15 +356,15 @@ mod scram {
             username: &str,
             password: &str,
             client_nonce: String,
-        ) -> Self {
-            ScramClient {
+        ) -> Result<Self, ConnectError> {
+            Ok(ScramClient {
                 mechanism,
-                username: saslprep(username),
-                password: saslprep(password),
+                username: saslprep(username)?,
+                password: saslprep(password)?,
                 client_nonce,
                 client_first_bare: String::new(),
                 server_signature: None,
-            }
+            })
         }
 
         pub(super) fn client_first(&mut self) -> Bytes {
@@ -453,7 +483,8 @@ mod scram {
                 "user",
                 "pencil",
                 "fyko+d2lbbFgONRv9qkxdawL".to_owned(),
-            );
+            )
+            .unwrap();
             let first = c.client_first();
             assert_eq!(&first[..], b"n,,n=user,r=fyko+d2lbbFgONRv9qkxdawL");
 
