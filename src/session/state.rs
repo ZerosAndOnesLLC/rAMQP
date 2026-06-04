@@ -118,7 +118,14 @@ impl Session {
 
     /// Apply the peer's `begin`: bind its channel, learn its windows, become
     /// mapped, and complete the begin reply.
+    ///
+    /// Only a session that sent `begin` and is awaiting the peer's may map; a
+    /// duplicate or out-of-phase begin is ignored rather than clobbering live
+    /// flow-control state (the driver also rejects it as a connection error).
     pub fn on_peer_begin(&mut self, remote_channel: u16, begin: &Begin) {
+        if self.phase != SessionPhase::BeginSent {
+            return;
+        }
         self.remote_channel = Some(remote_channel);
         self.windows.on_peer_begin(begin);
         self.phase = SessionPhase::Mapped;
