@@ -417,7 +417,13 @@ impl Session {
                     let delivery_id = DeliveryId(transfer.delivery_id.unwrap_or(0));
                     let tag = transfer.delivery_tag.clone().unwrap_or_default();
                     let settled = transfer.settled.unwrap_or(false);
-                    r.partial = Some(PartialDelivery::new(delivery_id, tag, settled, &payload));
+                    r.partial = Some(PartialDelivery::new(
+                        delivery_id,
+                        tag,
+                        settled,
+                        transfer.state.clone(),
+                        &payload,
+                    ));
                     !transfer.more
                 };
 
@@ -440,6 +446,7 @@ impl Session {
                         delivery_id: delivery.delivery_id,
                         delivery_tag: delivery.delivery_tag.clone(),
                         settled: delivery.settled,
+                        state: delivery.state().cloned(),
                         message: delivery.into_raw(),
                     });
                     emit = Some((event, r.events.clone()));

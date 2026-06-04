@@ -171,6 +171,9 @@ pub struct IncomingDelivery {
     pub message: Bytes,
     /// Whether the peer pre-settled the delivery.
     pub settled: bool,
+    /// The delivery state the sender declared on the transfer, if any (e.g. a
+    /// pre-declared outcome); `None` for the common fresh-delivery case.
+    pub state: Option<DeliveryState>,
 }
 
 /// Events the driver pushes to a link handle (producer or consumer).
