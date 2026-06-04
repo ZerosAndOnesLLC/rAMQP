@@ -82,25 +82,26 @@ impl UnsettledMap {
         state: Option<&DeliveryState>,
         settled: bool,
     ) -> Vec<u32> {
-        let ids: Vec<u32> = self
-            .entries
-            .range(first..=last)
-            .map(|(id, _)| *id)
-            .collect();
-        for id in &ids {
-            if let Some(entry) = self.entries.get_mut(id) {
-                if state.is_some() {
-                    entry.state = state.cloned();
-                }
-                entry.settled = settled;
-            }
-        }
         if settled {
+            // The entries are about to be dropped, so skip cloning the state into
+            // them — just collect the affected ids and remove them.
+            let ids: Vec<u32> = self.entries.range(first..=last).map(|(id, _)| *id).collect();
             for id in &ids {
                 self.entries.remove(id);
             }
+            ids
+        } else {
+            // Update state in a single mutable pass (no second get_mut lookup).
+            let mut ids = Vec::new();
+            for (id, entry) in self.entries.range_mut(first..=last) {
+                if state.is_some() {
+                    entry.state = state.cloned();
+                }
+                entry.settled = false;
+                ids.push(*id);
+            }
+            ids
         }
-        ids
     }
 
     /// Snapshot the map into the `attach.unsettled` form (tag → state) for link
