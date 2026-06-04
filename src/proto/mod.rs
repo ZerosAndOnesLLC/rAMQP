@@ -84,6 +84,9 @@ pub enum DriverCommand {
         settled: bool,
         /// The message format (`0` = AMQP).
         message_format: u32,
+        /// Delivery state to set on the transfer (e.g. a `transactional-state`
+        /// enlisting the message in a transaction); `None` for an ordinary send.
+        state: Option<DeliveryState>,
         /// If present, the driver replies with the terminal outcome once settled.
         reply: Option<Reply<DeliveryState, SendError>>,
     },

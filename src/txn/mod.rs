@@ -70,6 +70,31 @@ fn control_message<T: Encode>(content: &T) -> Bytes {
     buf.freeze()
 }
 
+/// Build the `transactional-state` delivery state that enlists a message in the
+/// transaction `txn_id`. Pass it to
+/// [`Producer::send_with_state`](crate::Producer::send_with_state) to send a
+/// message within a transaction; `outcome` is the provisional outcome (usually
+/// `None` on a send — the coordinator records the result at `discharge`).
+///
+/// ```no_run
+/// # async fn ex(producer: &ramqp::Producer, ctl: &ramqp::txn::TransactionController) -> Result<(), Box<dyn std::error::Error>> {
+/// use ramqp::{Message, txn};
+/// let txn_id = ctl.declare().await?;
+/// producer
+///     .send_with_state(Message::text("in a txn"), txn::transactional_state(txn_id.clone(), None))
+///     .await?;
+/// ctl.commit(txn_id).await?;
+/// # Ok(()) }
+/// ```
+pub fn transactional_state(txn_id: TxnId, outcome: Option<Outcome>) -> DeliveryState {
+    let ts = TransactionalState { txn_id, outcome };
+    // The transfer/disposition `state` field carries the described type verbatim
+    // as `DeliveryState::Other`; reuse the codec to obtain that raw value.
+    let value = from_slice::<crate::codec::Value>(&to_vec(&ts))
+        .expect("transactional-state encodes to a valid described value");
+    DeliveryState::Other(value)
+}
+
 /// Try to interpret a delivery state as a `declared` outcome and extract its
 /// `txn-id`.
 fn declared_txn_id(state: &DeliveryState) -> Option<TxnId> {
@@ -110,13 +135,23 @@ impl TransactionController {
     pub async fn discharge(&self, txn_id: TxnId, fail: bool) -> Result<(), SendError> {
         let body = control_message(&Discharge { txn_id, fail });
         let outcome = self.control.send_bytes(body, false).await?;
+        // Per spec §4.3 a discharge must be answered with accepted or rejected;
+        // any other (non-terminal Released/Modified, or unknown) outcome is a
+        // coordinator protocol violation, not a silent success.
         match outcome {
             DeliveryState::Accepted(_) => Ok(()),
-            DeliveryState::Rejected(_) => Err(SendError::msg(
+            DeliveryState::Rejected(r) => {
+                let mut msg = String::from("transaction discharge was rejected");
+                if let Some(e) = &r.error {
+                    msg.push_str(": ");
+                    msg.push_str(&e.to_string());
+                }
+                Err(SendError::msg(ErrorKind::ProtocolViolation, msg))
+            }
+            other => Err(SendError::msg(
                 ErrorKind::ProtocolViolation,
-                "transaction discharge was rejected",
+                format!("unexpected discharge outcome: {other:?}"),
             )),
-            _ => Ok(()),
         }
     }
 
@@ -171,6 +206,15 @@ mod tests {
         let state: DeliveryState = from_slice(&bytes).unwrap();
         assert!(matches!(state, DeliveryState::Other(_)));
         assert_eq!(declared_txn_id(&state), Some(Bytes::from_static(b"abc")));
+    }
+
+    #[test]
+    fn transactional_state_round_trips_to_txn_state() {
+        let st = transactional_state(Bytes::from_static(b"txn-1"), None);
+        assert!(matches!(st, DeliveryState::Other(_)));
+        // It must encode to the wire as a transactional-state described type.
+        let ts: TransactionalState = from_slice(&to_vec(&st)).unwrap();
+        assert_eq!(ts.txn_id, Bytes::from_static(b"txn-1"));
     }
 
     #[test]

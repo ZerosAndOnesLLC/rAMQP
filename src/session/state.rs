@@ -278,6 +278,7 @@ impl Session {
         body: Bytes,
         settled: bool,
         message_format: u32,
+        state: Option<DeliveryState>,
         reply: Option<Reply<DeliveryState, crate::error::SendError>>,
         transport: &mut FramedTransport<S>,
         max_frame_size: usize,
@@ -287,6 +288,7 @@ impl Session {
                 body,
                 settled,
                 message_format,
+                state,
                 reply,
             }),
             _ => {
@@ -345,6 +347,7 @@ impl Session {
                 &tag,
                 pending.settled,
                 pending.message_format,
+                pending.state.clone(),
                 &pending.body,
                 max_payload,
                 windows,
@@ -834,6 +837,7 @@ fn send_message_frames<S: IoStream>(
     tag: &Bytes,
     settled: bool,
     message_format: u32,
+    state: Option<DeliveryState>,
     body: &[u8],
     max_payload: usize,
     windows: &mut SessionWindows,
@@ -846,6 +850,7 @@ fn send_message_frames<S: IoStream>(
             message_format: Some(message_format),
             settled: Some(settled),
             more: false,
+            state,
             ..Default::default()
         };
         transport.queue_amqp(channel, &Performative::Transfer(first), Some(body));
@@ -859,6 +864,8 @@ fn send_message_frames<S: IoStream>(
         let end = (offset + max_payload).min(body.len());
         let is_last = end == body.len();
         let chunk = &body[offset..end];
+        // The delivery state (e.g. transactional-state) rides only the first
+        // frame of a multi-frame delivery.
         let transfer = if first_frame {
             Transfer {
                 handle,
@@ -867,6 +874,7 @@ fn send_message_frames<S: IoStream>(
                 message_format: Some(message_format),
                 settled: Some(settled),
                 more: !is_last,
+                state: state.clone(),
                 ..Default::default()
             }
         } else {

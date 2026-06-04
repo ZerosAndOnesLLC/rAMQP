@@ -261,6 +261,7 @@ impl<S: IoStream> Driver<S> {
                 body,
                 settled,
                 message_format,
+                state,
                 reply,
             } => {
                 let max = self.negotiated.max_frame_size as usize;
@@ -270,6 +271,7 @@ impl<S: IoStream> Driver<S> {
                         body,
                         settled,
                         message_format,
+                        state,
                         reply,
                         &mut self.transport,
                         max,
@@ -889,6 +891,7 @@ mod tests {
             body: bytes::Bytes::from(body),
             settled: false,
             message_format: 0,
+            state: None,
             reply: Some(stx),
         })
         .await

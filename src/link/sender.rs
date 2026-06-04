@@ -30,6 +30,8 @@ pub struct PendingSend {
     pub settled: bool,
     /// The message format.
     pub message_format: u32,
+    /// Delivery state to set on the transfer (e.g. a `transactional-state`).
+    pub state: Option<DeliveryState>,
     /// Reply with the terminal outcome once settled (if awaited).
     pub reply: Option<Reply<DeliveryState, SendError>>,
 }

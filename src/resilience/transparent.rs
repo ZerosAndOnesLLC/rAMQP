@@ -73,6 +73,7 @@ struct ReplayReq {
     body: Bytes,
     settled: bool,
     message_format: u32,
+    state: Option<DeliveryState>,
     reply: Reply<DeliveryState, SendError>,
 }
 
@@ -343,6 +344,7 @@ impl Supervisor {
                 body,
                 settled,
                 message_format,
+                state,
                 reply,
             } => {
                 self.send_transfer(
@@ -351,6 +353,7 @@ impl Supervisor {
                     body,
                     settled,
                     message_format,
+                    state,
                     reply,
                 )
                 .await;
@@ -450,6 +453,7 @@ impl Supervisor {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn send_transfer(
         &mut self,
         vchan: u16,
@@ -457,6 +461,7 @@ impl Supervisor {
         body: Bytes,
         settled: bool,
         message_format: u32,
+        state: Option<DeliveryState>,
         reply: Option<Reply<DeliveryState, SendError>>,
     ) {
         let routed = self.inner.clone().zip(self.real_ids(vchan, vhandle));
@@ -474,6 +479,7 @@ impl Supervisor {
             Some(handle_reply) => {
                 let (ptx, prx) = oneshot::channel();
                 let body_for_replay = body.clone();
+                let state_for_replay = state.clone();
                 if inner
                     .send(DriverCommand::SendTransfer {
                         channel: ChannelId(rc),
@@ -481,6 +487,7 @@ impl Supervisor {
                         body,
                         settled,
                         message_format,
+                        state,
                         reply: Some(ptx),
                     })
                     .await
@@ -506,6 +513,7 @@ impl Supervisor {
                                 body: body_for_replay,
                                 settled,
                                 message_format,
+                                state: state_for_replay,
                                 reply: handle_reply,
                             });
                         }
@@ -521,6 +529,7 @@ impl Supervisor {
                         body,
                         settled,
                         message_format,
+                        state,
                         reply: None,
                     })
                     .await;
@@ -535,6 +544,7 @@ impl Supervisor {
             req.body,
             req.settled,
             req.message_format,
+            req.state,
             Some(req.reply),
         )
         .await;
