@@ -13,6 +13,7 @@ pub type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
 /// The classification of an error, shared by every operation error type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ErrorKind {
     /// Underlying socket / IO failure.
     Io,
@@ -45,25 +46,44 @@ pub enum ErrorKind {
 impl ErrorKind {
     /// Whether an operation failing with this kind is worth retrying once the
     /// supervisor re-establishes the connection.
+    ///
+    /// An exhaustive match so a newly added [`ErrorKind`] cannot be left
+    /// silently unclassified.
     pub fn is_retryable(self) -> bool {
-        matches!(
-            self,
+        match self {
             ErrorKind::Io
-                | ErrorKind::Timeout
-                | ErrorKind::PeerClosed
-                | ErrorKind::Detached
-                | ErrorKind::Capacity
-                | ErrorKind::NotConnected
-        )
+            | ErrorKind::Timeout
+            | ErrorKind::PeerClosed
+            | ErrorKind::Detached
+            | ErrorKind::Capacity
+            | ErrorKind::NotConnected => true,
+            ErrorKind::Tls
+            | ErrorKind::Sasl
+            | ErrorKind::ProtocolViolation
+            | ErrorKind::LinkRedirect
+            | ErrorKind::Settlement
+            | ErrorKind::Encode
+            | ErrorKind::Cancelled => false,
+        }
     }
 
     /// Whether this kind renders the underlying connection unusable (a reconnect
     /// is required; the current transport cannot continue).
     pub fn is_fatal(self) -> bool {
-        matches!(
-            self,
-            ErrorKind::ProtocolViolation | ErrorKind::Tls | ErrorKind::Sasl | ErrorKind::Encode
-        )
+        match self {
+            ErrorKind::ProtocolViolation | ErrorKind::Tls | ErrorKind::Sasl | ErrorKind::Encode => {
+                true
+            }
+            ErrorKind::Io
+            | ErrorKind::PeerClosed
+            | ErrorKind::Timeout
+            | ErrorKind::Detached
+            | ErrorKind::LinkRedirect
+            | ErrorKind::Capacity
+            | ErrorKind::Settlement
+            | ErrorKind::NotConnected
+            | ErrorKind::Cancelled => false,
+        }
     }
 
     fn label(self) -> &'static str {

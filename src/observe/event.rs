@@ -7,6 +7,7 @@ use tokio::sync::broadcast;
 
 /// A coarse, cloneable snapshot of connection health.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ConnectionState {
     /// The initial connect / handshake is in progress.
     Connecting,
@@ -22,6 +23,7 @@ pub enum ConnectionState {
 
 /// A connection lifecycle event published on the [`EventBus`].
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ConnectionEvent {
     /// The initial connection / handshake started.
     Connecting,

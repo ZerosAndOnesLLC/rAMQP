@@ -102,6 +102,7 @@ impl Default for SessionConfig {
 
 /// How a receiver issues link credit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CreditMode {
     /// The application issues credit explicitly via the consumer handle.
     Manual,
