@@ -51,6 +51,13 @@ pub enum DecodeError {
     /// A length prefix exceeded what the input could contain.
     #[error("length overflow")]
     Overflow,
+    /// A value was nested more deeply than the decoder permits, guarding
+    /// against stack exhaustion from a hostile peer.
+    #[error("nesting too deep (max {max})")]
+    NestingTooDeep {
+        /// The maximum nesting depth allowed.
+        max: u32,
+    },
 }
 
 /// A type that can be read from the AMQP 1.0 wire format.
@@ -96,6 +103,15 @@ pub(crate) fn read_u64(buf: &mut Bytes) -> Result<u64, DecodeError> {
 pub(crate) fn read_bytes(buf: &mut Bytes, n: usize) -> Result<Bytes, DecodeError> {
     ensure(buf, n)?;
     Ok(buf.split_to(n))
+}
+
+/// Validate a byte run as UTF-8 and return an owned `String`. Validation is done
+/// on the borrowed bytes first, so invalid input is rejected without allocating.
+pub(crate) fn utf8_string(raw: &[u8], kind: &'static str) -> Result<String, DecodeError> {
+    match std::str::from_utf8(raw) {
+        Ok(s) => Ok(s.to_owned()),
+        Err(_) => Err(DecodeError::InvalidUtf8 { kind }),
+    }
 }
 
 /// Peek the next format code without consuming it.
@@ -276,7 +292,7 @@ impl Decode for String {
             c => return Err(bad(c, "string")),
         };
         let raw = read_bytes(buf, len)?;
-        String::from_utf8(raw.to_vec()).map_err(|_| DecodeError::InvalidUtf8 { kind: "string" })
+        utf8_string(&raw, "string")
     }
 }
 
@@ -288,9 +304,7 @@ impl Decode for Symbol {
             c => return Err(bad(c, "symbol")),
         };
         let raw = read_bytes(buf, len)?;
-        let s = String::from_utf8(raw.to_vec())
-            .map_err(|_| DecodeError::InvalidUtf8 { kind: "symbol" })?;
-        Ok(Symbol(s))
+        Ok(Symbol(utf8_string(&raw, "symbol")?))
     }
 }
 
