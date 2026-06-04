@@ -316,10 +316,19 @@ impl Session {
         let max_payload = max_payload_per_frame(max_frame_size);
 
         while !sender.outbox.is_empty() && sender.attached && sender.credit.can_send() {
+            // Bound outstanding unsettled deliveries: if the broker grants credit
+            // but withholds dispositions, pause unsettled sends (leaving them
+            // queued) rather than growing the unsettled/pending maps without
+            // limit. Pre-settled sends never accumulate, so they are not gated.
+            let front = sender.outbox.front().expect("non-empty");
+            if !front.settled && sender.unsettled.len() >= crate::link::sender::MAX_UNSETTLED_PER_LINK
+            {
+                break;
+            }
             // A message takes `frame_count` transfer frames; only begin it if the
             // session outgoing-window can cover all of them (avoids over-drawing
             // the window mid-message).
-            let body_len = sender.outbox.front().expect("non-empty").body.len();
+            let body_len = front.body.len();
             let frame_count = body_len.div_ceil(max_payload).max(1) as u32;
             if windows.remote_incoming_window < frame_count {
                 break;
