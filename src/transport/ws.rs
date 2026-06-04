@@ -19,6 +19,12 @@ use tokio_tungstenite::tungstenite::Message;
 
 use crate::error::{ConnectError, ErrorKind};
 
+/// Maximum reassembled inbound WebSocket message size (defense against a hostile
+/// server; the AMQP layer enforces its own, smaller, negotiated frame size).
+const MAX_WS_MESSAGE_SIZE: usize = 64 << 20; // 64 MiB
+/// Maximum single inbound WebSocket frame size.
+const MAX_WS_FRAME_SIZE: usize = 16 << 20; // 16 MiB
+
 /// A plain byte-stream adapter over a [`WebSocketStream`].
 ///
 /// Implements [`AsyncRead`] and [`AsyncWrite`] by carrying AMQP bytes inside
@@ -208,13 +214,39 @@ where
         http::HeaderValue::from_static("amqp"),
     );
 
-    let (ws, _response) = tokio_tungstenite::client_async(request, stream)
+    // Bound inbound WebSocket message/frame sizes so a hostile server cannot
+    // drive unbounded buffering at the transport layer (the AMQP layer separately
+    // enforces the negotiated max-frame-size on decode).
+    let config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+        max_message_size: Some(MAX_WS_MESSAGE_SIZE),
+        max_frame_size: Some(MAX_WS_FRAME_SIZE),
+        ..Default::default()
+    };
+
+    let (ws, response) = tokio_tungstenite::client_async_with_config(request, stream, Some(config))
         .await
         .map_err(|e| match e {
             WsError::Io(io) => ConnectError::new(ErrorKind::Io).with_source(io),
             other => ConnectError::msg(ErrorKind::ProtocolViolation, "websocket handshake failed")
                 .with_source(other),
         })?;
+
+    // Per RFC 6455 §4.1 and the AMQP WebSocket Binding, the server MUST select the
+    // `amqp` subprotocol. If it negotiated something else (or nothing), the byte
+    // stream is not AMQP — reject it instead of feeding non-AMQP data to the codec.
+    let agreed = response
+        .headers()
+        .get(http::header::SEC_WEBSOCKET_PROTOCOL)
+        .and_then(|v| v.to_str().ok());
+    match agreed {
+        Some(p) if p.eq_ignore_ascii_case("amqp") => {}
+        other => {
+            return Err(ConnectError::msg(
+                ErrorKind::ProtocolViolation,
+                format!("server did not select the `amqp` websocket subprotocol (got {other:?})"),
+            ));
+        }
+    }
 
     Ok(WsByteStream::new(ws))
 }
