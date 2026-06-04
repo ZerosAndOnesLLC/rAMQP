@@ -14,7 +14,7 @@ use crate::types::sasl::{SaslCode, SaslFrame, SaslInit, SaslResponse};
 use scram::ScramClient;
 
 /// A SASL authentication profile selected by the client.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum SaslProfile {
     /// The ANONYMOUS mechanism (no credentials).
     Anonymous,
@@ -40,6 +40,32 @@ pub enum SaslProfile {
         /// Password.
         password: String,
     },
+}
+
+impl std::fmt::Debug for SaslProfile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never print credentials: usernames and passwords are redacted, leaving
+        // only the mechanism/structure visible.
+        match self {
+            SaslProfile::Anonymous => f.write_str("Anonymous"),
+            SaslProfile::Plain { .. } => f
+                .debug_struct("Plain")
+                .field("authcid", &"***")
+                .field("passwd", &"***")
+                .finish(),
+            SaslProfile::External { authzid } => f
+                .debug_struct("External")
+                .field("authzid", &authzid.as_ref().map(|_| "***"))
+                .finish(),
+            #[cfg(feature = "scram")]
+            SaslProfile::Scram { mechanism, .. } => f
+                .debug_struct("Scram")
+                .field("mechanism", mechanism)
+                .field("username", &"***")
+                .field("password", &"***")
+                .finish(),
+        }
+    }
 }
 
 impl SaslProfile {

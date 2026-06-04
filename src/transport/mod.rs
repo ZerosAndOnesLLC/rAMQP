@@ -131,7 +131,7 @@ impl Scheme {
 }
 
 /// A parsed connection address (`amqp[s]://[user[:pass]@]host[:port][/path]`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Address {
     /// The URL scheme.
     pub scheme: Scheme,
@@ -145,6 +145,20 @@ pub struct Address {
     pub password: Option<String>,
     /// The path component (virtual host / node address); empty if none.
     pub path: String,
+}
+
+impl std::fmt::Debug for Address {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never print URL credentials: show only whether they are present.
+        f.debug_struct("Address")
+            .field("scheme", &self.scheme)
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("username", &self.username.as_ref().map(|_| "***"))
+            .field("password", &self.password.as_ref().map(|_| "***"))
+            .field("path", &self.path)
+            .finish()
+    }
 }
 
 impl Address {
@@ -426,5 +440,16 @@ mod tests {
     #[test]
     fn rejects_unknown_scheme() {
         assert!(Address::parse("http://h").is_err());
+    }
+
+    #[test]
+    fn debug_redacts_credentials() {
+        let a = Address::parse("amqp://guest:hunter2@broker.example:5673/vhost").unwrap();
+        let dbg = format!("{a:?}");
+        assert!(!dbg.contains("hunter2"), "password leaked in Debug: {dbg}");
+        assert!(!dbg.contains("guest"), "username leaked in Debug: {dbg}");
+        // Non-secret fields remain visible.
+        assert!(dbg.contains("broker.example"));
+        assert!(dbg.contains("vhost"));
     }
 }

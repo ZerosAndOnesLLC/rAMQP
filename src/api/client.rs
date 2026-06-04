@@ -29,13 +29,29 @@ pub struct ConnectionBuilder {
 
 impl std::fmt::Debug for ConnectionBuilder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The URL may embed `user:pass@`; mask the userinfo. `sasl`/`tls` redact
+        // their own secrets.
         f.debug_struct("ConnectionBuilder")
-            .field("url", &self.url)
+            .field("url", &redact_url(&self.url))
             .field("config", &self.config)
             .field("sasl", &self.sasl)
             .field("tls", &self.tls)
             .finish_non_exhaustive()
     }
+}
+
+/// Mask any `user:pass@` userinfo in a connection URL so credentials never
+/// appear in `Debug` output or logs.
+fn redact_url(url: &str) -> String {
+    if let Some(scheme_end) = url.find("://") {
+        let (scheme, rest) = url.split_at(scheme_end + 3);
+        let auth_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+        let (authority, tail) = rest.split_at(auth_end);
+        if let Some(at) = authority.rfind('@') {
+            return format!("{scheme}***@{}{tail}", &authority[at + 1..]);
+        }
+    }
+    url.to_owned()
 }
 
 impl ConnectionBuilder {
@@ -174,5 +190,29 @@ impl ConnectionBuilder {
         } else {
             Connection::establish(addr, self.config, self.metrics, profile, self.tls).await
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redacts_url_userinfo() {
+        assert_eq!(
+            redact_url("amqp://guest:hunter2@broker:5672/vhost"),
+            "amqp://***@broker:5672/vhost"
+        );
+        // no credentials → unchanged
+        assert_eq!(redact_url("amqp://broker:5672"), "amqp://broker:5672");
+        // username only
+        assert_eq!(redact_url("amqps://user@host/path"), "amqps://***@host/path");
+    }
+
+    #[test]
+    fn builder_debug_hides_password() {
+        let b = ConnectionBuilder::new("amqp://guest:hunter2@broker:5672");
+        let dbg = format!("{b:?}");
+        assert!(!dbg.contains("hunter2"), "password leaked: {dbg}");
     }
 }
