@@ -78,18 +78,33 @@ impl Connection {
     ) -> Result<Connection, ConnectError> {
         let config = Arc::new(config);
 
-        let mut stream = transport::connect(&addr, &tls).await?;
+        // The whole handshake (transport connect, SASL, and the `open` exchange)
+        // is bounded by `connect_timeout` so a peer that accepts the socket then
+        // stalls cannot pin this task and its read buffer indefinitely.
+        let handshake = async {
+            let mut stream = transport::connect(&addr, &tls).await?;
 
-        // SASL layer: header → mechanism negotiation → AMQP header.
-        ProtocolHeader::SASL.negotiate(&mut stream).await?;
-        let mut framed = FramedTransport::new(stream, config.connection.max_frame_size);
-        crate::sasl::negotiate(&mut framed, &profile, Some(&addr.host)).await?;
-        ProtocolHeader::AMQP.negotiate(framed.stream_mut()).await?;
+            // SASL layer: header → mechanism negotiation → AMQP header.
+            ProtocolHeader::SASL.negotiate(&mut stream).await?;
+            let mut framed = FramedTransport::new(stream, config.connection.max_frame_size);
+            crate::sasl::negotiate(&mut framed, &profile, Some(&addr.host)).await?;
+            ProtocolHeader::AMQP.negotiate(framed.stream_mut()).await?;
 
-        // Connection open + driver spawn.
-        let events = EventBus::default();
-        let (commands, rx) = mpsc::channel(config.connection.command_buffer);
-        let driver = Driver::open(framed, config.clone(), metrics, events.clone(), rx).await?;
+            // Connection open.
+            let events = EventBus::default();
+            let (commands, rx) = mpsc::channel(config.connection.command_buffer);
+            let driver = Driver::open(framed, config.clone(), metrics, events.clone(), rx).await?;
+            Ok::<_, ConnectError>((driver, commands, events))
+        };
+
+        let (driver, commands, events) = match config.connection.connect_timeout {
+            Some(timeout) => tokio::time::timeout(timeout, handshake)
+                .await
+                .map_err(|_| {
+                    ConnectError::msg(ErrorKind::Timeout, "connection handshake timed out")
+                })??,
+            None => handshake.await?,
+        };
         let join = tokio::spawn(driver.run());
 
         Ok(Connection {

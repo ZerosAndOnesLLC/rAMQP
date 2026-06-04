@@ -84,6 +84,9 @@ pub enum DriverCommand {
         settled: bool,
         /// The message format (`0` = AMQP).
         message_format: u32,
+        /// Delivery state to set on the transfer (e.g. a `transactional-state`
+        /// enlisting the message in a transaction); `None` for an ordinary send.
+        state: Option<DeliveryState>,
         /// If present, the driver replies with the terminal outcome once settled.
         reply: Option<Reply<DeliveryState, SendError>>,
     },
@@ -171,6 +174,9 @@ pub struct IncomingDelivery {
     pub message: Bytes,
     /// Whether the peer pre-settled the delivery.
     pub settled: bool,
+    /// The delivery state the sender declared on the transfer, if any (e.g. a
+    /// pre-declared outcome); `None` for the common fresh-delivery case.
+    pub state: Option<DeliveryState>,
 }
 
 /// Events the driver pushes to a link handle (producer or consumer).

@@ -599,35 +599,81 @@ impl Decode for Message {
         let mut msg = Message::default();
         let mut data_parts: Vec<Bytes> = Vec::new();
         let mut seq_parts: Vec<Vec<Value>> = Vec::new();
+        let mut have_value = false;
+
+        // Sections must appear in the canonical spec order (§3.2) and at most
+        // once each, except the repeatable body sections. `max_rank` tracks the
+        // highest section rank seen so out-of-order and duplicate sections are
+        // rejected rather than silently overwriting earlier ones.
+        const BODY_RANK: i32 = 5;
+        let mut max_rank: i32 = -1;
 
         while !buf.is_empty() {
-            let Ok(desc) = peek_descriptor(buf) else {
+            let Ok(Descriptor::Code(code)) = peek_descriptor(buf) else {
+                // End of input, an unreadable header, or a symbolic descriptor:
+                // stop parsing the bare message.
                 break;
             };
-            match desc {
-                Descriptor::Code(descriptors::HEADER) => msg.header = Some(Header::decode(buf)?),
-                Descriptor::Code(descriptors::DELIVERY_ANNOTATIONS) => {
-                    msg.delivery_annotations = Some(DeliveryAnnotations::decode(buf)?)
+            let rank: i32 = match code {
+                descriptors::HEADER => 0,
+                descriptors::DELIVERY_ANNOTATIONS => 1,
+                descriptors::MESSAGE_ANNOTATIONS => 2,
+                descriptors::PROPERTIES => 3,
+                descriptors::APPLICATION_PROPERTIES => 4,
+                descriptors::DATA | descriptors::AMQP_SEQUENCE | descriptors::AMQP_VALUE => {
+                    BODY_RANK
                 }
-                Descriptor::Code(descriptors::MESSAGE_ANNOTATIONS) => {
-                    msg.message_annotations = Some(MessageAnnotations::decode(buf)?)
-                }
-                Descriptor::Code(descriptors::PROPERTIES) => {
-                    msg.properties = Some(Properties::decode(buf)?)
-                }
-                Descriptor::Code(descriptors::APPLICATION_PROPERTIES) => {
-                    msg.application_properties = Some(ApplicationProperties::decode(buf)?)
-                }
-                Descriptor::Code(descriptors::DATA) => data_parts.push(Data::decode(buf)?.0),
-                Descriptor::Code(descriptors::AMQP_SEQUENCE) => {
-                    seq_parts.push(AmqpSequence::decode(buf)?.0)
-                }
-                Descriptor::Code(descriptors::AMQP_VALUE) => {
-                    msg.body = Body::Value(AmqpValue::decode(buf)?.0)
-                }
-                Descriptor::Code(descriptors::FOOTER) => msg.footer = Some(Footer::decode(buf)?),
+                descriptors::FOOTER => 6,
                 // Unknown described section: stop parsing the message.
                 _ => break,
+            };
+            if rank < max_rank {
+                return Err(DecodeError::InvalidValue(format!(
+                    "message section {code:#x} is out of order"
+                )));
+            }
+            if rank == max_rank && rank != BODY_RANK {
+                return Err(DecodeError::InvalidValue(format!(
+                    "duplicate message section {code:#x}"
+                )));
+            }
+            max_rank = rank;
+
+            match code {
+                descriptors::HEADER => msg.header = Some(Header::decode(buf)?),
+                descriptors::DELIVERY_ANNOTATIONS => {
+                    msg.delivery_annotations = Some(DeliveryAnnotations::decode(buf)?)
+                }
+                descriptors::MESSAGE_ANNOTATIONS => {
+                    msg.message_annotations = Some(MessageAnnotations::decode(buf)?)
+                }
+                descriptors::PROPERTIES => msg.properties = Some(Properties::decode(buf)?),
+                descriptors::APPLICATION_PROPERTIES => {
+                    msg.application_properties = Some(ApplicationProperties::decode(buf)?)
+                }
+                // The body is exactly one of: data section(s), amqp-sequence
+                // section(s), or a single amqp-value — never a mix (§3.2).
+                descriptors::DATA => {
+                    if have_value || !seq_parts.is_empty() {
+                        return Err(mixed_body_error());
+                    }
+                    data_parts.push(Data::decode(buf)?.0);
+                }
+                descriptors::AMQP_SEQUENCE => {
+                    if have_value || !data_parts.is_empty() {
+                        return Err(mixed_body_error());
+                    }
+                    seq_parts.push(AmqpSequence::decode(buf)?.0);
+                }
+                descriptors::AMQP_VALUE => {
+                    if have_value || !data_parts.is_empty() || !seq_parts.is_empty() {
+                        return Err(mixed_body_error());
+                    }
+                    msg.body = Body::Value(AmqpValue::decode(buf)?.0);
+                    have_value = true;
+                }
+                descriptors::FOOTER => msg.footer = Some(Footer::decode(buf)?),
+                _ => unreachable!("rank assigned above for every matched code"),
             }
         }
 
@@ -638,6 +684,12 @@ impl Decode for Message {
         }
         Ok(msg)
     }
+}
+
+fn mixed_body_error() -> DecodeError {
+    DecodeError::InvalidValue(
+        "message body mixes data / amqp-sequence / amqp-value sections".into(),
+    )
 }
 
 #[cfg(test)]
@@ -733,5 +785,39 @@ mod tests {
             body: Body::Data(vec![Bytes::from_static(b"a"), Bytes::from_static(b"bc")]),
             ..Default::default()
         });
+    }
+
+    #[test]
+    fn rejects_mixed_body_sections() {
+        // A data section followed by an amqp-value section is illegal (§3.2).
+        let mut buf = BytesMut::new();
+        Data(Bytes::from_static(b"x")).encode(&mut buf);
+        AmqpValue(Value::Uint(1)).encode(&mut buf);
+        let r: Result<Message, _> = from_slice(&buf);
+        assert!(matches!(r, Err(DecodeError::InvalidValue(_))), "got {r:?}");
+    }
+
+    #[test]
+    fn rejects_duplicate_section() {
+        // Two header sections must be rejected, not silently overwritten.
+        let mut buf = BytesMut::new();
+        Header {
+            durable: true,
+            ..Default::default()
+        }
+        .encode(&mut buf);
+        Header::default().encode(&mut buf);
+        let r: Result<Message, _> = from_slice(&buf);
+        assert!(matches!(r, Err(DecodeError::InvalidValue(_))), "got {r:?}");
+    }
+
+    #[test]
+    fn rejects_out_of_order_sections() {
+        // Properties (rank 3) before header (rank 0) is out of canonical order.
+        let mut buf = BytesMut::new();
+        Properties::default().encode(&mut buf);
+        Header::default().encode(&mut buf);
+        let r: Result<Message, _> = from_slice(&buf);
+        assert!(matches!(r, Err(DecodeError::InvalidValue(_))), "got {r:?}");
     }
 }

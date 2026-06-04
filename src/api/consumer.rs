@@ -78,7 +78,8 @@ impl Consumer {
             match self.events.recv().await {
                 Some(LinkEvent::Delivery(d)) => {
                     let delivery =
-                        Delivery::new(d.delivery_id, d.delivery_tag, d.settled, d.message);
+                        Delivery::new(d.delivery_id, d.delivery_tag, d.settled, d.message)
+                            .with_state(d.state);
                     self.after_consume().await;
                     return Ok(delivery);
                 }

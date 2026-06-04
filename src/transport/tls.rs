@@ -170,6 +170,17 @@ pub async fn connect_native_tls(
     domain: &str,
     cfg: &TlsConfig,
 ) -> Result<tokio_native_tls::TlsStream<TcpStream>, ConnectError> {
+    // The native-tls backend always trusts the platform root store and cannot be
+    // restricted to custom CAs only, so `webpki_roots(false)` cannot be honored
+    // here. Fail loudly rather than silently trusting the system roots the caller
+    // asked to exclude; the `rustls` backend supports this.
+    if !cfg.webpki_roots {
+        return Err(ConnectError::msg(
+            ErrorKind::Tls,
+            "TlsConfig::webpki_roots(false) (trust only added CAs) is not supported by the \
+             native-tls backend; enable the `rustls` feature to restrict trust anchors",
+        ));
+    }
     let mut builder = native_tls::TlsConnector::builder();
     for pem in &cfg.root_ca_pem {
         let cert = native_tls::Certificate::from_pem(pem)

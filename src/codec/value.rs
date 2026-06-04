@@ -6,7 +6,9 @@ use bytes::{BufMut, Bytes, BytesMut};
 use ordered_float::OrderedFloat;
 use uuid::Uuid;
 
-use super::decode::{Decode, DecodeError, read_bytes, read_u8, read_u16, read_u32, read_u64};
+use super::decode::{
+    Decode, DecodeError, read_bytes, read_u8, read_u16, read_u32, read_u64, utf8_string,
+};
 use super::encode::{Encode, close_compound, encode_null, open_compound};
 use super::primitives::{OrderedMap, Symbol, codes};
 
@@ -272,15 +274,32 @@ fn encode_described_array(buf: &mut BytesMut, items: &[Value]) {
     close_compound(buf, s, c, start, items.len() as u32);
 }
 
+/// Maximum nesting depth accepted when decoding a self-describing [`Value`].
+///
+/// AMQP 1.0 sets no explicit bound on nesting, but a hostile or buggy peer can
+/// encode a value that costs only a byte or two per level yet drives unbounded
+/// recursion in the decoder — e.g. a run of `0x00` described-type constructors,
+/// or deeply nested lists/maps/arrays. Without a cap, such a frame (bounded only
+/// by `max-frame-size`) overflows the driver task's stack and crashes the
+/// connection. The limit is chosen to stay comfortably within a 2 MiB worker
+/// stack (each level costs a few stack frames) while sitting far above any
+/// nesting a real application or broker produces.
+const MAX_DEPTH: u32 = 64;
+
 impl Decode for Value {
     fn decode(buf: &mut Bytes) -> Result<Self, DecodeError> {
-        let code = read_u8(buf)?;
-        decode_value_body(buf, code)
+        decode_value(buf, 0)
     }
 }
 
+/// Read a 1-byte constructor and decode the value that follows at nesting `depth`.
+fn decode_value(buf: &mut Bytes, depth: u32) -> Result<Value, DecodeError> {
+    let code = read_u8(buf)?;
+    decode_value_body(buf, code, depth)
+}
+
 fn utf8(b: Bytes, kind: &'static str) -> Result<String, DecodeError> {
-    String::from_utf8(b.to_vec()).map_err(|_| DecodeError::InvalidUtf8 { kind })
+    utf8_string(&b, kind)
 }
 
 fn fixed<const N: usize>(buf: &mut Bytes) -> Result<[u8; N], DecodeError> {
@@ -290,9 +309,13 @@ fn fixed<const N: usize>(buf: &mut Bytes) -> Result<[u8; N], DecodeError> {
     Ok(a)
 }
 
-/// Decode a value whose 1-byte constructor `code` has already been consumed.
-fn decode_value_body(buf: &mut Bytes, code: u8) -> Result<Value, DecodeError> {
+/// Decode a value whose 1-byte constructor `code` has already been consumed,
+/// rejecting input nested beyond [`MAX_DEPTH`] to bound decoder recursion.
+fn decode_value_body(buf: &mut Bytes, code: u8, depth: u32) -> Result<Value, DecodeError> {
     use codes::*;
+    if depth > MAX_DEPTH {
+        return Err(DecodeError::NestingTooDeep { max: MAX_DEPTH });
+    }
     Ok(match code {
         NULL => Value::Null,
         BOOL_TRUE => Value::Bool(true),
@@ -360,41 +383,41 @@ fn decode_value_body(buf: &mut Bytes, code: u8) -> Result<Value, DecodeError> {
             let size = read_u8(buf)? as usize;
             let mut b = read_bytes(buf, size)?;
             let count = read_u8(&mut b)? as u32;
-            Value::List(decode_n(&mut b, count)?)
+            Value::List(decode_n(&mut b, count, depth + 1)?)
         }
         LIST32 => {
             let size = read_u32(buf)? as usize;
             let mut b = read_bytes(buf, size)?;
             let count = read_u32(&mut b)?;
-            Value::List(decode_n(&mut b, count)?)
+            Value::List(decode_n(&mut b, count, depth + 1)?)
         }
         MAP8 => {
             let size = read_u8(buf)? as usize;
             let mut b = read_bytes(buf, size)?;
             let count = read_u8(&mut b)? as u32;
-            Value::Map(decode_map(&mut b, count)?)
+            Value::Map(decode_map(&mut b, count, depth + 1)?)
         }
         MAP32 => {
             let size = read_u32(buf)? as usize;
             let mut b = read_bytes(buf, size)?;
             let count = read_u32(&mut b)?;
-            Value::Map(decode_map(&mut b, count)?)
+            Value::Map(decode_map(&mut b, count, depth + 1)?)
         }
         ARRAY8 => {
             let size = read_u8(buf)? as usize;
             let mut b = read_bytes(buf, size)?;
             let count = read_u8(&mut b)? as u32;
-            Value::Array(decode_array(&mut b, count)?)
+            Value::Array(decode_array(&mut b, count, depth + 1)?)
         }
         ARRAY32 => {
             let size = read_u32(buf)? as usize;
             let mut b = read_bytes(buf, size)?;
             let count = read_u32(&mut b)?;
-            Value::Array(decode_array(&mut b, count)?)
+            Value::Array(decode_array(&mut b, count, depth + 1)?)
         }
         DESCRIBED => {
-            let d = Value::decode(buf)?;
-            let v = Value::decode(buf)?;
+            let d = decode_value(buf, depth + 1)?;
+            let v = decode_value(buf, depth + 1)?;
             Value::Described(Box::new(d), Box::new(v))
         }
         c => {
@@ -412,46 +435,56 @@ fn cap_hint(count: u32, remaining: usize) -> usize {
     (count as usize).min(remaining)
 }
 
-fn decode_n(buf: &mut Bytes, count: u32) -> Result<Vec<Value>, DecodeError> {
+fn decode_n(buf: &mut Bytes, count: u32, depth: u32) -> Result<Vec<Value>, DecodeError> {
     let mut out = Vec::with_capacity(cap_hint(count, buf.len()));
     for _ in 0..count {
-        out.push(Value::decode(buf)?);
+        out.push(decode_value(buf, depth)?);
     }
     Ok(out)
 }
 
-fn decode_map(buf: &mut Bytes, count: u32) -> Result<OrderedMap<Value, Value>, DecodeError> {
+fn decode_map(
+    buf: &mut Bytes,
+    count: u32,
+    depth: u32,
+) -> Result<OrderedMap<Value, Value>, DecodeError> {
     let entries = (count / 2) as usize;
     let mut map = OrderedMap::with_capacity(entries.min(buf.len()));
     for _ in 0..entries {
-        let k = Value::decode(buf)?;
-        let v = Value::decode(buf)?;
+        let k = decode_value(buf, depth)?;
+        let v = decode_value(buf, depth)?;
         map.push(k, v);
     }
     Ok(map)
 }
 
-fn decode_array(buf: &mut Bytes, count: u32) -> Result<Vec<Value>, DecodeError> {
+fn decode_array(buf: &mut Bytes, count: u32, depth: u32) -> Result<Vec<Value>, DecodeError> {
     // The element constructor is always present, even for a zero-count array.
     let ctor = read_u8(buf)?;
     if ctor == codes::DESCRIBED {
         // A described array shares one descriptor and one element constructor,
-        // followed by `count` bare element bodies.
-        let descriptor = Value::decode(buf)?;
+        // followed by `count` bare element bodies. The shared descriptor is
+        // cloned into every element but the last, which takes it by move.
+        let descriptor = decode_value(buf, depth)?;
         let elem_ctor = read_u8(buf)?;
         let mut out = Vec::with_capacity(cap_hint(count, buf.len()));
-        for _ in 0..count {
-            let body = decode_value_body(buf, elem_ctor)?;
-            out.push(Value::Described(
-                Box::new(descriptor.clone()),
-                Box::new(body),
-            ));
+        let mut descriptor = Some(descriptor);
+        for i in 0..count {
+            let body = decode_value_body(buf, elem_ctor, depth)?;
+            let d = if i + 1 == count {
+                descriptor
+                    .take()
+                    .expect("descriptor present until last element")
+            } else {
+                descriptor.as_ref().expect("descriptor present").clone()
+            };
+            out.push(Value::Described(Box::new(d), Box::new(body)));
         }
         Ok(out)
     } else {
         let mut out = Vec::with_capacity(cap_hint(count, buf.len()));
         for _ in 0..count {
-            out.push(decode_value_body(buf, ctor)?);
+            out.push(decode_value_body(buf, ctor, depth)?);
         }
         Ok(out)
     }
@@ -593,6 +626,41 @@ mod tests {
             Box::new(Value::Ulong(0x24)),
             Box::new(Value::List(vec![])),
         ));
+    }
+
+    #[test]
+    fn deeply_nested_described_is_rejected_not_panicked() {
+        // A long run of described-type constructors (0x00) costs one byte per
+        // nesting level. Without the depth bound this overflows the stack; with
+        // it we get a clean `NestingTooDeep` error instead of a crash.
+        let bytes = vec![0x00u8; 100_000];
+        let r: Result<Value, _> = from_slice(&bytes);
+        assert!(
+            matches!(r, Err(DecodeError::NestingTooDeep { .. })),
+            "expected NestingTooDeep, got {r:?}"
+        );
+    }
+
+    #[test]
+    fn deeply_nested_lists_are_rejected_not_panicked() {
+        // Build, inside-out, a chain of single-element LIST32s nested deeper than
+        // MAX_DEPTH. Each level's size prefix correctly encloses the inner value,
+        // so this is a genuine nesting (~9 bytes/level), and the depth bound must
+        // reject it rather than overflowing the stack.
+        let mut inner = vec![codes::NULL];
+        for _ in 0..(MAX_DEPTH as usize + 50) {
+            let size = (4 + inner.len()) as u32; // 4-byte count + body
+            let mut lvl = vec![codes::LIST32];
+            lvl.extend_from_slice(&size.to_be_bytes());
+            lvl.extend_from_slice(&1u32.to_be_bytes()); // count = 1
+            lvl.extend_from_slice(&inner);
+            inner = lvl;
+        }
+        let r: Result<Value, _> = from_slice(&inner);
+        assert!(
+            matches!(r, Err(DecodeError::NestingTooDeep { .. })),
+            "expected NestingTooDeep, got {r:?}"
+        );
     }
 
     #[test]

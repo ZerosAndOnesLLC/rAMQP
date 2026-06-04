@@ -23,6 +23,10 @@ pub struct ConnectionConfig {
     pub channel_max: u16,
     /// Idle timeout advertised to the peer; `None` disables heartbeats.
     pub idle_timeout: Option<Duration>,
+    /// Maximum time for the connection handshake (transport connect + SASL + the
+    /// `open` exchange). `None` disables it. Guards against a peer that accepts
+    /// the socket then stalls mid-handshake (slow-loris).
+    pub connect_timeout: Option<Duration>,
     /// Bound on the driver command queue (back-pressures producers).
     pub command_buffer: usize,
     /// Reconnect / backoff policy.
@@ -38,6 +42,7 @@ impl Default for ConnectionConfig {
             max_frame_size: 128 * 1024,
             channel_max: 1024,
             idle_timeout: Some(Duration::from_secs(60)),
+            connect_timeout: Some(Duration::from_secs(30)),
             command_buffer: 1024,
             reconnect: ReconnectConfig::default(),
         }
@@ -97,6 +102,7 @@ impl Default for SessionConfig {
 
 /// How a receiver issues link credit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CreditMode {
     /// The application issues credit explicitly via the consumer handle.
     Manual,

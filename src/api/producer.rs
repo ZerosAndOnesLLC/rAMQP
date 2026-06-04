@@ -66,8 +66,32 @@ impl Producer {
         self.send_bytes(to_bytes(&message).freeze(), false).await
     }
 
+    /// Send a message carrying an explicit delivery `state` and await its outcome.
+    ///
+    /// The primary use is enlisting a message in a transaction: pass the
+    /// `transactional-state` built from a declared `txn-id` (see
+    /// [`txn::transactional_state`](crate::txn::transactional_state) under the
+    /// `transaction` feature).
+    pub async fn send_with_state(
+        &self,
+        message: Message,
+        state: DeliveryState,
+    ) -> Result<DeliveryState, SendError> {
+        self.send_bytes_with_state(to_bytes(&message).freeze(), false, Some(state))
+            .await
+    }
+
     /// Send a pre-encoded body and await its outcome.
     pub async fn send_bytes(&self, body: Bytes, settled: bool) -> Result<DeliveryState, SendError> {
+        self.send_bytes_with_state(body, settled, None).await
+    }
+
+    async fn send_bytes_with_state(
+        &self,
+        body: Bytes,
+        settled: bool,
+        state: Option<DeliveryState>,
+    ) -> Result<DeliveryState, SendError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.commands
             .send(DriverCommand::SendTransfer {
@@ -76,6 +100,7 @@ impl Producer {
                 body,
                 settled,
                 message_format: 0,
+                state,
                 reply: Some(reply_tx),
             })
             .await
@@ -123,6 +148,7 @@ impl Producer {
                         body,
                         settled: true,
                         message_format: 0,
+                        state: None,
                         reply: Some(reply_tx),
                     })
                     .await
@@ -143,6 +169,7 @@ impl Producer {
                     body,
                     settled: true,
                     message_format: 0,
+                    state: None,
                     reply: None,
                 })
                 .await

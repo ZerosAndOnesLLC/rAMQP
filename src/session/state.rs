@@ -118,7 +118,14 @@ impl Session {
 
     /// Apply the peer's `begin`: bind its channel, learn its windows, become
     /// mapped, and complete the begin reply.
+    ///
+    /// Only a session that sent `begin` and is awaiting the peer's may map; a
+    /// duplicate or out-of-phase begin is ignored rather than clobbering live
+    /// flow-control state (the driver also rejects it as a connection error).
     pub fn on_peer_begin(&mut self, remote_channel: u16, begin: &Begin) {
+        if self.phase != SessionPhase::BeginSent {
+            return;
+        }
         self.remote_channel = Some(remote_channel);
         self.windows.on_peer_begin(begin);
         self.phase = SessionPhase::Mapped;
@@ -271,6 +278,7 @@ impl Session {
         body: Bytes,
         settled: bool,
         message_format: u32,
+        state: Option<DeliveryState>,
         reply: Option<Reply<DeliveryState, crate::error::SendError>>,
         transport: &mut FramedTransport<S>,
         max_frame_size: usize,
@@ -280,6 +288,7 @@ impl Session {
                 body,
                 settled,
                 message_format,
+                state,
                 reply,
             }),
             _ => {
@@ -309,10 +318,20 @@ impl Session {
         let max_payload = max_payload_per_frame(max_frame_size);
 
         while !sender.outbox.is_empty() && sender.attached && sender.credit.can_send() {
+            // Bound outstanding unsettled deliveries: if the broker grants credit
+            // but withholds dispositions, pause unsettled sends (leaving them
+            // queued) rather than growing the unsettled/pending maps without
+            // limit. Pre-settled sends never accumulate, so they are not gated.
+            let front = sender.outbox.front().expect("non-empty");
+            if !front.settled
+                && sender.unsettled.len() >= crate::link::sender::MAX_UNSETTLED_PER_LINK
+            {
+                break;
+            }
             // A message takes `frame_count` transfer frames; only begin it if the
             // session outgoing-window can cover all of them (avoids over-drawing
             // the window mid-message).
-            let body_len = sender.outbox.front().expect("non-empty").body.len();
+            let body_len = front.body.len();
             let frame_count = body_len.div_ceil(max_payload).max(1) as u32;
             if windows.remote_incoming_window < frame_count {
                 break;
@@ -329,6 +348,7 @@ impl Session {
                 &tag,
                 pending.settled,
                 pending.message_format,
+                pending.state.clone(),
                 &pending.body,
                 max_payload,
                 windows,
@@ -410,7 +430,13 @@ impl Session {
                     let delivery_id = DeliveryId(transfer.delivery_id.unwrap_or(0));
                     let tag = transfer.delivery_tag.clone().unwrap_or_default();
                     let settled = transfer.settled.unwrap_or(false);
-                    r.partial = Some(PartialDelivery::new(delivery_id, tag, settled, &payload));
+                    r.partial = Some(PartialDelivery::new(
+                        delivery_id,
+                        tag,
+                        settled,
+                        transfer.state.clone(),
+                        &payload,
+                    ));
                     !transfer.more
                 };
 
@@ -433,6 +459,7 @@ impl Session {
                         delivery_id: delivery.delivery_id,
                         delivery_tag: delivery.delivery_tag.clone(),
                         settled: delivery.settled,
+                        state: delivery.state().cloned(),
                         message: delivery.into_raw(),
                     });
                     emit = Some((event, r.events.clone()));
@@ -811,6 +838,7 @@ fn send_message_frames<S: IoStream>(
     tag: &Bytes,
     settled: bool,
     message_format: u32,
+    state: Option<DeliveryState>,
     body: &[u8],
     max_payload: usize,
     windows: &mut SessionWindows,
@@ -823,6 +851,7 @@ fn send_message_frames<S: IoStream>(
             message_format: Some(message_format),
             settled: Some(settled),
             more: false,
+            state,
             ..Default::default()
         };
         transport.queue_amqp(channel, &Performative::Transfer(first), Some(body));
@@ -836,6 +865,8 @@ fn send_message_frames<S: IoStream>(
         let end = (offset + max_payload).min(body.len());
         let is_last = end == body.len();
         let chunk = &body[offset..end];
+        // The delivery state (e.g. transactional-state) rides only the first
+        // frame of a multi-frame delivery.
         let transfer = if first_frame {
             Transfer {
                 handle,
@@ -844,6 +875,7 @@ fn send_message_frames<S: IoStream>(
                 message_format: Some(message_format),
                 settled: Some(settled),
                 more: !is_last,
+                state: state.clone(),
                 ..Default::default()
             }
         } else {

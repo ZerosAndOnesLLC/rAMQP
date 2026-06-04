@@ -9,7 +9,7 @@ use bytes::{Bytes, BytesMut};
 use crate::codec::Decode;
 use crate::error::RecvError;
 use crate::ids::DeliveryId;
-use crate::types::messaging::Message;
+use crate::types::messaging::{DeliveryState, Message};
 
 /// A received delivery. The body is exposed as raw [`Bytes`] by default; typed
 /// access is opt-in (the inversion of `fe2o3-amqp`'s eager-deserialize default).
@@ -21,6 +21,7 @@ pub struct Delivery {
     pub delivery_tag: Bytes,
     /// Whether the peer pre-settled the delivery.
     pub settled: bool,
+    state: Option<DeliveryState>,
     body: Bytes,
 }
 
@@ -31,8 +32,20 @@ impl Delivery {
             delivery_id,
             delivery_tag,
             settled,
+            state: None,
             body,
         }
+    }
+
+    /// Attach the sender-declared delivery state (from the transfer's `state`).
+    pub fn with_state(mut self, state: Option<DeliveryState>) -> Self {
+        self.state = state;
+        self
+    }
+
+    /// The delivery state the sender declared on the transfer, if any.
+    pub fn state(&self) -> Option<&DeliveryState> {
+        self.state.as_ref()
     }
 
     /// The raw (zero-copy) message bytes.
@@ -66,18 +79,28 @@ pub struct PartialDelivery {
     delivery_id: DeliveryId,
     delivery_tag: Bytes,
     settled: bool,
+    state: Option<DeliveryState>,
     buf: BytesMut,
 }
 
 impl PartialDelivery {
-    /// Begin a delivery from its first transfer's metadata and payload.
-    pub fn new(delivery_id: DeliveryId, delivery_tag: Bytes, settled: bool, first: &[u8]) -> Self {
+    /// Begin a delivery from its first transfer's metadata and payload. The
+    /// sender-declared `state` (the transfer's `state` field, present only on the
+    /// first frame) is carried through to the completed [`Delivery`].
+    pub fn new(
+        delivery_id: DeliveryId,
+        delivery_tag: Bytes,
+        settled: bool,
+        state: Option<DeliveryState>,
+        first: &[u8],
+    ) -> Self {
         let mut buf = BytesMut::with_capacity(first.len());
         buf.extend_from_slice(first);
         PartialDelivery {
             delivery_id,
             delivery_tag,
             settled,
+            state,
             buf,
         }
     }
@@ -110,6 +133,7 @@ impl PartialDelivery {
             self.settled,
             self.buf.freeze(),
         )
+        .with_state(self.state)
     }
 }
 
@@ -138,7 +162,8 @@ mod tests {
         let msg = Message::data(Bytes::from_static(b"abcdefgh"));
         let full = to_vec(&msg);
         let (a, b) = full.split_at(full.len() / 2);
-        let mut partial = PartialDelivery::new(DeliveryId(2), Bytes::from_static(b"t"), false, a);
+        let mut partial =
+            PartialDelivery::new(DeliveryId(2), Bytes::from_static(b"t"), false, None, a);
         partial.append(b);
         let delivery = partial.complete();
         assert_eq!(delivery.message().unwrap(), msg);

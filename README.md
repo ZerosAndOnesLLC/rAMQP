@@ -62,11 +62,13 @@ See [`examples/produce_consume.rs`](examples/produce_consume.rs).
 |---------------|--------------------------------------------------------------|
 | `rustls`      | `amqps://` via rustls + webpki-roots                         |
 | `native-tls`  | `amqps://` via native-tls                                   |
-| `ws`          | `ws://` / `wss://` (AMQP over WebSocket)                     |
+| `ws`          | `ws://` (AMQP over WebSocket); `wss://` also needs `rustls`  |
 | `scram`       | SASL `SCRAM-SHA-1/256/512`                                   |
 | `transaction` | Transaction coordinator types (clean-room, spec part 4)     |
 
-ANONYMOUS / PLAIN / EXTERNAL SASL are always available.
+ANONYMOUS / PLAIN / EXTERNAL SASL are always available. `wss://` (WebSocket over
+TLS) requires **both** `ws` and `rustls`; the `ws` feature alone covers only
+plaintext `ws://`.
 
 ## Architecture
 
@@ -106,11 +108,12 @@ Working today (with tests):
 cargo test                                  # unit + mock-peer integration
 cargo bench --bench codec                   # codec/framing micro-benchmarks
 
-# Real-broker interop (skipped unless RAMQP_BROKER_URL is set). Example against
-# RabbitMQ 4.x (which speaks AMQP 1.0 natively); declare the queue first:
+# Real-broker interop — #[ignore]d, so a normal `cargo test` lists them as
+# *ignored* (never a false pass). Run explicitly against e.g. RabbitMQ 4.x
+# (which speaks AMQP 1.0 natively); declare the queue first:
 RAMQP_BROKER_URL=amqp://guest:guest@localhost:5672 \
 RAMQP_BROKER_ADDRESS=/queues/my-queue \
-    cargo test --test broker -- --test-threads=1
+    cargo test --test broker -- --ignored --test-threads=1
 ```
 
 **Verified against live RabbitMQ 4.x and ActiveMQ Artemis**: SASL PLAIN,

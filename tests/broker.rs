@@ -1,21 +1,35 @@
 //! Broker interop tests (WP-8.1).
 //!
-//! These run against a real AMQP 1.0 broker. Set `RAMQP_BROKER_URL` to enable
-//! them, e.g. against ActiveMQ Artemis or RabbitMQ (AMQP 1.0 plugin):
+//! These run against a real AMQP 1.0 broker (e.g. RabbitMQ 4.x or ActiveMQ
+//! Artemis) and are marked `#[ignore]`, so a normal `cargo test` reports them as
+//! *ignored* rather than as a (misleading) pass. Run them explicitly, pointing at
+//! a broker:
 //!
 //! ```sh
-//! RAMQP_BROKER_URL=amqp://guest:guest@localhost:5672 cargo test --test broker
+//! RAMQP_BROKER_URL=amqp://guest:guest@localhost:5672 \
+//! RAMQP_BROKER_ADDRESS=/queues/my-queue \
+//!     cargo test --test broker -- --ignored --test-threads=1
 //! ```
 //!
-//! When the variable is unset the tests no-op (so CI without Docker stays green).
+//! `RAMQP_BROKER_URL` is required to run them: it is an error (not a silent
+//! no-op) to run the broker tests without it.
 
 use std::time::Duration;
 
 use ramqp::types::messaging::{DeliveryState, Modified};
 use ramqp::{Connection, Consumer, Delivery, Message, Session};
 
-fn broker_url() -> Option<String> {
-    std::env::var("RAMQP_BROKER_URL").ok()
+/// The broker URL for interop tests. Panics with guidance when unset — the tests
+/// are `#[ignore]`d, so this is only reached when they are deliberately run, and
+/// a deliberate run without a broker should fail loudly, never silently pass.
+fn broker_url() -> String {
+    std::env::var("RAMQP_BROKER_URL").unwrap_or_else(|_| {
+        panic!(
+            "RAMQP_BROKER_URL must be set to run the broker interop tests \
+             (run e.g. `RAMQP_BROKER_URL=amqp://guest:guest@localhost:5672 \
+             cargo test --test broker -- --ignored --test-threads=1`)"
+        )
+    })
 }
 
 /// Drain any leftover messages on `address` so a test starts from a clean queue
@@ -65,11 +79,9 @@ fn broker_address() -> String {
 }
 
 #[tokio::test]
+#[ignore = "requires a live AMQP 1.0 broker; set RAMQP_BROKER_URL and run with --ignored"]
 async fn produce_consume_roundtrip() {
-    let Some(url) = broker_url() else {
-        eprintln!("skipping broker test: set RAMQP_BROKER_URL to run");
-        return;
-    };
+    let url = broker_url();
 
     let address = broker_address();
     let address = address.as_str();
@@ -98,11 +110,9 @@ async fn produce_consume_roundtrip() {
 }
 
 #[tokio::test]
+#[ignore = "requires a live AMQP 1.0 broker; set RAMQP_BROKER_URL and run with --ignored"]
 async fn many_messages_roundtrip() {
-    let Some(url) = broker_url() else {
-        eprintln!("skipping broker test: set RAMQP_BROKER_URL to run");
-        return;
-    };
+    let url = broker_url();
 
     let address = broker_address();
     let address = address.as_str();
@@ -130,11 +140,9 @@ async fn many_messages_roundtrip() {
 
 /// `release` returns the delivery to the queue; the broker must redeliver it.
 #[tokio::test]
+#[ignore = "requires a live AMQP 1.0 broker; set RAMQP_BROKER_URL and run with --ignored"]
 async fn release_redelivers() {
-    let Some(url) = broker_url() else {
-        eprintln!("skipping broker test: set RAMQP_BROKER_URL to run");
-        return;
-    };
+    let url = broker_url();
     let address = broker_address();
     let conn = open_conn(&url).await;
     let session = conn.begin_session().await.expect("session");
@@ -172,11 +180,9 @@ async fn release_redelivers() {
 /// `reject` (no dead-letter configured) must drop the message: it is not
 /// redelivered, and the broker accepts the disposition without error.
 #[tokio::test]
+#[ignore = "requires a live AMQP 1.0 broker; set RAMQP_BROKER_URL and run with --ignored"]
 async fn reject_drops() {
-    let Some(url) = broker_url() else {
-        eprintln!("skipping broker test: set RAMQP_BROKER_URL to run");
-        return;
-    };
+    let url = broker_url();
     let address = broker_address();
     let conn = open_conn(&url).await;
     let session = conn.begin_session().await.expect("session");
@@ -204,11 +210,9 @@ async fn reject_drops() {
 /// `modify { delivery_failed: true }` requeues with an incremented
 /// delivery-count; the broker must redeliver it.
 #[tokio::test]
+#[ignore = "requires a live AMQP 1.0 broker; set RAMQP_BROKER_URL and run with --ignored"]
 async fn modify_requeues() {
-    let Some(url) = broker_url() else {
-        eprintln!("skipping broker test: set RAMQP_BROKER_URL to run");
-        return;
-    };
+    let url = broker_url();
     let address = broker_address();
     let conn = open_conn(&url).await;
     let session = conn.begin_session().await.expect("session");
@@ -252,11 +256,9 @@ async fn modify_requeues() {
 /// The terminal outcome the broker settles a *produced* message with is
 /// `Accepted` on a normal enqueue.
 #[tokio::test]
+#[ignore = "requires a live AMQP 1.0 broker; set RAMQP_BROKER_URL and run with --ignored"]
 async fn produce_outcome_is_accepted() {
-    let Some(url) = broker_url() else {
-        eprintln!("skipping broker test: set RAMQP_BROKER_URL to run");
-        return;
-    };
+    let url = broker_url();
     let address = broker_address();
     let conn = open_conn(&url).await;
     let session = conn.begin_session().await.expect("session");
@@ -278,11 +280,9 @@ async fn produce_outcome_is_accepted() {
 /// feature: `cargo test --test broker --features scram`).
 #[cfg(feature = "scram")]
 #[tokio::test]
+#[ignore = "requires a live AMQP 1.0 broker; set RAMQP_BROKER_URL and run with --ignored"]
 async fn scram_sha256_auth() {
-    let Some(url) = broker_url() else {
-        eprintln!("skipping scram test: set RAMQP_BROKER_URL to run");
-        return;
-    };
+    let url = broker_url();
     use ramqp::sasl::{SaslProfile, ScramMechanism};
 
     let user = std::env::var("RAMQP_BROKER_USER").unwrap_or_else(|_| "guest".into());

@@ -6,7 +6,7 @@ use bytes::Bytes;
 
 use super::decode::{
     Decode, DecodeError, peek_code, read_array_header, read_bytes, read_list_header, read_u8,
-    read_u32,
+    read_u32, utf8_string,
 };
 use super::primitives::{Symbol, codes};
 
@@ -359,9 +359,7 @@ fn decode_symbol_array(mut body: Bytes, count: u32) -> Result<Vec<Symbol>, Decod
             }
         };
         let raw = read_bytes(&mut body, len)?;
-        let s = String::from_utf8(raw.to_vec())
-            .map_err(|_| DecodeError::InvalidUtf8 { kind: "symbol" })?;
-        out.push(Symbol(s));
+        out.push(Symbol(utf8_string(&raw, "symbol")?));
     }
     Ok(out)
 }

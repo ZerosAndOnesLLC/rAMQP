@@ -9,12 +9,14 @@ use tokio::sync::mpsc;
 use crate::config::Config;
 use crate::connection::heartbeat::{Heartbeat, HeartbeatAction};
 use crate::connection::mux::{ChannelAllocator, RemoteChannelMap};
-use crate::connection::negotiate::{Negotiated, build_open, close_to_error, reconcile};
+use crate::connection::negotiate::{
+    MIN_MAX_FRAME_SIZE, Negotiated, build_open, close_to_error, reconcile,
+};
 use crate::error::{ConnectError, ErrorKind, LinkError, RecvError, SendError, SessionError};
 use crate::ids::{ChannelId, SessionId};
 use crate::observe::{ConnectionEvent, EventBus, SharedMetrics};
 use crate::proto::{DriverCommand, Reply, SessionEvent, SessionOpened};
-use crate::session::state::Session;
+use crate::session::state::{Session, SessionPhase};
 use crate::transport::IoStream;
 use crate::transport::frame::{Frame, FrameBody, FramedTransport};
 use crate::types::definitions::Error as AmqpError;
@@ -83,6 +85,19 @@ impl<S: IoStream> Driver<S> {
                 }
             }
         };
+
+        // A peer advertising a max-frame-size below the 512-octet spec floor is
+        // non-compliant (it could not receive our minimum frames); reject the
+        // connection rather than silently clamping it.
+        if peer_open.max_frame_size < MIN_MAX_FRAME_SIZE {
+            return Err(ConnectError::msg(
+                ErrorKind::ProtocolViolation,
+                format!(
+                    "peer advertised max-frame-size {} below the {MIN_MAX_FRAME_SIZE}-octet minimum",
+                    peer_open.max_frame_size
+                ),
+            ));
+        }
 
         let negotiated = reconcile(&local_open, &peer_open);
         transport.set_max_frame_size(negotiated.max_frame_size);
@@ -246,6 +261,7 @@ impl<S: IoStream> Driver<S> {
                 body,
                 settled,
                 message_format,
+                state,
                 reply,
             } => {
                 let max = self.negotiated.max_frame_size as usize;
@@ -255,6 +271,7 @@ impl<S: IoStream> Driver<S> {
                         body,
                         settled,
                         message_format,
+                        state,
                         reply,
                         &mut self.transport,
                         max,
@@ -411,6 +428,17 @@ impl<S: IoStream> Driver<S> {
         performative: Performative,
         payload: Option<bytes::Bytes>,
     ) -> Result<(), ConnectError> {
+        // Inbound channel numbers must fall within the negotiated channel-max
+        // (spec §2.7.1); a frame outside that range is a connection error.
+        if channel > self.negotiated.channel_max {
+            return Err(ConnectError::msg(
+                ErrorKind::ProtocolViolation,
+                format!(
+                    "frame on channel {channel} exceeds negotiated channel-max {}",
+                    self.negotiated.channel_max
+                ),
+            ));
+        }
         match performative {
             Performative::Begin(begin) => {
                 let local = begin.remote_channel.ok_or_else(|| {
@@ -419,6 +447,25 @@ impl<S: IoStream> Driver<S> {
                         "peer begin missing remote-channel",
                     )
                 })?;
+                // The peer's begin must reference one of our sessions that is
+                // still awaiting it. Binding a duplicate or unknown channel would
+                // overwrite live session flow-control state or leak a routing
+                // entry, so reject it as a connection error instead.
+                match self.sessions.get(&local) {
+                    Some(s) if s.phase() == SessionPhase::BeginSent => {}
+                    Some(_) => {
+                        return Err(ConnectError::msg(
+                            ErrorKind::ProtocolViolation,
+                            format!("peer begin for already-mapped channel {local}"),
+                        ));
+                    }
+                    None => {
+                        return Err(ConnectError::msg(
+                            ErrorKind::ProtocolViolation,
+                            format!("peer begin references unknown local channel {local}"),
+                        ));
+                    }
+                }
                 self.remote_channels.bind(channel, local);
                 if let Some(session) = self.sessions.get_mut(&local) {
                     session.on_peer_begin(channel, &begin);
@@ -446,18 +493,24 @@ impl<S: IoStream> Driver<S> {
             }
             // Link performatives (attach/detach/transfer/disposition/flow).
             performative => {
+                // A link frame on a channel with no mapped session is a protocol
+                // violation (spec §2.7); surface it rather than dropping silently.
+                let Some(local) = self.remote_channels.resolve(channel) else {
+                    return Err(ConnectError::msg(
+                        ErrorKind::ProtocolViolation,
+                        format!("link frame on unmapped channel {channel}"),
+                    ));
+                };
                 match &performative {
                     Performative::Transfer(_) => self.metrics.on_transfer_received(),
                     Performative::Disposition(_) => self.metrics.on_settlement(),
                     _ => {}
                 }
-                if let Some(local) = self.remote_channels.resolve(channel) {
-                    let max = self.negotiated.max_frame_size as usize;
-                    if let Some(session) = self.sessions.get_mut(&local) {
-                        session
-                            .handle_link_frame(performative, payload, &mut self.transport, max)
-                            .await?;
-                    }
+                let max = self.negotiated.max_frame_size as usize;
+                if let Some(session) = self.sessions.get_mut(&local) {
+                    session
+                        .handle_link_frame(performative, payload, &mut self.transport, max)
+                        .await?;
                 }
             }
         }
@@ -838,6 +891,7 @@ mod tests {
             body: bytes::Bytes::from(body),
             settled: false,
             message_format: 0,
+            state: None,
             reply: Some(stx),
         })
         .await
@@ -856,6 +910,51 @@ mod tests {
         crx.await.unwrap().unwrap();
         run.await.unwrap().unwrap();
         server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejects_begin_for_unknown_channel() {
+        use crate::types::performatives::{Begin, Open};
+
+        let (client, server) = tokio::io::duplex(1 << 16);
+        let server_task = tokio::spawn(async move {
+            let mut st = FramedTransport::new(server, 1 << 16);
+            let _ = st.read_frame().await.unwrap(); // open
+            st.send_amqp(0, &Performative::Open(Open::new("server")), None)
+                .await
+                .unwrap();
+            // Unsolicited begin referencing a local channel we never allocated.
+            st.send_amqp(
+                0,
+                &Performative::Begin(Begin {
+                    remote_channel: Some(99),
+                    next_outgoing_id: 0,
+                    incoming_window: 100,
+                    outgoing_window: 100,
+                    ..Default::default()
+                }),
+                None,
+            )
+            .await
+            .unwrap();
+            let _ = st.read_frame().await; // peer observes the drop
+        });
+
+        let transport = FramedTransport::new(client, 1 << 16);
+        let (_tx, rx) = mpsc::channel(16);
+        let driver = Driver::open(
+            transport,
+            Arc::new(Config::default()),
+            noop_metrics(),
+            EventBus::default(),
+            rx,
+        )
+        .await
+        .unwrap();
+
+        let err = driver.run().await.unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ProtocolViolation);
+        let _ = server_task.await;
     }
 
     #[tokio::test]

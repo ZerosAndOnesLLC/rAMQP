@@ -15,6 +15,12 @@ use crate::proto::{LinkAttached, LinkEvent, Reply};
 use crate::types::definitions::SenderSettleMode;
 use crate::types::messaging::DeliveryState;
 
+/// Safety cap on outstanding unsettled deliveries per sender link. Unsettled
+/// sends pause (messages stay queued) once this many deliveries await a
+/// disposition, bounding memory even if a broker grants credit but withholds
+/// settlement. Well above any realistic in-flight count for normal operation.
+pub const MAX_UNSETTLED_PER_LINK: usize = 1 << 16;
+
 /// A queued outbound message awaiting credit/window before it can be sent.
 #[derive(Debug)]
 pub struct PendingSend {
@@ -24,6 +30,8 @@ pub struct PendingSend {
     pub settled: bool,
     /// The message format.
     pub message_format: u32,
+    /// Delivery state to set on the transfer (e.g. a `transactional-state`).
+    pub state: Option<DeliveryState>,
     /// Reply with the terminal outcome once settled (if awaited).
     pub reply: Option<Reply<DeliveryState, SendError>>,
 }

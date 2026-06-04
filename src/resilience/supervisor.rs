@@ -27,7 +27,22 @@ pub struct Backoff {
 
 impl Backoff {
     /// Create a backoff from a reconnect policy.
-    pub fn new(policy: ReconnectConfig) -> Self {
+    ///
+    /// The policy is sanitized against misconfiguration that would cause a tight
+    /// retry spin: a multiplier below 1 (or NaN) is raised to 1 so the delay
+    /// never shrinks, and a sub-millisecond initial backoff is floored so retries
+    /// are never effectively instantaneous.
+    pub fn new(mut policy: ReconnectConfig) -> Self {
+        if policy.multiplier < 1.0 || policy.multiplier.is_nan() {
+            policy.multiplier = 1.0;
+        }
+        let min_backoff = Duration::from_millis(1);
+        if policy.initial_backoff < min_backoff {
+            policy.initial_backoff = min_backoff;
+        }
+        if policy.max_backoff < policy.initial_backoff {
+            policy.max_backoff = policy.initial_backoff;
+        }
         let current = policy.initial_backoff;
         Backoff {
             policy,
@@ -118,6 +133,25 @@ pub async fn connect_with_retry(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sanitizes_misconfigured_backoff() {
+        // A multiplier < 1 and a zero initial backoff would otherwise spin.
+        let policy = ReconnectConfig {
+            enabled: true,
+            max_retries: None,
+            initial_backoff: Duration::ZERO,
+            max_backoff: Duration::ZERO,
+            multiplier: 0.0,
+            jitter: 0.0,
+        };
+        let mut b = Backoff::new(policy);
+        let d1 = b.next_delay().unwrap();
+        let d2 = b.next_delay().unwrap();
+        // floored to >= 1ms and never shrinking to an instantaneous retry
+        assert!(d1 >= Duration::from_millis(1));
+        assert!(d2 >= Duration::from_millis(1));
+    }
 
     #[test]
     fn backoff_grows_and_caps() {
