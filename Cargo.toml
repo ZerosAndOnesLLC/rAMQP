@@ -1,6 +1,6 @@
 [package]
 name = "ramqp"
-version = "0.6.4"
+version = "0.6.5"
 edition = "2024"
 rust-version = "1.85"
 description = "A from-scratch, clean-room AMQP 1.0 client."
@@ -55,7 +55,7 @@ default-features = false
 features = ["ring", "std", "tls12"]
 
 [dependencies.webpki-roots]
-version = "0.26"
+version = "1"
 optional = true
 
 [dependencies.rustls-pemfile]
@@ -71,7 +71,7 @@ version = "0.2"
 optional = true
 
 [dependencies.tokio-tungstenite]
-version = "0.24"
+version = "0.29"
 optional = true
 
 [dependencies.http]
@@ -79,19 +79,19 @@ version = "1"
 optional = true
 
 [dependencies.hmac]
-version = "0.12"
+version = "0.13"
 optional = true
 
 [dependencies.sha1]
-version = "0.10"
+version = "0.11"
 optional = true
 
 [dependencies.sha2]
-version = "0.10"
+version = "0.11"
 optional = true
 
 [dependencies.pbkdf2]
-version = "0.12"
+version = "0.13"
 optional = true
 default-features = false
 features = ["hmac"]
@@ -106,9 +106,9 @@ optional = true
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
-criterion = "0.5"
+criterion = "0.8"
 # Server side of the WebSocket bridge used by the live `ws` interop test.
-tokio-tungstenite = "0.24"
+tokio-tungstenite = "0.29"
 
 [[bench]]
 name = "codec"

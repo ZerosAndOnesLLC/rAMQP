@@ -5,7 +5,8 @@
 //! ```
 
 use bytes::{Bytes, BytesMut};
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
+use std::hint::black_box;
 
 use ramqp::Message;
 use ramqp::codec::{from_slice, to_vec};

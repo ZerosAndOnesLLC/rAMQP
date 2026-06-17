@@ -262,7 +262,7 @@ mod scram {
     use super::*;
     use base64::Engine;
     use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     use sha1::Sha1;
     use sha2::{Digest, Sha256, Sha512};
 

@@ -160,9 +160,9 @@ where
         let this = self.get_mut();
         // Wait for the sink to accept an item, then enqueue one binary message.
         ready!(this.inner.poll_ready_unpin(cx)).map_err(ws_to_io)?;
-        // tungstenite 0.24 `Message::Binary` takes `Vec<u8>` (later versions
-        // switched to `bytes::Bytes`), so copy the slice into an owned buffer.
-        let msg = Message::Binary(buf.to_vec());
+        // tungstenite's `Message::Binary` takes `bytes::Bytes`, so copy the
+        // slice into an owned buffer.
+        let msg = Message::Binary(bytes::Bytes::copy_from_slice(buf));
         match this.inner.start_send_unpin(msg) {
             Ok(()) => Poll::Ready(Ok(buf.len())),
             Err(e) => Poll::Ready(Err(ws_to_io(e))),
@@ -217,11 +217,9 @@ where
     // Bound inbound WebSocket message/frame sizes so a hostile server cannot
     // drive unbounded buffering at the transport layer (the AMQP layer separately
     // enforces the negotiated max-frame-size on decode).
-    let config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
-        max_message_size: Some(MAX_WS_MESSAGE_SIZE),
-        max_frame_size: Some(MAX_WS_FRAME_SIZE),
-        ..Default::default()
-    };
+    let config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+        .max_message_size(Some(MAX_WS_MESSAGE_SIZE))
+        .max_frame_size(Some(MAX_WS_FRAME_SIZE));
 
     let (ws, response) = tokio_tungstenite::client_async_with_config(request, stream, Some(config))
         .await
