@@ -1,11 +1,12 @@
 # ramqp
 
-A from-scratch, **clean-room** AMQP 1.0 **client** for Rust, built on `tokio`.
+An async **AMQP 1.0 client** for Rust on `tokio` — connect to RabbitMQ 4.x,
+ActiveMQ Artemis, and other AMQP 1.0 brokers.
 
-`ramqp` implements the OASIS AMQP 1.0 specification from the ground up — including
-its own type/encoding layer — with no external AMQP dependencies. It is designed
-to fix the resilience, performance, API, and observability gaps common to existing
-clients.
+`ramqp` is a from-scratch, **clean-room** implementation of the OASIS AMQP 1.0
+specification — including its own type/encoding layer, with no external AMQP
+dependencies. It is designed to fix the resilience, performance, API, and
+observability gaps common to existing clients.
 
 ## Highlights
 
