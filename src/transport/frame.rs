@@ -5,6 +5,8 @@
 //! `fe2o3-amqp` "re-serialize to probe size" pattern is never used. Decoding is
 //! zero-copy: the frame body is a [`Bytes`] slice of the read buffer.
 
+use std::io::IoSlice;
+
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -43,12 +45,14 @@ pub struct Frame {
     pub body: FrameBody,
 }
 
-/// Encode one AMQP frame (single-pass, backpatched size).
-pub fn encode_amqp_frame(
+/// Encode an AMQP frame header + performative, backpatching the frame size to
+/// include `trailing` payload bytes that are *not* written into `buf` (they are
+/// written separately — e.g. as a gathered body segment in a vectored flush).
+fn encode_amqp_header(
     buf: &mut BytesMut,
     channel: u16,
     performative: &Performative,
-    payload: Option<&[u8]>,
+    trailing: usize,
 ) {
     let size_pos = buf.len();
     buf.put_u32(0); // size placeholder
@@ -56,11 +60,21 @@ pub fn encode_amqp_frame(
     buf.put_u8(FRAME_TYPE_AMQP);
     buf.put_u16(channel);
     performative.encode(buf); // serialized exactly once
+    let size = (buf.len() - size_pos + trailing) as u32;
+    buf[size_pos..size_pos + 4].copy_from_slice(&size.to_be_bytes());
+}
+
+/// Encode one AMQP frame (single-pass, backpatched size), payload inline.
+pub fn encode_amqp_frame(
+    buf: &mut BytesMut,
+    channel: u16,
+    performative: &Performative,
+    payload: Option<&[u8]>,
+) {
+    encode_amqp_header(buf, channel, performative, payload.map_or(0, |p| p.len()));
     if let Some(p) = payload {
         buf.put_slice(p);
     }
-    let size = (buf.len() - size_pos) as u32;
-    buf[size_pos..size_pos + 4].copy_from_slice(&size.to_be_bytes());
 }
 
 /// Encode one SASL frame.
@@ -159,12 +173,24 @@ const READ_CHUNK: usize = 64 * 1024;
 /// Lower bound on that spare capacity (also the floor for tiny `max-frame-size`).
 const MIN_READ_CHUNK: usize = 4096;
 
+/// A transfer body at least this large is written zero-copy via a gathered
+/// (vectored) write instead of being copied into the write buffer — but only on
+/// vectored-capable streams (plain TCP). Smaller bodies are inlined, since the
+/// copy is cheaper than an extra scatter/gather segment.
+const BODY_SEGMENT_THRESHOLD: usize = 4096;
+
 /// A stream wrapper that reads/writes whole frames with buffered, batched IO.
 #[derive(Debug)]
 pub struct FramedTransport<S> {
     stream: S,
     read_buf: BytesMut,
     write_buf: BytesMut,
+    /// Large transfer bodies held out of `write_buf` for a gathered write, each
+    /// paired with the offset in `write_buf` at which it belongs on the wire.
+    out_bodies: Vec<(usize, Bytes)>,
+    /// Whether the stream supports true vectored writes (plain TCP). On TLS /
+    /// WebSocket this is false and bodies are always inlined (no behavior change).
+    vectored: bool,
     max_frame_size: usize,
     last_read_size: usize,
 }
@@ -173,10 +199,13 @@ impl<S: IoStream> FramedTransport<S> {
     /// Wrap `stream`, accepting frames up to `max_frame_size` bytes.
     pub fn new(stream: S, max_frame_size: u32) -> Self {
         let cap = (max_frame_size as usize).clamp(4096, 1 << 20);
+        let vectored = stream.is_write_vectored();
         FramedTransport {
             stream,
             read_buf: BytesMut::with_capacity(cap),
             write_buf: BytesMut::with_capacity(cap),
+            out_bodies: Vec::new(),
+            vectored,
             max_frame_size: max_frame_size as usize,
             last_read_size: 0,
         }
@@ -239,6 +268,21 @@ impl<S: IoStream> FramedTransport<S> {
         encode_amqp_frame(&mut self.write_buf, channel, performative, payload);
     }
 
+    /// Queue a transfer frame whose `body` is the message payload.
+    ///
+    /// On a vectored-capable stream a large body is held out of `write_buf` and
+    /// written zero-copy at flush (no body memcpy); otherwise — and for small
+    /// bodies — it is inlined exactly as [`queue_amqp`](Self::queue_amqp) would.
+    pub fn queue_transfer(&mut self, channel: u16, performative: &Performative, body: Bytes) {
+        if self.vectored && body.len() >= BODY_SEGMENT_THRESHOLD {
+            encode_amqp_header(&mut self.write_buf, channel, performative, body.len());
+            // The body belongs on the wire right after this header/performative.
+            self.out_bodies.push((self.write_buf.len(), body));
+        } else {
+            encode_amqp_frame(&mut self.write_buf, channel, performative, Some(&body));
+        }
+    }
+
     /// Queue a SASL frame in the write buffer.
     pub fn queue_sasl(&mut self, frame: &SaslFrame) {
         encode_sasl_frame(&mut self.write_buf, frame);
@@ -249,9 +293,9 @@ impl<S: IoStream> FramedTransport<S> {
         encode_empty_frame(&mut self.write_buf, channel);
     }
 
-    /// Number of queued, unflushed bytes.
+    /// Number of queued, unflushed bytes (inline buffer plus held bodies).
     pub fn pending_bytes(&self) -> usize {
-        self.write_buf.len()
+        self.write_buf.len() + self.out_bodies.iter().map(|(_, b)| b.len()).sum::<usize>()
     }
 
     /// Flush all queued frames in a single write + flush.
@@ -259,9 +303,51 @@ impl<S: IoStream> FramedTransport<S> {
         if self.write_buf.is_empty() {
             return Ok(());
         }
-        self.stream.write_all(&self.write_buf).await?;
+        if self.out_bodies.is_empty() {
+            self.stream.write_all(&self.write_buf).await?;
+        } else {
+            self.flush_gathered().await?;
+            self.out_bodies.clear();
+        }
         self.write_buf.clear();
         self.stream.flush().await?;
+        Ok(())
+    }
+
+    /// Write the queued frames via a single gathered (vectored) write,
+    /// interleaving the inline header/performative runs with the held bodies in
+    /// wire order so no body is copied into `write_buf`.
+    async fn flush_gathered(&mut self) -> Result<(), ConnectError> {
+        let Self {
+            stream,
+            write_buf,
+            out_bodies,
+            ..
+        } = self;
+        let mut slices: Vec<IoSlice<'_>> = Vec::with_capacity(out_bodies.len() * 2 + 1);
+        let mut pos = 0usize;
+        for (off, body) in out_bodies.iter() {
+            if *off > pos {
+                slices.push(IoSlice::new(&write_buf[pos..*off]));
+            }
+            slices.push(IoSlice::new(&body[..]));
+            pos = *off;
+        }
+        if pos < write_buf.len() {
+            slices.push(IoSlice::new(&write_buf[pos..]));
+        }
+
+        let mut remaining: &mut [IoSlice<'_>] = &mut slices;
+        while !remaining.is_empty() {
+            let n = stream.write_vectored(remaining).await?;
+            if n == 0 {
+                return Err(ConnectError::msg(
+                    ErrorKind::PeerClosed,
+                    "connection closed during write",
+                ));
+            }
+            IoSlice::advance_slices(&mut remaining, n);
+        }
         Ok(())
     }
 

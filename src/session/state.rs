@@ -441,46 +441,74 @@ impl Session {
                 }
                 let payload = payload.unwrap_or_default();
                 let cap = r.size_cap();
-                let complete = if let Some(partial) = r.partial.as_mut() {
-                    partial.append(&payload);
-                    !transfer.more
-                } else {
-                    let delivery_id = DeliveryId(transfer.delivery_id.unwrap_or(0));
-                    let tag = transfer.delivery_tag.clone().unwrap_or_default();
-                    let settled = transfer.settled.unwrap_or(false);
-                    r.partial = Some(PartialDelivery::new(
-                        delivery_id,
-                        tag,
-                        settled,
-                        transfer.state.clone(),
-                        &payload,
-                    ));
-                    !transfer.more
-                };
-
-                if r.partial.as_ref().map(|p| p.len() as u64).unwrap_or(0) > cap {
-                    // Refuse oversized deliveries rather than assembling unbounded.
-                    r.partial = None;
-                    size_exceeded = true;
-                } else if complete {
-                    let delivery = r.partial.take().expect("partial present").complete();
-                    r.credit.record_received();
-                    if !delivery.settled {
-                        r.unsettled.insert(
-                            delivery.delivery_id.value(),
-                            delivery.delivery_tag.clone(),
-                            None,
-                        );
-                        self.metrics.on_inflight(1);
+                if r.partial.is_none() && !transfer.more {
+                    // Fast path: a single self-contained frame (nothing is being
+                    // assembled and this transfer is not continued). The frame's
+                    // payload `Bytes` becomes the message body directly — no copy
+                    // into an assembly buffer.
+                    if payload.len() as u64 > cap {
+                        size_exceeded = true;
+                    } else {
+                        let delivery_id = DeliveryId(transfer.delivery_id.unwrap_or(0));
+                        let tag = transfer.delivery_tag.clone().unwrap_or_default();
+                        let settled = transfer.settled.unwrap_or(false);
+                        r.credit.record_received();
+                        if !settled {
+                            r.unsettled.insert(delivery_id.value(), tag.clone(), None);
+                            self.metrics.on_inflight(1);
+                        }
+                        let event = LinkEvent::Delivery(IncomingDelivery {
+                            delivery_id,
+                            delivery_tag: tag,
+                            settled,
+                            state: transfer.state.clone(),
+                            message: payload,
+                        });
+                        emit = Some((event, r.events.clone()));
                     }
-                    let event = LinkEvent::Delivery(IncomingDelivery {
-                        delivery_id: delivery.delivery_id,
-                        delivery_tag: delivery.delivery_tag.clone(),
-                        settled: delivery.settled,
-                        state: delivery.state().cloned(),
-                        message: delivery.into_raw(),
-                    });
-                    emit = Some((event, r.events.clone()));
+                } else {
+                    // Slow path: multi-frame assembly accumulates into a buffer.
+                    let complete = if let Some(partial) = r.partial.as_mut() {
+                        partial.append(&payload);
+                        !transfer.more
+                    } else {
+                        let delivery_id = DeliveryId(transfer.delivery_id.unwrap_or(0));
+                        let tag = transfer.delivery_tag.clone().unwrap_or_default();
+                        let settled = transfer.settled.unwrap_or(false);
+                        r.partial = Some(PartialDelivery::new(
+                            delivery_id,
+                            tag,
+                            settled,
+                            transfer.state.clone(),
+                            &payload,
+                        ));
+                        !transfer.more
+                    };
+
+                    if r.partial.as_ref().map(|p| p.len() as u64).unwrap_or(0) > cap {
+                        // Refuse oversized deliveries rather than assembling unbounded.
+                        r.partial = None;
+                        size_exceeded = true;
+                    } else if complete {
+                        let delivery = r.partial.take().expect("partial present").complete();
+                        r.credit.record_received();
+                        if !delivery.settled {
+                            r.unsettled.insert(
+                                delivery.delivery_id.value(),
+                                delivery.delivery_tag.clone(),
+                                None,
+                            );
+                            self.metrics.on_inflight(1);
+                        }
+                        let event = LinkEvent::Delivery(IncomingDelivery {
+                            delivery_id: delivery.delivery_id,
+                            delivery_tag: delivery.delivery_tag.clone(),
+                            settled: delivery.settled,
+                            state: delivery.state().cloned(),
+                            message: delivery.into_raw(),
+                        });
+                        emit = Some((event, r.events.clone()));
+                    }
                 }
             }
         }
@@ -868,7 +896,7 @@ fn send_message_frames<S: IoStream>(
     settled: bool,
     message_format: u32,
     state: Option<DeliveryState>,
-    body: &[u8],
+    body: &Bytes,
     max_payload: usize,
     windows: &mut SessionWindows,
 ) {
@@ -883,7 +911,7 @@ fn send_message_frames<S: IoStream>(
             state,
             ..Default::default()
         };
-        transport.queue_amqp(channel, &Performative::Transfer(first), Some(body));
+        transport.queue_transfer(channel, &Performative::Transfer(first), body.clone());
         windows.record_outgoing();
         return;
     }
@@ -896,7 +924,7 @@ fn send_message_frames<S: IoStream>(
     while offset < body.len() {
         let end = (offset + max_payload).min(body.len());
         let is_last = end == body.len();
-        let chunk = &body[offset..end];
+        let chunk = body.slice(offset..end);
         // The delivery state (e.g. transactional-state) rides only the first
         // frame of a multi-frame delivery.
         let transfer = if first_frame {
@@ -917,7 +945,7 @@ fn send_message_frames<S: IoStream>(
                 ..Default::default()
             }
         };
-        transport.queue_amqp(channel, &Performative::Transfer(transfer), Some(chunk));
+        transport.queue_transfer(channel, &Performative::Transfer(transfer), chunk);
         windows.record_outgoing();
         offset = end;
         first_frame = false;

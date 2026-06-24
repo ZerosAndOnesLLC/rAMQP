@@ -910,6 +910,141 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn produce_large_body_uses_gathered_write() {
+        // A body over BODY_SEGMENT_THRESHOLD (4 KiB) but under the negotiated
+        // frame size is a single transfer written via the gathered (vectored)
+        // write path on the TCP stream. The broker reassembles the payload and
+        // the test asserts it matches the encoded message byte-for-byte.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(2);
+        let broker = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let mut framed = broker_handshake(sock).await;
+            let mut acc: Vec<u8> = Vec::new();
+            let mut current: Option<u32> = None;
+            loop {
+                let frame = match framed.read_frame().await {
+                    Ok(f) => f,
+                    Err(_) => break,
+                };
+                match frame.body {
+                    FrameBody::Amqp(Performative::Attach(a), _) if a.role == Role::Sender => {
+                        framed
+                            .send_amqp(
+                                0,
+                                &Performative::Attach(Attach {
+                                    name: a.name.clone(),
+                                    handle: 0,
+                                    role: Role::Receiver,
+                                    source: Some(Source::default()),
+                                    target: Some(TargetArchetype::from(Target::new("queue"))),
+                                    ..Default::default()
+                                }),
+                                None,
+                            )
+                            .await
+                            .unwrap();
+                        framed
+                            .send_amqp(
+                                0,
+                                &Performative::Flow(Flow {
+                                    next_incoming_id: Some(0),
+                                    incoming_window: 100,
+                                    next_outgoing_id: 0,
+                                    outgoing_window: 100,
+                                    handle: Some(0),
+                                    delivery_count: Some(0),
+                                    link_credit: Some(10),
+                                    ..Default::default()
+                                }),
+                                None,
+                            )
+                            .await
+                            .unwrap();
+                    }
+                    FrameBody::Amqp(Performative::Transfer(t), payload) => {
+                        if let Some(id) = t.delivery_id {
+                            current = Some(id);
+                        }
+                        if let Some(p) = payload {
+                            acc.extend_from_slice(&p);
+                        }
+                        if !t.more {
+                            let id = current.take().unwrap();
+                            framed
+                                .send_amqp(
+                                    0,
+                                    &Performative::Disposition(Disposition {
+                                        role: Role::Receiver,
+                                        first: id,
+                                        last: None,
+                                        settled: true,
+                                        state: Some(DeliveryState::Accepted(Accepted::default())),
+                                        batchable: false,
+                                    }),
+                                    None,
+                                )
+                                .await
+                                .unwrap();
+                            tx.send(std::mem::take(&mut acc)).await.unwrap();
+                        }
+                    }
+                    FrameBody::Amqp(Performative::Detach(d), _) => {
+                        framed
+                            .send_amqp(
+                                0,
+                                &Performative::Detach(Detach {
+                                    handle: d.handle,
+                                    closed: true,
+                                    error: None,
+                                }),
+                                None,
+                            )
+                            .await
+                            .unwrap();
+                    }
+                    FrameBody::Amqp(Performative::End(_), _) => {
+                        framed
+                            .send_amqp(0, &Performative::End(End { error: None }), None)
+                            .await
+                            .unwrap();
+                    }
+                    FrameBody::Amqp(Performative::Close(_), _) => {
+                        framed
+                            .send_amqp(0, &Performative::Close(Close { error: None }), None)
+                            .await
+                            .unwrap();
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        let url = format!("amqp://127.0.0.1:{port}");
+        let conn = Connection::open(&url).await.unwrap();
+        let session = conn.begin_session().await.unwrap();
+        let producer = session.create_producer("queue").await.unwrap();
+
+        let big = "z".repeat(20_000);
+        let expected = to_vec(&Message::text(&big));
+        let outcome = producer.send(Message::text(&big)).await.unwrap();
+        assert!(matches!(outcome, DeliveryState::Accepted(_)));
+
+        let got = rx.recv().await.unwrap();
+        assert_eq!(
+            got, expected,
+            "gathered (vectored) write must reproduce the body exactly"
+        );
+
+        producer.detach().await.unwrap();
+        session.end().await.unwrap();
+        conn.close().await.unwrap();
+        broker.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn second_mode_settlement() {
         use crate::types::definitions::ReceiverSettleMode;
         use std::sync::Arc;
