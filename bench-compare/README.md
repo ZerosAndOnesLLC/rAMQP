@@ -14,11 +14,14 @@ cargo build -p ramqp-bench-compare --release
 
 ## Binaries
 
-| bin       | what it measures |
-|-----------|------------------|
-| `rig`     | The rigorous comparison: matched credit windows, warmup, multiple body sizes, N trials, median/min/max. Per client via `BENCH_CLIENT`. |
-| `bench`   | Quick head-to-head send + recv throughput (one or both clients). |
-| `confirm` | Isolation experiment: ramqp `recv()` only vs `recv()`+`accept()`, to pin settlement cost. |
+| bin         | what it measures |
+|-------------|------------------|
+| `rig`       | The rigorous comparison: matched credit windows, warmup, multiple body sizes, N trials, median/min/max. Per client via `BENCH_CLIENT`. |
+| `bench`     | Quick head-to-head send + recv throughput (one or both clients). |
+| `confirm`   | Isolation experiment: ramqp `recv()` only vs `recv()`+`accept()`, to pin settlement cost. |
+| `wscompare` | ramqp receive throughput over the transport in `AMQP_URL` (`amqp://` = TCP, `ws://` = WebSocket), one long-lived connection — for comparing the WS vs TCP transport on the same broker. |
+| `probe`     | Minimal connectivity check with per-step timeouts (handy when bringing up a new broker/transport). |
+| `wsproxy`   | Transparent WebSocket→TCP proxy, to benchmark AMQP-over-WebSocket against a broker that only speaks TCP (e.g. RabbitMQ). |
 
 ## Fairness controls (in `rig`)
 
@@ -46,6 +49,41 @@ BENCH_CLIENT=fe2o3                cargo run -p ramqp-bench-compare --release --b
 ```
 
 Env: `BENCH_CLIENT` (`ramqp`|`fe2o3`), `RAMQP_BATCH` (>1 = batched `accept_through`).
+
+## WebSocket vs TCP
+
+RabbitMQ doesn't expose AMQP 1.0 over WebSocket, but **ActiveMQ Artemis does**
+natively (its AMQP acceptor auto-detects the WS upgrade and negotiates the
+`amqp` subprotocol). Run `wscompare` over both schemes against the same broker:
+
+```sh
+docker run -d --name artemis -e ARTEMIS_USER=guest -e ARTEMIS_PASSWORD=guest \
+  -p 5682:5672 -p 8162:8161 apache/activemq-artemis:latest
+# Artemis needs an anycast queue (store-and-forward) for prefill-then-drain:
+docker exec artemis /var/lib/artemis-instance/bin/artemis queue create \
+  --name ramqp_it --address ramqp_it --anycast --durable \
+  --auto-create-address --preserve-on-no-consumers --user guest --password guest --silent
+
+export AMQP_ADDRESS=ramqp_it
+AMQP_URL=amqp://guest:guest@localhost:5682 cargo run -p ramqp-bench-compare --release --bin wscompare
+AMQP_URL=ws://guest:guest@localhost:5682   cargo run -p ramqp-bench-compare --release --bin wscompare
+```
+
+For a same-broker isolation against a TCP-only broker (e.g. RabbitMQ), front it
+with `wsproxy` and point `wscompare` at `ws://127.0.0.1:5673`:
+
+```sh
+WS_LISTEN=127.0.0.1:5673 WS_UPSTREAM=127.0.0.1:5672 \
+  cargo run -p ramqp-bench-compare --release --bin wsproxy &
+```
+
+**Finding (Artemis, directional, high variance):** the WS transport is **on par
+with TCP** — within ~15%, ahead at 64 B and slightly behind at 1–8 KB (the
+masking/copy cost scales with payload). The WS layer is not a meaningful
+throughput penalty. Note Artemis throttles rapid AMQP-over-*TCP* reconnects
+(handshake timeouts under the per-trial-reconnect `rig`), while its WS path stays
+healthy — a broker-side quirk, not a client one (the same `rig` is fine on
+RabbitMQ); `wscompare` sidesteps it with one long-lived connection.
 
 ## Results (ramqp 0.7.2 vs fe2o3-amqp 0.15.1, RabbitMQ 4.x, recv msg/s median)
 
