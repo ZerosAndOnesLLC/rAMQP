@@ -1,0 +1,29 @@
+# Comparison-benchmark crate: ramqp vs fe2o3-amqp.
+#
+# A workspace member, but kept out of the published `ramqp` tarball (see the
+# root manifest's `exclude`) and off the default build, so its competitor
+# `fe2o3-amqp` dependency never enters ramqp's CI or published artifact.
+# Build explicitly: `cargo build -p ramqp-bench-compare --release`.
+[package]
+name = "ramqp-bench-compare"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Comparison benchmark harness: ramqp vs fe2o3-amqp against a live AMQP 1.0 broker."
+
+[dependencies]
+ramqp = { path = ".." }
+fe2o3-amqp = "0.15"
+tokio = { version = "1", features = ["full"] }
+
+[[bin]]
+name = "rig"
+path = "src/bin/rig.rs"
+
+[[bin]]
+name = "bench"
+path = "src/bin/bench.rs"
+
+[[bin]]
+name = "confirm"
+path = "src/bin/confirm.rs"

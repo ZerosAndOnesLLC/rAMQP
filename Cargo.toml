@@ -8,10 +8,20 @@ license = "MIT"
 repository = "https://github.com/ZerosAndOnesLLC/rAMQP"
 keywords = ["amqp", "amqp1", "messaging", "tokio", "async"]
 categories = ["network-programming", "asynchronous"]
+# Keep the comparison-benchmark crate (and its fe2o3-amqp dep) out of the
+# published `ramqp` tarball; it remains a workspace member for local dev.
+exclude = ["/bench-compare"]
 
 # Document every feature-gated API (TLS / WebSocket / SCRAM / transactions) on docs.rs.
 [package.metadata.docs.rs]
 all-features = true
+
+# Root package + the comparison-benchmark member. Default commands
+# (`cargo build`, `cargo test`) stay scoped to the root `ramqp` package — so CI
+# and the published crate never pull in fe2o3-amqp; build the bench explicitly
+# with `-p ramqp-bench-compare`.
+[workspace]
+members = ["bench-compare"]
 
 [lib]
 name = "ramqp"
