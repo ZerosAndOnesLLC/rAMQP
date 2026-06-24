@@ -236,16 +236,19 @@ fn encode_value_array(buf: &mut BytesMut, items: &[Value]) {
 }
 
 fn encode_compound_array(buf: &mut BytesMut, items: &[Value]) {
-    let mut first = BytesMut::new();
-    items[0].encode(&mut first);
-    let ctor = first[0];
+    // Reuse one scratch buffer across all elements (cleared between them) rather
+    // than allocating a fresh BytesMut per element; the leading constructor byte
+    // is shared by the array header, so only each element's body is copied in.
+    let mut scratch = BytesMut::new();
+    items[0].encode(&mut scratch);
+    let ctor = scratch[0];
     let (s, c, start) = open_compound(buf, codes::ARRAY32);
     buf.put_u8(ctor);
-    buf.put_slice(&first[1..]);
+    buf.put_slice(&scratch[1..]);
     for it in &items[1..] {
-        let mut e = BytesMut::new();
-        it.encode(&mut e);
-        buf.put_slice(&e[1..]);
+        scratch.clear();
+        it.encode(&mut scratch);
+        buf.put_slice(&scratch[1..]);
     }
     close_compound(buf, s, c, start, items.len() as u32);
 }
@@ -264,11 +267,12 @@ fn encode_described_array(buf: &mut BytesMut, items: &[Value]) {
     buf.put_slice(&dbuf);
     buf.put_u8(vctor);
     buf.put_slice(&vbuf[1..]);
+    // Reuse `vbuf` for the remaining element values instead of reallocating.
     for it in &items[1..] {
         if let Value::Described(_, v) = it {
-            let mut vb = BytesMut::new();
-            v.encode(&mut vb);
-            buf.put_slice(&vb[1..]);
+            vbuf.clear();
+            v.encode(&mut vbuf);
+            buf.put_slice(&vbuf[1..]);
         }
     }
     close_compound(buf, s, c, start, items.len() as u32);

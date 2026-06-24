@@ -362,7 +362,7 @@ impl Session {
                 tag,
                 pending.settled,
                 pending.message_format,
-                pending.state.clone(),
+                pending.state,
                 &pending.body,
                 max_payload,
                 windows,
