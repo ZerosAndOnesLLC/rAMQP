@@ -896,7 +896,7 @@ fn send_message_frames<S: IoStream>(
     settled: bool,
     message_format: u32,
     state: Option<DeliveryState>,
-    body: &[u8],
+    body: &Bytes,
     max_payload: usize,
     windows: &mut SessionWindows,
 ) {
@@ -911,7 +911,7 @@ fn send_message_frames<S: IoStream>(
             state,
             ..Default::default()
         };
-        transport.queue_amqp(channel, &Performative::Transfer(first), Some(body));
+        transport.queue_transfer(channel, &Performative::Transfer(first), body.clone());
         windows.record_outgoing();
         return;
     }
@@ -924,7 +924,7 @@ fn send_message_frames<S: IoStream>(
     while offset < body.len() {
         let end = (offset + max_payload).min(body.len());
         let is_last = end == body.len();
-        let chunk = &body[offset..end];
+        let chunk = body.slice(offset..end);
         // The delivery state (e.g. transactional-state) rides only the first
         // frame of a multi-frame delivery.
         let transfer = if first_frame {
@@ -945,7 +945,7 @@ fn send_message_frames<S: IoStream>(
                 ..Default::default()
             }
         };
-        transport.queue_amqp(channel, &Performative::Transfer(transfer), Some(chunk));
+        transport.queue_transfer(channel, &Performative::Transfer(transfer), chunk);
         windows.record_outgoing();
         offset = end;
         first_frame = false;

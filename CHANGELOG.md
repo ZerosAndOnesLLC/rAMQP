@@ -5,6 +5,19 @@ All notable changes to ramqp will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.1] - 2026-06-24
+
+### Changed (performance)
+- **Zero-copy receive for single-frame deliveries.** A self-contained transfer
+  (the common case) is now turned into a delivery directly from the frame's
+  `Bytes` slice, eliminating the per-message body memcpy through the multi-frame
+  assembly buffer. Multi-frame deliveries are unchanged.
+- **Gathered (vectored) writes for large transfer bodies.** On vectored-capable
+  streams (plain TCP) a transfer body ≥ 4 KiB is held out of the write buffer and
+  written zero-copy via `writev` interleaved with the frame headers, avoiding the
+  body copy on send. TLS and WebSocket streams (non-vectored) are byte-identical
+  to before — small bodies are always inlined.
+
 ## [0.7.0] - 2026-06-24
 
 ### Security
