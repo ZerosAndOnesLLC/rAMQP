@@ -868,8 +868,15 @@ mod tests {
         consumer.accept_through(&d2).await.unwrap();
 
         let (first, last) = rx.recv().await.unwrap();
-        assert_eq!(first, 0, "ranged accept must start at the oldest unsettled id");
-        assert_eq!(last, Some(2), "ranged accept must cover through the last delivery");
+        assert_eq!(
+            first, 0,
+            "ranged accept must start at the oldest unsettled id"
+        );
+        assert_eq!(
+            last,
+            Some(2),
+            "ranged accept must cover through the last delivery"
+        );
 
         consumer.detach().await.unwrap();
         session.end().await.unwrap();

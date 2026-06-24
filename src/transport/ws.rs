@@ -125,7 +125,8 @@ where
                         // An empty binary frame carries no AMQP bytes; keep going.
                         continue;
                     }
-                    this.leftover = bytes::Bytes::from(data);
+                    // `Message::Binary` already yields `bytes::Bytes` (tungstenite 0.29+).
+                    this.leftover = data;
                     this.drain_leftover(buf);
                     return Poll::Ready(Ok(()));
                 }
