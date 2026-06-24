@@ -340,12 +340,16 @@ impl Session {
             let pending = sender.outbox.pop_front().expect("non-empty");
             let delivery_id = windows.next_outgoing_id;
             let tag = sender.next_delivery_tag();
+            // Clone the tag for the unsettled map only when the delivery is
+            // tracked; the pre-settled fast path moves the single allocation
+            // straight into the frame with no extra refcount traffic.
+            let tag_for_map = (!pending.settled).then(|| tag.clone());
             send_message_frames(
                 transport,
                 local_channel,
                 handle,
                 delivery_id,
-                &tag,
+                tag,
                 pending.settled,
                 pending.message_format,
                 pending.state.clone(),
@@ -359,7 +363,11 @@ impl Session {
                     let _ = reply.send(Ok(DeliveryState::Accepted(Accepted::default())));
                 }
             } else {
-                sender.unsettled.insert(delivery_id, tag, None);
+                sender.unsettled.insert(
+                    delivery_id,
+                    tag_for_map.expect("unsettled delivery has a tag"),
+                    None,
+                );
                 self.metrics.on_inflight(1);
                 if let Some(reply) = pending.reply {
                     sender
@@ -835,7 +843,7 @@ fn send_message_frames<S: IoStream>(
     channel: u16,
     handle: u32,
     delivery_id: u32,
-    tag: &Bytes,
+    tag: Bytes,
     settled: bool,
     message_format: u32,
     state: Option<DeliveryState>,
@@ -847,7 +855,7 @@ fn send_message_frames<S: IoStream>(
         let first = Transfer {
             handle,
             delivery_id: Some(delivery_id),
-            delivery_tag: Some(tag.clone()),
+            delivery_tag: Some(tag),
             message_format: Some(message_format),
             settled: Some(settled),
             more: false,
@@ -859,6 +867,9 @@ fn send_message_frames<S: IoStream>(
         return;
     }
 
+    // Only the first transfer of a multi-frame delivery carries the tag; move
+    // the single allocation into it rather than cloning.
+    let mut tag = Some(tag);
     let mut offset = 0;
     let mut first_frame = true;
     while offset < body.len() {
@@ -871,7 +882,7 @@ fn send_message_frames<S: IoStream>(
             Transfer {
                 handle,
                 delivery_id: Some(delivery_id),
-                delivery_tag: Some(tag.clone()),
+                delivery_tag: tag.take(),
                 message_format: Some(message_format),
                 settled: Some(settled),
                 more: !is_last,
