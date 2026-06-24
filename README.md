@@ -1,5 +1,11 @@
 # ramqp
 
+[![CI](https://github.com/ZerosAndOnesLLC/rAMQP/actions/workflows/ci.yml/badge.svg)](https://github.com/ZerosAndOnesLLC/rAMQP/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/ramqp.svg)](https://crates.io/crates/ramqp)
+[![docs.rs](https://img.shields.io/docsrs/ramqp)](https://docs.rs/ramqp)
+[![downloads](https://img.shields.io/crates/d/ramqp.svg)](https://crates.io/crates/ramqp)
+[![license](https://img.shields.io/crates/l/ramqp.svg)](./LICENSE)
+
 An async **AMQP 1.0 client** for Rust on `tokio` — connect to RabbitMQ 4.x,
 ActiveMQ Artemis, and other AMQP 1.0 brokers.
 
@@ -28,6 +34,29 @@ observability gaps common to existing clients.
   re-established with backoff, sessions/links are re-attached, and in-flight sends
   are replayed — all behind the scenes.
 - **`#![forbid(unsafe_code)]`** throughout.
+
+## Performance & how it compares
+
+`ramqp` is benchmarked head-to-head against the established `fe2o3-amqp` client
+over a live broker, with matched credit windows and warmup (see
+[`bench-compare/`](./bench-compare)). On RabbitMQ 4.x, 5000 messages, receive
+throughput (median msg/s):
+
+| body | ramqp (per-msg ack) | fe2o3-amqp (per-msg ack) | ramqp (batched ack) |
+|------|--------------------:|-------------------------:|--------------------:|
+| 64 B |             ~180,000 |                 ~177,000 |        **~230,000** |
+| 1 KB |             ~119,000 |                 ~129,000 |        **~150,000** |
+| 8 KB |              ~42,000 |                  ~42,000 |         **~53,000** |
+
+- On the standard per-message path, ramqp is **at parity** with the mature
+  incumbent.
+- Using **batched ranged settlement** (`accept_through`) — settling a whole run
+  of deliveries in one frame — ramqp is **~1.2–1.4x faster**.
+- Send throughput is bound by per-message broker settlement, not the client, so
+  it ties for both.
+
+Numbers are directional (single-node RabbitMQ); reproduce them on your own
+broker with the harness in [`bench-compare/`](./bench-compare).
 
 ## Quick start
 
