@@ -5,7 +5,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::api::lifecycle::detach_on_drop;
 use crate::error::{ErrorKind, LinkError, RecvError, RemoteError};
-use crate::ids::{ChannelId, Handle};
+use crate::ids::{ChannelId, DeliveryId, Handle};
 use crate::link::Delivery;
 use crate::proto::{DriverCommand, LinkEvent};
 use crate::types::definitions::Error as AmqpError;
@@ -118,6 +118,17 @@ impl Consumer {
     }
 
     /// Accept a delivery (settles it).
+    ///
+    /// The disposition is *dispatched* to the connection driver, not confirmed
+    /// by the broker: for a settled disposition the receiver is locally
+    /// authoritative, so this returns as soon as the frame is queued (awaiting
+    /// only backpressure / connection liveness). This is what lets a
+    /// `recv → accept` loop pipeline. The same applies to
+    /// [`reject`](Self::reject), [`release`](Self::release),
+    /// [`modify`](Self::modify), and [`settle`](Self::settle). Under
+    /// `ReceiverSettleMode::Second` the final settle still completes when the
+    /// sender confirms (as before — the previous reply never waited for that
+    /// either).
     pub async fn accept(&self, delivery: &Delivery) -> Result<(), RecvError> {
         self.dispose(delivery, DeliveryState::Accepted(Accepted::default()))
             .await
@@ -151,21 +162,37 @@ impl Consumer {
     }
 
     async fn dispose(&self, delivery: &Delivery, state: DeliveryState) -> Result<(), RecvError> {
-        let (tx, rx) = oneshot::channel();
+        self.dispose_range(delivery.delivery_id, None, state).await
+    }
+
+    /// Dispatch a (possibly ranged) settled disposition **without** awaiting a
+    /// driver round-trip.
+    ///
+    /// For a `settled` disposition the receiver is locally authoritative, so the
+    /// old per-message `oneshot` reply only confirmed that the frame had been
+    /// queued — never a broker acknowledgement. Dropping it lets the
+    /// `recv → settle` loop pipeline instead of stalling on an actor round-trip
+    /// per message (the dominant cost measured in issue #3). The command send is
+    /// still `await`ed, so backpressure and a closed connection are surfaced at
+    /// the call site; only the redundant post-send confirmation is gone.
+    async fn dispose_range(
+        &self,
+        first: DeliveryId,
+        last: Option<DeliveryId>,
+        state: DeliveryState,
+    ) -> Result<(), RecvError> {
         self.commands
             .send(DriverCommand::SendDisposition {
                 channel: self.channel,
                 handle: self.handle,
-                first: delivery.delivery_id,
-                last: None,
+                first,
+                last,
                 state,
                 settled: true,
-                reply: Some(tx),
+                reply: None,
             })
             .await
-            .map_err(|_| RecvError::msg(ErrorKind::NotConnected, "connection closed"))?;
-        rx.await
-            .map_err(|_| RecvError::msg(ErrorKind::Cancelled, "driver dropped"))?
+            .map_err(|_| RecvError::msg(ErrorKind::NotConnected, "connection closed"))
     }
 
     /// Grant additional link credit (manual credit mode).
