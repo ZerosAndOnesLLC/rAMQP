@@ -153,6 +153,21 @@ impl<S: IoStream> Driver<S> {
             tokio::select! {
                 biased;
 
+                // Reads first: draining available transfers fills the consumer,
+                // which then produces a burst of settlements that the command arm
+                // below coalesces into a single disposition write (instead of one
+                // tiny write per accept in the tight recv->accept ping-pong).
+                frame = self.transport.read_frame() => {
+                    let frame = frame?;
+                    self.heartbeat.record_recv();
+                    self.metrics.on_frame_received(self.transport.last_read_size());
+                    let done = self.handle_frame(frame).await?;
+                    self.flush().await?;
+                    if done {
+                        return Ok(());
+                    }
+                }
+
                 command = self.commands.recv() => {
                     match command {
                         Some(command) => {
@@ -186,17 +201,6 @@ impl<S: IoStream> Driver<S> {
                             self.await_peer_close().await?;
                             return Ok(());
                         }
-                    }
-                }
-
-                frame = self.transport.read_frame() => {
-                    let frame = frame?;
-                    self.heartbeat.record_recv();
-                    self.metrics.on_frame_received(self.transport.last_read_size());
-                    let done = self.handle_frame(frame).await?;
-                    self.flush().await?;
-                    if done {
-                        return Ok(());
                     }
                 }
 
