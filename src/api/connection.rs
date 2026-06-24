@@ -762,6 +762,122 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn accept_through_sends_one_ranged_disposition() {
+        // Broker delivers three unsettled messages and reports the (first, last)
+        // of the single disposition the consumer emits back to the test.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<(u32, Option<u32>)>(4);
+        let broker = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let mut framed = broker_handshake(sock).await;
+            let mut delivered = false;
+            loop {
+                let frame = match framed.read_frame().await {
+                    Ok(f) => f,
+                    Err(_) => break,
+                };
+                match frame.body {
+                    FrameBody::Amqp(Performative::Attach(a), _) if a.role == Role::Receiver => {
+                        framed
+                            .send_amqp(
+                                0,
+                                &Performative::Attach(Attach {
+                                    name: a.name.clone(),
+                                    handle: 0,
+                                    role: Role::Sender,
+                                    source: Some(Source::new("queue")),
+                                    target: Some(TargetArchetype::from(Target::default())),
+                                    initial_delivery_count: Some(0),
+                                    ..Default::default()
+                                }),
+                                None,
+                            )
+                            .await
+                            .unwrap();
+                    }
+                    FrameBody::Amqp(Performative::Flow(f), _)
+                        if !delivered && f.link_credit.unwrap_or(0) >= 3 =>
+                    {
+                        delivered = true;
+                        for id in 0..3u32 {
+                            let body = to_vec(&Message::text("batch"));
+                            framed
+                                .send_amqp(
+                                    0,
+                                    &Performative::Transfer(Transfer {
+                                        handle: 0,
+                                        delivery_id: Some(id),
+                                        delivery_tag: Some(Bytes::copy_from_slice(
+                                            &id.to_be_bytes(),
+                                        )),
+                                        message_format: Some(0),
+                                        settled: Some(false),
+                                        more: false,
+                                        ..Default::default()
+                                    }),
+                                    Some(&body),
+                                )
+                                .await
+                                .unwrap();
+                        }
+                    }
+                    FrameBody::Amqp(Performative::Disposition(d), _) => {
+                        tx.send((d.first, d.last)).await.unwrap();
+                    }
+                    FrameBody::Amqp(Performative::Detach(d), _) => {
+                        framed
+                            .send_amqp(
+                                0,
+                                &Performative::Detach(Detach {
+                                    handle: d.handle,
+                                    closed: true,
+                                    error: None,
+                                }),
+                                None,
+                            )
+                            .await
+                            .unwrap();
+                    }
+                    FrameBody::Amqp(Performative::End(_), _) => {
+                        framed
+                            .send_amqp(0, &Performative::End(End { error: None }), None)
+                            .await
+                            .unwrap();
+                    }
+                    FrameBody::Amqp(Performative::Close(_), _) => {
+                        framed
+                            .send_amqp(0, &Performative::Close(Close { error: None }), None)
+                            .await
+                            .unwrap();
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        let url = format!("amqp://127.0.0.1:{port}");
+        let conn = Connection::open(&url).await.unwrap();
+        let session = conn.begin_session().await.unwrap();
+        let mut consumer = session.create_consumer("queue").await.unwrap();
+
+        let _d0 = consumer.recv().await.unwrap();
+        let _d1 = consumer.recv().await.unwrap();
+        let d2 = consumer.recv().await.unwrap();
+        consumer.accept_through(&d2).await.unwrap();
+
+        let (first, last) = rx.recv().await.unwrap();
+        assert_eq!(first, 0, "ranged accept must start at the oldest unsettled id");
+        assert_eq!(last, Some(2), "ranged accept must cover through the last delivery");
+
+        consumer.detach().await.unwrap();
+        session.end().await.unwrap();
+        conn.close().await.unwrap();
+        broker.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn end_to_end_produce_multiframe() {
         let (url, broker) = spawn_broker().await;
         let mut config = Config::default();

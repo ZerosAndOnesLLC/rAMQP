@@ -23,6 +23,9 @@ pub struct Consumer {
     /// Replenish once this many deliveries have been consumed since the last top-up.
     replenish_every: u32,
     consumed: u32,
+    /// Oldest delivery id received but not yet settled, used as the lower bound
+    /// of a ranged [`accept_through`](Consumer::accept_through).
+    pending_first: Option<DeliveryId>,
 }
 
 impl Consumer {
@@ -42,6 +45,7 @@ impl Consumer {
             credit_window,
             replenish_every: credit_window.saturating_sub(low_water).max(1),
             consumed: 0,
+            pending_first: None,
         }
     }
 
@@ -80,6 +84,9 @@ impl Consumer {
                     let delivery =
                         Delivery::new(d.delivery_id, d.delivery_tag, d.settled, d.message)
                             .with_state(d.state);
+                    if self.pending_first.is_none() {
+                        self.pending_first = Some(delivery.delivery_id);
+                    }
                     self.after_consume().await;
                     return Ok(delivery);
                 }
@@ -132,6 +139,29 @@ impl Consumer {
     pub async fn accept(&self, delivery: &Delivery) -> Result<(), RecvError> {
         self.dispose(delivery, DeliveryState::Accepted(Accepted::default()))
             .await
+    }
+
+    /// Accept every delivery from the oldest not-yet-settled one *through*
+    /// `delivery`, in a single ranged disposition frame.
+    ///
+    /// This collapses N per-message dispositions into one `first..last` frame —
+    /// the cheapest way to acknowledge a batch, both in syscalls and in wire
+    /// bytes. Intended for in-order bulk acknowledgement: drive a `recv` loop
+    /// and call `accept_through` on the most recent delivery every so often (or
+    /// at the end of a batch). The receiver applies the outcome only to
+    /// deliveries still unsettled within the range, so a delivery already
+    /// settled individually is left untouched — but do not rely on interleaving
+    /// per-delivery [`reject`](Self::reject) inside a range you then
+    /// `accept_through`, as the broker's handling of a re-referenced settled id
+    /// is undefined.
+    pub async fn accept_through(&mut self, delivery: &Delivery) -> Result<(), RecvError> {
+        let first = self.pending_first.take().unwrap_or(delivery.delivery_id);
+        self.dispose_range(
+            first,
+            Some(delivery.delivery_id),
+            DeliveryState::Accepted(Accepted::default()),
+        )
+        .await
     }
 
     /// Reject a delivery with an optional error.
