@@ -27,6 +27,11 @@ pub struct Heartbeat {
     recv_timeout: Option<Duration>,
     last_recv: Instant,
     last_send: Instant,
+    // Activity is flagged with a cheap bool per frame and folded into `last_recv`
+    // / `last_send` once per (infrequent) timer tick — so the per-message hot
+    // path never calls `Instant::now()` (a `clock_gettime` syscall/vDSO call).
+    recv_since_tick: bool,
+    send_since_tick: bool,
 }
 
 impl Heartbeat {
@@ -57,17 +62,19 @@ impl Heartbeat {
             recv_timeout,
             last_recv: now,
             last_send: now,
+            recv_since_tick: false,
+            send_since_tick: false,
         }
     }
 
-    /// Record that a frame was received from the peer.
+    /// Record that a frame was received from the peer (hot path: no clock call).
     pub fn record_recv(&mut self) {
-        self.last_recv = Instant::now();
+        self.recv_since_tick = true;
     }
 
-    /// Record that a frame was sent to the peer.
+    /// Record that a frame was sent to the peer (hot path: no clock call).
     pub fn record_send(&mut self) {
-        self.last_send = Instant::now();
+        self.send_since_tick = true;
     }
 
     /// Await the next heartbeat tick and decide what to do. Cancel-safe.
@@ -78,13 +85,22 @@ impl Heartbeat {
         match &mut self.timer {
             Some(iv) => {
                 iv.tick().await;
+                // Fold the per-frame activity flags into the timestamps with a
+                // single clock read, then evaluate the timeouts against `now`.
+                let now = Instant::now();
+                if std::mem::take(&mut self.recv_since_tick) {
+                    self.last_recv = now;
+                }
+                if std::mem::take(&mut self.send_since_tick) {
+                    self.last_send = now;
+                }
                 if let Some(to) = self.recv_timeout {
-                    if self.last_recv.elapsed() >= to {
+                    if now.saturating_duration_since(self.last_recv) >= to {
                         return HeartbeatAction::PeerTimedOut;
                     }
                 }
                 if let Some(sa) = self.send_after {
-                    if self.last_send.elapsed() >= sa {
+                    if now.saturating_duration_since(self.last_send) >= sa {
                         return HeartbeatAction::SendEmpty;
                     }
                 }

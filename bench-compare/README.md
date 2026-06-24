@@ -47,22 +47,28 @@ BENCH_CLIENT=fe2o3                cargo run -p ramqp-bench-compare --release --b
 
 Env: `BENCH_CLIENT` (`ramqp`|`fe2o3`), `RAMQP_BATCH` (>1 = batched `accept_through`).
 
-## Results (ramqp 0.7.1 vs fe2o3-amqp 0.15.1, RabbitMQ 4.x, recv msg/s median)
+## Results (ramqp 0.7.2 vs fe2o3-amqp 0.15.1, RabbitMQ 4.x, recv msg/s median)
 
 | body | ramqp (per-msg) | fe2o3 (per-msg) | ramqp (batched) |
 |------|----------------:|----------------:|----------------:|
-| 64 B |         186,000 |         189,000 |     **229,000** |
-| 1 KB |         115,000 |         126,000 |     **157,000** |
-| 8 KB |          40,000 |          40,000 |      **52,000** |
+| 64 B |         188,000 |         177,000 |     **263,000** |
+| 1 KB |         120,000 |         119,000 |     **150,000** |
+| 8 KB |          42,000 |          42,000 |      **54,000** |
 
 **Takeaways:**
 
-- On the identical per-message path, ramqp is at **parity** with the mature
-  incumbent (within a few %).
+- On the identical per-message path, ramqp is at **parity or slightly ahead** of
+  the mature incumbent — helped by two 0.7.2 receive-path optimizations: removing
+  a per-frame `clock_gettime` from heartbeat bookkeeping, and a read-preferring
+  driver loop that coalesces per-message settlements into one write.
 - Using ramqp's **batched ranged settlement** (`accept_through`, which fe2o3's
-  public API lacks) makes it **~1.2–1.3x faster** across body sizes.
+  public API lacks) makes it **~1.3–1.4x faster** across body sizes.
 - Send throughput is a tie for both — it is bound by per-message broker
   settlement, not the client.
+- Profiling shows the remaining per-message cost is ~80% async-runtime overhead
+  (scheduler, cross-thread task wakeups, mpsc) rather than ramqp's own codec or
+  transport — further gains require structural changes (e.g. batched recv/send
+  APIs, fewer task hops), not micro-optimization.
 
 Numbers are from a single-node RabbitMQ on WSL2 and are sensitive to broker
 credit/prefetch dynamics; treat them as directional. Re-run on your own broker.
