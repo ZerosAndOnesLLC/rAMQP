@@ -152,6 +152,13 @@ fn decode_amqp_body(mut body: Bytes) -> Result<FrameBody, ConnectError> {
     Ok(FrameBody::Amqp(performative, payload))
 }
 
+/// Upper bound on the spare read capacity (re)established before each socket
+/// read, so reads pull a large chunk per syscall instead of triggering
+/// `BytesMut`'s small default growth as decoded frames are split off the front.
+const READ_CHUNK: usize = 64 * 1024;
+/// Lower bound on that spare capacity (also the floor for tiny `max-frame-size`).
+const MIN_READ_CHUNK: usize = 4096;
+
 /// A stream wrapper that reads/writes whole frames with buffered, batched IO.
 #[derive(Debug)]
 pub struct FramedTransport<S> {
@@ -204,6 +211,13 @@ impl<S: IoStream> FramedTransport<S> {
                 self.last_read_size = before - self.read_buf.len();
                 return Ok(frame);
             }
+            // Re-establish a worthwhile chunk of spare capacity before reading so
+            // the socket read pulls many bytes per syscall rather than repeatedly
+            // growing the buffer in small increments. `reserve` is a no-op when
+            // spare capacity already suffices, and reclaims space freed as decoded
+            // frames are split off and dropped.
+            self.read_buf
+                .reserve(self.max_frame_size.clamp(MIN_READ_CHUNK, READ_CHUNK));
             let n = self.stream.read_buf(&mut self.read_buf).await?;
             if n == 0 {
                 return Err(if self.read_buf.is_empty() {
