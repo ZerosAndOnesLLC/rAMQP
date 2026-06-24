@@ -338,6 +338,11 @@ impl<T: Decode> Decode for Option<T> {
 impl<K: Decode, V: Decode> Decode for OrderedMap<K, V> {
     fn decode(buf: &mut Bytes) -> Result<Self, DecodeError> {
         let (count, mut body) = read_map_header(buf)?;
+        if count % 2 != 0 {
+            return Err(DecodeError::InvalidValue(format!(
+                "map has an odd element count {count}"
+            )));
+        }
         let entries = (count / 2) as usize;
         // Clamp the capacity hint to the input so a hostile count cannot
         // pre-allocate unbounded memory (each entry needs ≥ 2 bytes).
