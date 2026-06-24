@@ -133,8 +133,9 @@ impl ConnectionBuilder {
         self
     }
 
-    /// **DANGER** — disable TLS certificate verification. Test-only; never use
-    /// against a production broker.
+    /// **DANGER** — disable TLS certificate verification. This also disables
+    /// hostname verification, leaving the connection open to man-in-the-middle.
+    /// Test-only; never use against a production broker.
     pub fn danger_accept_invalid_certs(mut self, accept: bool) -> Self {
         self.tls.danger_accept_invalid_certs = accept;
         self

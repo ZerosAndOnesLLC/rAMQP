@@ -5,6 +5,39 @@ All notable changes to ramqp will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-06-24
+
+### Security
+- **Bound array decoding against a malformed-frame DoS.** A `Value` array whose
+  elements share a zero-width constructor (e.g. `null`, `boolean-true`) consumed
+  no body bytes per element, so a few-byte frame could declare a count up to
+  `u32::MAX` and drive unbounded allocation / OOM in the connection driver. The
+  element count is now bounded by the available body (and a small ceiling for the
+  degenerate zero-width case).
+- Maps with an odd element count are now rejected instead of silently dropping a
+  dangling key.
+- Documented that `danger_accept_invalid_certs` also disables hostname
+  verification on both TLS backends.
+
+### Added
+- `Consumer::accept_through(&delivery)` — accept every delivery from the oldest
+  unsettled one through `delivery` in a single ranged `first..last` disposition,
+  for cheap batched acknowledgement.
+
+### Changed (performance — closes the issue #3 receive-throughput gap)
+- **Fire-and-forget settlement.** `accept`/`reject`/`release`/`modify`/`settle`
+  no longer await a per-message driver round-trip (the reply only ever confirmed
+  the frame was queued, never a broker ack), so a `recv → settle` loop pipelines
+  instead of stalling on an actor hop per message.
+- **Driver write-batching.** The connection driver drains queued commands and
+  writes them under a single flush, collapsing a burst of settlements/sends into
+  one socket write instead of one per command.
+- **Transport read buffer** reserves a read chunk before each socket read,
+  avoiding repeated small reallocations under sustained receive.
+- Delivery tag is moved into the transfer instead of cloned; links are indexed
+  by name for O(1) attach binding; compound/described array encoding reuses one
+  scratch buffer; send delivery-state is moved rather than cloned.
+
 ## [0.5.4] - 2026-06-03
 
 ### Changed

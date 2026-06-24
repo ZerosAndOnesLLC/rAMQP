@@ -5,7 +5,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::api::lifecycle::detach_on_drop;
 use crate::error::{ErrorKind, LinkError, RecvError, RemoteError};
-use crate::ids::{ChannelId, Handle};
+use crate::ids::{ChannelId, DeliveryId, Handle};
 use crate::link::Delivery;
 use crate::proto::{DriverCommand, LinkEvent};
 use crate::types::definitions::Error as AmqpError;
@@ -23,6 +23,9 @@ pub struct Consumer {
     /// Replenish once this many deliveries have been consumed since the last top-up.
     replenish_every: u32,
     consumed: u32,
+    /// Oldest delivery id received but not yet settled, used as the lower bound
+    /// of a ranged [`accept_through`](Consumer::accept_through).
+    pending_first: Option<DeliveryId>,
 }
 
 impl Consumer {
@@ -42,6 +45,7 @@ impl Consumer {
             credit_window,
             replenish_every: credit_window.saturating_sub(low_water).max(1),
             consumed: 0,
+            pending_first: None,
         }
     }
 
@@ -80,6 +84,9 @@ impl Consumer {
                     let delivery =
                         Delivery::new(d.delivery_id, d.delivery_tag, d.settled, d.message)
                             .with_state(d.state);
+                    if self.pending_first.is_none() {
+                        self.pending_first = Some(delivery.delivery_id);
+                    }
                     self.after_consume().await;
                     return Ok(delivery);
                 }
@@ -118,9 +125,43 @@ impl Consumer {
     }
 
     /// Accept a delivery (settles it).
+    ///
+    /// The disposition is *dispatched* to the connection driver, not confirmed
+    /// by the broker: for a settled disposition the receiver is locally
+    /// authoritative, so this returns as soon as the frame is queued (awaiting
+    /// only backpressure / connection liveness). This is what lets a
+    /// `recv → accept` loop pipeline. The same applies to
+    /// [`reject`](Self::reject), [`release`](Self::release),
+    /// [`modify`](Self::modify), and [`settle`](Self::settle). Under
+    /// `ReceiverSettleMode::Second` the final settle still completes when the
+    /// sender confirms (as before — the previous reply never waited for that
+    /// either).
     pub async fn accept(&self, delivery: &Delivery) -> Result<(), RecvError> {
         self.dispose(delivery, DeliveryState::Accepted(Accepted::default()))
             .await
+    }
+
+    /// Accept every delivery from the oldest not-yet-settled one *through*
+    /// `delivery`, in a single ranged disposition frame.
+    ///
+    /// This collapses N per-message dispositions into one `first..last` frame —
+    /// the cheapest way to acknowledge a batch, both in syscalls and in wire
+    /// bytes. Intended for in-order bulk acknowledgement: drive a `recv` loop
+    /// and call `accept_through` on the most recent delivery every so often (or
+    /// at the end of a batch). The receiver applies the outcome only to
+    /// deliveries still unsettled within the range, so a delivery already
+    /// settled individually is left untouched — but do not rely on interleaving
+    /// per-delivery [`reject`](Self::reject) inside a range you then
+    /// `accept_through`, as the broker's handling of a re-referenced settled id
+    /// is undefined.
+    pub async fn accept_through(&mut self, delivery: &Delivery) -> Result<(), RecvError> {
+        let first = self.pending_first.take().unwrap_or(delivery.delivery_id);
+        self.dispose_range(
+            first,
+            Some(delivery.delivery_id),
+            DeliveryState::Accepted(Accepted::default()),
+        )
+        .await
     }
 
     /// Reject a delivery with an optional error.
@@ -151,21 +192,37 @@ impl Consumer {
     }
 
     async fn dispose(&self, delivery: &Delivery, state: DeliveryState) -> Result<(), RecvError> {
-        let (tx, rx) = oneshot::channel();
+        self.dispose_range(delivery.delivery_id, None, state).await
+    }
+
+    /// Dispatch a (possibly ranged) settled disposition **without** awaiting a
+    /// driver round-trip.
+    ///
+    /// For a `settled` disposition the receiver is locally authoritative, so the
+    /// old per-message `oneshot` reply only confirmed that the frame had been
+    /// queued — never a broker acknowledgement. Dropping it lets the
+    /// `recv → settle` loop pipeline instead of stalling on an actor round-trip
+    /// per message (the dominant cost measured in issue #3). The command send is
+    /// still `await`ed, so backpressure and a closed connection are surfaced at
+    /// the call site; only the redundant post-send confirmation is gone.
+    async fn dispose_range(
+        &self,
+        first: DeliveryId,
+        last: Option<DeliveryId>,
+        state: DeliveryState,
+    ) -> Result<(), RecvError> {
         self.commands
             .send(DriverCommand::SendDisposition {
                 channel: self.channel,
                 handle: self.handle,
-                first: delivery.delivery_id,
-                last: None,
+                first,
+                last,
                 state,
                 settled: true,
-                reply: Some(tx),
+                reply: None,
             })
             .await
-            .map_err(|_| RecvError::msg(ErrorKind::NotConnected, "connection closed"))?;
-        rx.await
-            .map_err(|_| RecvError::msg(ErrorKind::Cancelled, "driver dropped"))?
+            .map_err(|_| RecvError::msg(ErrorKind::NotConnected, "connection closed"))
     }
 
     /// Grant additional link credit (manual credit mode).

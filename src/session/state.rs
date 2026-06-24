@@ -56,6 +56,10 @@ pub struct Session {
     handles: HandleAllocator,
     remote_handles: RemoteHandleMap,
     links: HashMap<u32, Link>,
+    /// Index of link name -> local handle, so a peer `attach` response binds in
+    /// O(1) instead of scanning every link. Kept in lockstep with `links` via
+    /// [`Session::forget_link`].
+    link_handles: HashMap<String, u32>,
     events: mpsc::UnboundedSender<SessionEvent>,
     pending_begin: Option<Reply<SessionOpened, SessionError>>,
     pending_end: Option<Reply<(), SessionError>>,
@@ -99,6 +103,7 @@ impl Session {
             handles: HandleAllocator::new(begin.handle_max),
             remote_handles: RemoteHandleMap::default(),
             links: HashMap::new(),
+            link_handles: HashMap::new(),
             events,
             pending_begin: Some(pending_begin),
             pending_end: None,
@@ -192,6 +197,7 @@ impl Session {
         };
         attach.handle = handle;
         let name = attach.name.clone();
+        self.link_handles.insert(name.clone(), handle);
         let link = match attach.role {
             Role::Sender => {
                 if attach.initial_delivery_count.is_none() {
@@ -227,14 +233,18 @@ impl Session {
         attach: Attach,
         transport: &mut FramedTransport<S>,
     ) {
-        let local = self.links.iter().find_map(|(h, l)| {
-            let name = match l {
-                Link::Sender(s) => &s.name,
-                Link::Receiver(r) => &r.name,
-            };
-            (name == &attach.name && l.remote_handle().is_none()).then_some(*h)
-        });
-        let Some(local) = local else { return };
+        let Some(&local) = self.link_handles.get(&attach.name) else {
+            return;
+        };
+        // Only bind a link still awaiting its peer attach (ignore a duplicate
+        // attach for an already-bound link).
+        if self
+            .links
+            .get(&local)
+            .is_none_or(|l| l.remote_handle().is_some())
+        {
+            return;
+        }
         self.remote_handles.bind(attach.handle, local);
 
         let windows = self.windows;
@@ -340,15 +350,19 @@ impl Session {
             let pending = sender.outbox.pop_front().expect("non-empty");
             let delivery_id = windows.next_outgoing_id;
             let tag = sender.next_delivery_tag();
+            // Clone the tag for the unsettled map only when the delivery is
+            // tracked; the pre-settled fast path moves the single allocation
+            // straight into the frame with no extra refcount traffic.
+            let tag_for_map = (!pending.settled).then(|| tag.clone());
             send_message_frames(
                 transport,
                 local_channel,
                 handle,
                 delivery_id,
-                &tag,
+                tag,
                 pending.settled,
                 pending.message_format,
-                pending.state.clone(),
+                pending.state,
                 &pending.body,
                 max_payload,
                 windows,
@@ -359,7 +373,11 @@ impl Session {
                     let _ = reply.send(Ok(DeliveryState::Accepted(Accepted::default())));
                 }
             } else {
-                sender.unsettled.insert(delivery_id, tag, None);
+                sender.unsettled.insert(
+                    delivery_id,
+                    tag_for_map.expect("unsettled delivery has a tag"),
+                    None,
+                );
                 self.metrics.on_inflight(1);
                 if let Some(reply) = pending.reply {
                     sender
@@ -497,6 +515,20 @@ impl Session {
         Ok(())
     }
 
+    /// Remove a link from the links table, its name index, and free its local
+    /// handle. Centralized so `link_handles` can never drift out of sync with
+    /// `links` across the (three) detach paths.
+    fn forget_link(&mut self, local: u32) {
+        if let Some(link) = self.links.remove(&local) {
+            let name = match &link {
+                Link::Sender(s) => &s.name,
+                Link::Receiver(r) => &r.name,
+            };
+            self.link_handles.remove(name);
+        }
+        self.handles.release(local);
+    }
+
     /// Detach a link with a peer-facing error and notify the user handle.
     fn detach_with_error<S: IoStream>(
         &mut self,
@@ -523,8 +555,7 @@ impl Session {
         if let Some(r) = remote {
             self.remote_handles.unbind(r);
         }
-        self.links.remove(&local);
-        self.handles.release(local);
+        self.forget_link(local);
     }
 
     /// Handle an inbound disposition (resolve our sends or update our receives).
@@ -746,8 +777,7 @@ impl Session {
             if let Some(r) = remote {
                 self.remote_handles.unbind(r);
             }
-            self.links.remove(&handle);
-            self.handles.release(handle);
+            self.forget_link(handle);
         }
         let _ = reply.send(Ok(()));
     }
@@ -778,8 +808,7 @@ impl Session {
             None,
         );
         self.remote_handles.unbind(detach.handle);
-        self.links.remove(&local);
-        self.handles.release(local);
+        self.forget_link(local);
     }
 
     /// Dispatch an inbound link performative.
@@ -835,7 +864,7 @@ fn send_message_frames<S: IoStream>(
     channel: u16,
     handle: u32,
     delivery_id: u32,
-    tag: &Bytes,
+    tag: Bytes,
     settled: bool,
     message_format: u32,
     state: Option<DeliveryState>,
@@ -847,7 +876,7 @@ fn send_message_frames<S: IoStream>(
         let first = Transfer {
             handle,
             delivery_id: Some(delivery_id),
-            delivery_tag: Some(tag.clone()),
+            delivery_tag: Some(tag),
             message_format: Some(message_format),
             settled: Some(settled),
             more: false,
@@ -859,6 +888,9 @@ fn send_message_frames<S: IoStream>(
         return;
     }
 
+    // Only the first transfer of a multi-frame delivery carries the tag; move
+    // the single allocation into it rather than cloning.
+    let mut tag = Some(tag);
     let mut offset = 0;
     let mut first_frame = true;
     while offset < body.len() {
@@ -871,7 +903,7 @@ fn send_message_frames<S: IoStream>(
             Transfer {
                 handle,
                 delivery_id: Some(delivery_id),
-                delivery_tag: Some(tag.clone()),
+                delivery_tag: tag.take(),
                 message_format: Some(message_format),
                 settled: Some(settled),
                 more: !is_last,

@@ -22,6 +22,11 @@ use crate::transport::frame::{Frame, FrameBody, FramedTransport};
 use crate::types::definitions::Error as AmqpError;
 use crate::types::performatives::{Begin, Close, End, Performative};
 
+/// Maximum number of already-queued commands the driver drains and writes
+/// before a single flush. Bounds per-wakeup work so the inbound-frame and
+/// heartbeat arms are not starved under a sustained command burst.
+const COMMAND_BATCH_MAX: usize = 256;
+
 /// Connection lifecycle state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConnState {
@@ -151,7 +156,25 @@ impl<S: IoStream> Driver<S> {
                 command = self.commands.recv() => {
                     match command {
                         Some(command) => {
-                            let done = self.handle_command(command).await?;
+                            let mut done = self.handle_command(command).await?;
+                            // Drain further already-queued commands and write
+                            // them under one flush: a burst (pipelined
+                            // settlements or sends) collapses N write+flush
+                            // syscalls into one. Bounded by COMMAND_BATCH_MAX so
+                            // reads and the heartbeat are not starved.
+                            let mut drained = 0;
+                            while !done && drained < COMMAND_BATCH_MAX {
+                                match self.commands.try_recv() {
+                                    Ok(next) => {
+                                        done = self.handle_command(next).await?;
+                                        drained += 1;
+                                    }
+                                    // Empty, or all handles dropped mid-batch:
+                                    // flush what we have; the next recv() handles
+                                    // the graceful-close (None) case.
+                                    Err(_) => break,
+                                }
+                            }
                             self.flush().await?;
                             if done {
                                 return Ok(());

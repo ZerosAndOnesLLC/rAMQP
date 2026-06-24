@@ -60,8 +60,11 @@ pub struct TlsConfig {
     /// Override the server name used for SNI and certificate verification
     /// (otherwise the URL host is used).
     pub server_name: Option<String>,
-    /// **DANGER** — accept any server certificate without verification. Intended
-    /// only for tests against self-signed brokers; never enable in production.
+    /// **DANGER** — accept any server certificate without verification. This
+    /// also disables hostname verification (both TLS backends: rustls skips the
+    /// server name, native-tls additionally sets `danger_accept_invalid_hostnames`),
+    /// so an enabled connection is fully open to man-in-the-middle. Intended only
+    /// for tests against self-signed brokers; never enable in production.
     pub danger_accept_invalid_certs: bool,
 }
 

@@ -193,6 +193,9 @@ pub async fn connect_native_tls(
         builder.identity(identity);
     }
     if cfg.danger_accept_invalid_certs {
+        // The single danger knob disables BOTH cert and hostname verification;
+        // accepting an invalid cert without also skipping the hostname check
+        // would be an inconsistent half-measure. Documented on the config field.
         builder.danger_accept_invalid_certs(true);
         builder.danger_accept_invalid_hostnames(true);
     }

@@ -236,16 +236,19 @@ fn encode_value_array(buf: &mut BytesMut, items: &[Value]) {
 }
 
 fn encode_compound_array(buf: &mut BytesMut, items: &[Value]) {
-    let mut first = BytesMut::new();
-    items[0].encode(&mut first);
-    let ctor = first[0];
+    // Reuse one scratch buffer across all elements (cleared between them) rather
+    // than allocating a fresh BytesMut per element; the leading constructor byte
+    // is shared by the array header, so only each element's body is copied in.
+    let mut scratch = BytesMut::new();
+    items[0].encode(&mut scratch);
+    let ctor = scratch[0];
     let (s, c, start) = open_compound(buf, codes::ARRAY32);
     buf.put_u8(ctor);
-    buf.put_slice(&first[1..]);
+    buf.put_slice(&scratch[1..]);
     for it in &items[1..] {
-        let mut e = BytesMut::new();
-        it.encode(&mut e);
-        buf.put_slice(&e[1..]);
+        scratch.clear();
+        it.encode(&mut scratch);
+        buf.put_slice(&scratch[1..]);
     }
     close_compound(buf, s, c, start, items.len() as u32);
 }
@@ -264,11 +267,12 @@ fn encode_described_array(buf: &mut BytesMut, items: &[Value]) {
     buf.put_slice(&dbuf);
     buf.put_u8(vctor);
     buf.put_slice(&vbuf[1..]);
+    // Reuse `vbuf` for the remaining element values instead of reallocating.
     for it in &items[1..] {
         if let Value::Described(_, v) = it {
-            let mut vb = BytesMut::new();
-            v.encode(&mut vb);
-            buf.put_slice(&vb[1..]);
+            vbuf.clear();
+            v.encode(&mut vbuf);
+            buf.put_slice(&vbuf[1..]);
         }
     }
     close_compound(buf, s, c, start, items.len() as u32);
@@ -285,6 +289,15 @@ fn encode_described_array(buf: &mut BytesMut, items: &[Value]) {
 /// stack (each level costs a few stack frames) while sitting far above any
 /// nesting a real application or broker produces.
 const MAX_DEPTH: u32 = 64;
+
+/// Backstop on the element count of an `array` whose elements are *zero-width*
+/// (NULL, BOOL_TRUE/FALSE, UINT_0, ULONG_0, LIST_0). Such elements consume no
+/// body bytes, so their count cannot be bounded by the remaining input the way
+/// every other element type is. The array is necessarily degenerate — every
+/// element is identical and carries no data — so a small ceiling is always
+/// sufficient for legitimate data while preventing a few-byte frame from driving
+/// up to `u32::MAX` allocations.
+const MAX_ZERO_WIDTH_ARRAY: usize = 1024;
 
 impl Decode for Value {
     fn decode(buf: &mut Bytes) -> Result<Self, DecodeError> {
@@ -448,6 +461,11 @@ fn decode_map(
     count: u32,
     depth: u32,
 ) -> Result<OrderedMap<Value, Value>, DecodeError> {
+    if count % 2 != 0 {
+        return Err(DecodeError::InvalidValue(format!(
+            "map has an odd element count {count}"
+        )));
+    }
     let entries = (count / 2) as usize;
     let mut map = OrderedMap::with_capacity(entries.min(buf.len()));
     for _ in 0..entries {
@@ -467,6 +485,7 @@ fn decode_array(buf: &mut Bytes, count: u32, depth: u32) -> Result<Vec<Value>, D
         // cloned into every element but the last, which takes it by move.
         let descriptor = decode_value(buf, depth)?;
         let elem_ctor = read_u8(buf)?;
+        check_array_count(count, elem_ctor, buf.len())?;
         let mut out = Vec::with_capacity(cap_hint(count, buf.len()));
         let mut descriptor = Some(descriptor);
         for i in 0..count {
@@ -482,12 +501,40 @@ fn decode_array(buf: &mut Bytes, count: u32, depth: u32) -> Result<Vec<Value>, D
         }
         Ok(out)
     } else {
+        check_array_count(count, ctor, buf.len())?;
         let mut out = Vec::with_capacity(cap_hint(count, buf.len()));
         for _ in 0..count {
             out.push(decode_value_body(buf, ctor, depth)?);
         }
         Ok(out)
     }
+}
+
+/// Reject a hostile array `count` before it can drive unbounded allocation.
+///
+/// Array elements share a single constructor with no per-element framing. For a
+/// zero-width element type each element consumes no body bytes, so `count` is
+/// otherwise unbounded by the input (the OOM vector); for every other element
+/// type each element consumes ≥ 1 byte, so a legitimate `count` cannot exceed
+/// the remaining body. See [`MAX_ZERO_WIDTH_ARRAY`].
+fn check_array_count(count: u32, elem_ctor: u8, remaining: usize) -> Result<(), DecodeError> {
+    use codes::*;
+    let zero_width = matches!(
+        elem_ctor,
+        NULL | BOOL_TRUE | BOOL_FALSE | UINT_0 | ULONG_0 | LIST_0
+    );
+    let limit = if zero_width {
+        MAX_ZERO_WIDTH_ARRAY
+    } else {
+        remaining
+    };
+    if count as usize > limit {
+        return Err(DecodeError::InvalidValue(format!(
+            "array element count {count} exceeds limit {limit} \
+             (element constructor {elem_ctor:#04x}, {remaining} body bytes)"
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -660,6 +707,50 @@ mod tests {
         assert!(
             matches!(r, Err(DecodeError::NestingTooDeep { .. })),
             "expected NestingTooDeep, got {r:?}"
+        );
+    }
+
+    #[test]
+    fn hostile_zero_width_array_count_is_rejected_not_ooming() {
+        // ARRAY32 with count = u32::MAX and a zero-width element constructor
+        // (NULL). The body is a handful of bytes, but without the count bound
+        // each of ~4.3 billion elements would push a `Value` and OOM the
+        // decoder. We must reject it cleanly instead.
+        let mut bytes = vec![codes::ARRAY32];
+        let size = 4u32 + 1; // 4-byte count + 1-byte element constructor
+        bytes.extend_from_slice(&size.to_be_bytes());
+        bytes.extend_from_slice(&u32::MAX.to_be_bytes()); // count
+        bytes.push(codes::NULL); // zero-width element constructor
+        let r: Result<Value, _> = from_slice(&bytes);
+        assert!(
+            matches!(r, Err(DecodeError::InvalidValue(_))),
+            "expected InvalidValue for hostile array count, got {r:?}"
+        );
+    }
+
+    #[test]
+    fn small_zero_width_array_still_decodes() {
+        // A legitimate (degenerate) array of three nulls must still decode.
+        let v = Value::Array(vec![Value::Null, Value::Null, Value::Null]);
+        round_trip(v);
+    }
+
+    #[test]
+    fn map_with_odd_element_count_is_rejected() {
+        // MAP32 declaring an odd element count (3) is malformed — a map is
+        // key/value pairs. Reject rather than silently dropping the dangling key.
+        let mut body = Vec::new();
+        body.extend_from_slice(&3u32.to_be_bytes()); // count = 3 (odd)
+        body.push(codes::NULL);
+        body.push(codes::NULL);
+        body.push(codes::NULL);
+        let mut bytes = vec![codes::MAP32];
+        bytes.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(&body);
+        let r: Result<Value, _> = from_slice(&bytes);
+        assert!(
+            matches!(r, Err(DecodeError::InvalidValue(_))),
+            "expected InvalidValue for odd map count, got {r:?}"
         );
     }
 
