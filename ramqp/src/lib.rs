@@ -32,11 +32,11 @@ pub use ramqp_core::types;
 pub use ramqp_core::amqp_composite;
 
 // ---- Contracts (re-exported from ramqp-core where role-neutral) ----
+pub use ramqp_core::config;
+pub use ramqp_core::error;
 pub use ramqp_core::ids;
 pub use ramqp_core::observe;
 
-pub mod config;
-pub mod error;
 pub mod proto;
 
 // ---- Runtime (Phases 1–6) ----

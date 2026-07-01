@@ -127,10 +127,10 @@ pub struct LinkConfig {
     pub receiver_settle_mode: ReceiverSettleMode,
     /// Maximum message size we accept on the link (`None` = unlimited).
     pub max_message_size: Option<u64>,
-    /// Maximum number of unwritten fire-and-forget
-    /// ([`send_settled`](crate::Producer::send_settled)) messages buffered while
-    /// awaiting broker credit, before the call back-pressures. `0` disables the
-    /// bound (unbounded buffering — the pre-0.3 behavior).
+    /// Maximum number of unwritten fire-and-forget (`Producer::send_settled`)
+    /// messages buffered while awaiting broker credit, before the call
+    /// back-pressures. `0` disables the bound (unbounded buffering — the
+    /// pre-0.3 behavior).
     pub max_outbox: usize,
 }
 

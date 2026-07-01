@@ -94,12 +94,16 @@ impl Session {
             max_message_size: self.config.link.max_message_size,
             ..Default::default()
         };
-        let (window, low_water) = match credit_mode {
-            CreditMode::Auto {
-                initial,
-                refill_threshold,
-            } => (initial, refill_threshold),
-            CreditMode::Manual => (0, 0),
+        // Any non-Auto mode (Manual today; future variants) starts with no
+        // automatic credit window.
+        let (window, low_water) = if let CreditMode::Auto {
+            initial,
+            refill_threshold,
+        } = credit_mode
+        {
+            (initial, refill_threshold)
+        } else {
+            (0, 0)
         };
         // The delivery channel must hold the full credit window so the driver
         // never blocks handing off a delivery (no connection-wide head-of-line

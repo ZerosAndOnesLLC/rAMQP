@@ -79,9 +79,12 @@ impl ReceiverLink {
 
     /// The configured initial auto-credit, if any.
     pub fn initial_credit(&self) -> u32 {
-        match self.credit.mode() {
-            CreditMode::Auto { initial, .. } => initial,
-            CreditMode::Manual => 0,
+        // Any non-Auto mode (Manual today; future variants) grants no initial
+        // credit automatically.
+        if let CreditMode::Auto { initial, .. } = self.credit.mode() {
+            initial
+        } else {
+            0
         }
     }
 }

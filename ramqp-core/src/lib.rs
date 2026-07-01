@@ -20,5 +20,7 @@ pub mod codec;
 pub mod types;
 
 // ---- Contracts ----
+pub mod config;
+pub mod error;
 pub mod ids;
 pub mod observe;
