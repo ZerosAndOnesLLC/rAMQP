@@ -1,128 +1,19 @@
-[package]
-name = "ramqp"
-version = "0.7.2"
-edition = "2024"
-rust-version = "1.85"
-description = "Async AMQP 1.0 client for Rust on tokio — connects to RabbitMQ 4.x, ActiveMQ Artemis, and other AMQP 1.0 brokers."
-license = "MIT"
-repository = "https://github.com/ZerosAndOnesLLC/rAMQP"
-keywords = ["amqp", "amqp1", "messaging", "tokio", "async"]
-categories = ["network-programming", "asynchronous"]
-# Keep the comparison-benchmark crate (and its fe2o3-amqp dep) out of the
-# published `ramqp` tarball; it remains a workspace member for local dev.
-exclude = ["/bench-compare"]
-
-# Document every feature-gated API (TLS / WebSocket / SCRAM / transactions) on docs.rs.
-[package.metadata.docs.rs]
-all-features = true
-
-# Root package + the comparison-benchmark member. Default commands
-# (`cargo build`, `cargo test`) stay scoped to the root `ramqp` package — so CI
-# and the published crate never pull in fe2o3-amqp; build the bench explicitly
-# with `-p ramqp-bench-compare`.
+# Virtual workspace root for the rAMQP project.
+#
+# Members:
+#   ramqp         — the published AMQP 1.0 CLIENT (crate name unchanged)
+#   ramqp-core    — role-agnostic engine shared by client and broker (Phase 1 fills it)
+#   ramqp-broker  — the performance-first, HA AMQP 1.0 BROKER (Phase 3+ fills it)
+#   bench-compare — dev-only comparison harness vs fe2o3-amqp
+#
+# `default-members` excludes bench-compare so `cargo build`/`cargo test`/`cargo check`
+# at the root never pull in its `fe2o3-amqp` dependency; build it explicitly with
+# `-p ramqp-bench-compare`.
 [workspace]
-members = ["bench-compare"]
+resolver = "2"
+members = ["ramqp", "ramqp-core", "ramqp-broker", "bench-compare"]
+default-members = ["ramqp", "ramqp-core", "ramqp-broker"]
 
-[lib]
-name = "ramqp"
-path = "src/lib.rs"
-
-[dependencies]
-bytes = "1"
-thiserror = "2"
-ordered-float = "5"
-uuid = { version = "1", features = ["v4"] }
-tokio = { version = "1", features = ["sync", "io-util", "net", "rt", "macros", "time"] }
-futures-core = "0.3"
-futures-util = "0.3"
-pin-project-lite = "0.2"
-slab = "0.4"
-url = "2"
-tracing = "0.1"
-
-[features]
-default = []
-# TLS backends
-rustls = ["dep:tokio-rustls", "dep:rustls", "dep:webpki-roots", "dep:rustls-pemfile"]
-native-tls = ["dep:tokio-native-tls", "dep:native-tls"]
-# WebSocket transport
-ws = ["dep:tokio-tungstenite", "dep:http"]
-# SASL SCRAM mechanisms
-scram = ["dep:hmac", "dep:sha1", "dep:sha2", "dep:pbkdf2", "dep:base64", "dep:stringprep"]
-# Transaction coordinator (clean-room, spec part 4)
-transaction = []
-
-[dependencies.tokio-rustls]
-version = "0.26"
-optional = true
-default-features = false
-features = ["ring", "tls12"]
-
-[dependencies.rustls]
-version = "0.23"
-optional = true
-default-features = false
-features = ["ring", "std", "tls12"]
-
-[dependencies.webpki-roots]
-version = "1"
-optional = true
-
-[dependencies.rustls-pemfile]
-version = "2"
-optional = true
-
-[dependencies.tokio-native-tls]
-version = "0.3"
-optional = true
-
-[dependencies.native-tls]
-version = "0.2"
-optional = true
-
-[dependencies.tokio-tungstenite]
-version = "0.29"
-optional = true
-
-[dependencies.http]
-version = "1"
-optional = true
-
-[dependencies.hmac]
-version = "0.13"
-optional = true
-
-[dependencies.sha1]
-version = "0.11"
-optional = true
-
-[dependencies.sha2]
-version = "0.11"
-optional = true
-
-[dependencies.pbkdf2]
-version = "0.13"
-optional = true
-default-features = false
-features = ["hmac"]
-
-[dependencies.base64]
-version = "0.22"
-optional = true
-
-[dependencies.stringprep]
-version = "0.1"
-optional = true
-
-[dev-dependencies]
-tokio = { version = "1", features = ["full", "test-util"] }
-criterion = "0.8"
-# Server side of the WebSocket bridge used by the live `ws` interop test.
-tokio-tungstenite = "0.29"
-
-[[bench]]
-name = "codec"
-harness = false
-
+# Profiles are workspace-global and must live in the root manifest (not in members).
 [profile.bench]
 debug = true

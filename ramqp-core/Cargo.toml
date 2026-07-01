@@ -1,0 +1,12 @@
+[package]
+name = "ramqp-core"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Role-agnostic AMQP 1.0 engine (codec, framing, session/link state machines) shared by the ramqp client and ramqp-broker."
+license = "MIT"
+repository = "https://github.com/ZerosAndOnesLLC/rAMQP"
+keywords = ["amqp", "amqp1", "messaging", "codec", "async"]
+categories = ["network-programming", "asynchronous"]
+
+[dependencies]

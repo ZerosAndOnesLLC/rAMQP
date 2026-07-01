@@ -12,7 +12,7 @@ publish = false
 description = "Comparison benchmark harness: ramqp vs fe2o3-amqp against a live AMQP 1.0 broker."
 
 [dependencies]
-ramqp = { path = ".." }
+ramqp = { path = "../ramqp" }
 fe2o3-amqp = "0.15"
 tokio = { version = "1", features = ["full"] }
 
