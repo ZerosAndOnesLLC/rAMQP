@@ -36,8 +36,7 @@ pub use ramqp_core::config;
 pub use ramqp_core::error;
 pub use ramqp_core::ids;
 pub use ramqp_core::observe;
-
-pub mod proto;
+pub use ramqp_core::proto;
 
 // ---- Runtime (Phases 1–6) ----
 pub mod api;
