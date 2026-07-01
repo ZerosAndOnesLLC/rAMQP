@@ -26,5 +26,7 @@ pub mod ids;
 pub mod observe;
 
 // ---- Role-neutral runtime layers ----
+pub mod link;
 pub mod proto;
+pub mod session;
 pub mod transport;

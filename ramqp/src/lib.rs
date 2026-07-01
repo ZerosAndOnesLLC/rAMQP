@@ -39,12 +39,13 @@ pub use ramqp_core::observe;
 pub use ramqp_core::proto;
 
 // ---- Runtime (Phases 1–6) ----
+pub use ramqp_core::link;
+pub use ramqp_core::session;
+
 pub mod api;
 pub mod connection;
-pub mod link;
 pub mod resilience;
 pub mod sasl;
-pub mod session;
 pub mod transport;
 
 // ---- Transactions (clean-room, feature-gated) ----
