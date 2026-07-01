@@ -14,4 +14,5 @@ bytes = "1"
 thiserror = "2"
 ordered-float = "5"
 uuid = { version = "1", features = ["v4"] }
-tokio = { version = "1", features = ["sync"] }
+tokio = { version = "1", features = ["sync", "io-util"] }
+url = "2"
