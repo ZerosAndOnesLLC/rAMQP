@@ -23,15 +23,20 @@
 #![warn(missing_docs)]
 #![warn(missing_debug_implementations)]
 
-// ---- Clean-room encoding & type layer (Phase E) ----
-pub mod codec;
-pub mod types;
+// ---- Clean-room encoding & type layer (re-exported from ramqp-core) ----
+pub use ramqp_core::codec;
+pub use ramqp_core::types;
+// The composite-type codegen macro `amqp_composite!` is `#[macro_export]`ed
+// from `ramqp-core`; re-export it so existing `crate::amqp_composite` /
+// `ramqp::amqp_composite` paths keep resolving.
+pub use ramqp_core::amqp_composite;
 
-// ---- Contracts (Phase 0) ----
+// ---- Contracts (re-exported from ramqp-core where role-neutral) ----
+pub use ramqp_core::ids;
+pub use ramqp_core::observe;
+
 pub mod config;
 pub mod error;
-pub mod ids;
-pub mod observe;
 pub mod proto;
 
 // ---- Runtime (Phases 1–6) ----
