@@ -29,5 +29,10 @@ pub mod observe;
 pub mod connection;
 pub mod link;
 pub mod proto;
+pub mod sasl;
 pub mod session;
 pub mod transport;
+
+// ---- Transactions (clean-room wire types, feature-gated) ----
+#[cfg(feature = "transaction")]
+pub mod txn;

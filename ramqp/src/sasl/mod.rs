@@ -1,6 +1,10 @@
 //! SASL authentication (WP-1.4): the client-side negotiation state machine and
 //! the ANONYMOUS / PLAIN / EXTERNAL mechanisms, plus SCRAM-SHA-1/256/512 behind
 //! the `scram` feature.
+//!
+//! The SCRAM hash/HMAC/PBKDF2 math lives in `ramqp_core::sasl::scram`; this
+//! module keeps the client state machine ([`SaslProfile`], the RFC 5802 client
+//! flow) on top of it.
 
 use bytes::Bytes;
 
@@ -251,90 +255,19 @@ pub async fn negotiate<S: IoStream>(
 }
 
 // ---------------------------------------------------------------------------
-// SCRAM (RFC 5802), feature-gated.
+// SCRAM (RFC 5802) client state machine, feature-gated. The hash math lives in
+// ramqp_core::sasl::scram.
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "scram")]
-pub use scram::ScramMechanism;
+pub use ramqp_core::sasl::scram::ScramMechanism;
 
 #[cfg(feature = "scram")]
 mod scram {
     use super::*;
     use base64::Engine;
-    use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
-    use hmac::{Hmac, KeyInit, Mac};
-    use sha1::Sha1;
-    use sha2::{Digest, Sha256, Sha512};
-
-    /// Which SCRAM hash function to use.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum ScramMechanism {
-        /// SCRAM-SHA-1.
-        Sha1,
-        /// SCRAM-SHA-256.
-        Sha256,
-        /// SCRAM-SHA-512.
-        Sha512,
-    }
-
-    impl ScramMechanism {
-        /// The wire mechanism name.
-        pub fn name(self) -> &'static str {
-            match self {
-                ScramMechanism::Sha1 => "SCRAM-SHA-1",
-                ScramMechanism::Sha256 => "SCRAM-SHA-256",
-                ScramMechanism::Sha512 => "SCRAM-SHA-512",
-            }
-        }
-
-        fn h(self, data: &[u8]) -> Vec<u8> {
-            match self {
-                ScramMechanism::Sha1 => Sha1::digest(data).to_vec(),
-                ScramMechanism::Sha256 => Sha256::digest(data).to_vec(),
-                ScramMechanism::Sha512 => Sha512::digest(data).to_vec(),
-            }
-        }
-
-        fn hmac(self, key: &[u8], msg: &[u8]) -> Vec<u8> {
-            match self {
-                ScramMechanism::Sha1 => {
-                    let mut mac = Hmac::<Sha1>::new_from_slice(key).expect("hmac key");
-                    mac.update(msg);
-                    mac.finalize().into_bytes().to_vec()
-                }
-                ScramMechanism::Sha256 => {
-                    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("hmac key");
-                    mac.update(msg);
-                    mac.finalize().into_bytes().to_vec()
-                }
-                ScramMechanism::Sha512 => {
-                    let mut mac = Hmac::<Sha512>::new_from_slice(key).expect("hmac key");
-                    mac.update(msg);
-                    mac.finalize().into_bytes().to_vec()
-                }
-            }
-        }
-
-        fn pbkdf2(self, password: &[u8], salt: &[u8], iterations: u32) -> Vec<u8> {
-            match self {
-                ScramMechanism::Sha1 => {
-                    let mut out = vec![0u8; 20];
-                    pbkdf2::pbkdf2_hmac::<Sha1>(password, salt, iterations, &mut out);
-                    out
-                }
-                ScramMechanism::Sha256 => {
-                    let mut out = vec![0u8; 32];
-                    pbkdf2::pbkdf2_hmac::<Sha256>(password, salt, iterations, &mut out);
-                    out
-                }
-                ScramMechanism::Sha512 => {
-                    let mut out = vec![0u8; 64];
-                    pbkdf2::pbkdf2_hmac::<Sha512>(password, salt, iterations, &mut out);
-                    out
-                }
-            }
-        }
-    }
+    use base64::engine::general_purpose::STANDARD;
+    use ramqp_core::sasl::scram::{ct_eq, escape_username, gen_nonce, saslprep};
 
     /// The RFC 5802 client state machine.
     pub(super) struct ScramClient {
@@ -346,30 +279,12 @@ mod scram {
         server_signature: Option<Vec<u8>>,
     }
 
-    fn gen_nonce() -> String {
-        let a = uuid::Uuid::new_v4();
-        let b = uuid::Uuid::new_v4();
-        let mut bytes = Vec::with_capacity(32);
-        bytes.extend_from_slice(a.as_bytes());
-        bytes.extend_from_slice(b.as_bytes());
-        STANDARD_NO_PAD.encode(bytes)
-    }
-
-    /// Apply the SASLprep stringprep profile (RFC 4013) to a username/password.
-    /// RFC 5802 mandates that a SASLprep failure abort authentication rather than
-    /// silently using the unprepared input, so this propagates the error.
-    fn saslprep(s: &str) -> Result<String, ConnectError> {
-        stringprep::saslprep(s)
-            .map(|c| c.into_owned())
-            .map_err(|_| {
-                sasl_err(
-                    "username or password contains characters prohibited by SASLprep (RFC 4013)",
-                )
-            })
-    }
-
-    fn escape_username(s: &str) -> String {
-        s.replace('=', "=3D").replace(',', "=2C")
+    /// Apply SASLprep, mapping prohibited input to a fatal SASL error (RFC 5802
+    /// mandates aborting rather than silently using the unprepared string).
+    fn prep(s: &str) -> Result<String, ConnectError> {
+        saslprep(s).ok_or_else(|| {
+            sasl_err("username or password contains characters prohibited by SASLprep (RFC 4013)")
+        })
     }
 
     impl ScramClient {
@@ -389,8 +304,8 @@ mod scram {
         ) -> Result<Self, ConnectError> {
             Ok(ScramClient {
                 mechanism,
-                username: saslprep(username)?,
-                password: saslprep(password)?,
+                username: prep(username)?,
+                password: prep(password)?,
                 client_nonce,
                 client_first_bare: String::new(),
                 server_signature: None,
@@ -482,19 +397,6 @@ mod scram {
                 None => Err(sasl_err("scram server-final received before server-first")),
             }
         }
-    }
-
-    /// Constant-time byte-slice equality (avoids leaking the server signature
-    /// via comparison timing).
-    fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-        if a.len() != b.len() {
-            return false;
-        }
-        let mut diff = 0u8;
-        for (x, y) in a.iter().zip(b.iter()) {
-            diff |= x ^ y;
-        }
-        diff == 0
     }
 
     fn sasl_err(msg: &str) -> ConnectError {

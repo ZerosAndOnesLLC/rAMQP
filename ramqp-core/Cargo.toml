@@ -9,6 +9,10 @@ repository = "https://github.com/ZerosAndOnesLLC/rAMQP"
 keywords = ["amqp", "amqp1", "messaging", "codec", "async"]
 categories = ["network-programming", "asynchronous"]
 
+# Document every feature-gated API (SCRAM / transactions) on docs.rs.
+[package.metadata.docs.rs]
+all-features = true
+
 [dependencies]
 bytes = "1"
 thiserror = "2"
@@ -16,3 +20,37 @@ ordered-float = "5"
 uuid = { version = "1", features = ["v4"] }
 tokio = { version = "1", features = ["sync", "io-util"] }
 url = "2"
+
+[features]
+default = []
+# SASL SCRAM primitives (hash math + string preparation), shared by the
+# client's ScramClient and the broker's ScramServer.
+scram = ["dep:hmac", "dep:sha1", "dep:sha2", "dep:pbkdf2", "dep:base64", "dep:stringprep"]
+# Transaction wire types (clean-room, spec part 4).
+transaction = []
+
+[dependencies.hmac]
+version = "0.13"
+optional = true
+
+[dependencies.sha1]
+version = "0.11"
+optional = true
+
+[dependencies.sha2]
+version = "0.11"
+optional = true
+
+[dependencies.pbkdf2]
+version = "0.13"
+optional = true
+default-features = false
+features = ["hmac"]
+
+[dependencies.base64]
+version = "0.22"
+optional = true
+
+[dependencies.stringprep]
+version = "0.1"
+optional = true

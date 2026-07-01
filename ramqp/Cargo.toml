@@ -38,10 +38,10 @@ rustls = ["dep:tokio-rustls", "dep:rustls", "dep:webpki-roots", "dep:rustls-pemf
 native-tls = ["dep:tokio-native-tls", "dep:native-tls"]
 # WebSocket transport
 ws = ["dep:tokio-tungstenite", "dep:http"]
-# SASL SCRAM mechanisms
-scram = ["dep:hmac", "dep:sha1", "dep:sha2", "dep:pbkdf2", "dep:base64", "dep:stringprep"]
-# Transaction coordinator (clean-room, spec part 4)
-transaction = []
+# SASL SCRAM mechanisms (math lives in ramqp-core; base64 used by the client flow)
+scram = ["ramqp-core/scram", "dep:base64"]
+# Transaction controller (wire types live in ramqp-core)
+transaction = ["ramqp-core/transaction"]
 
 [dependencies.tokio-rustls]
 version = "0.26"
@@ -79,30 +79,8 @@ optional = true
 version = "1"
 optional = true
 
-[dependencies.hmac]
-version = "0.13"
-optional = true
-
-[dependencies.sha1]
-version = "0.11"
-optional = true
-
-[dependencies.sha2]
-version = "0.11"
-optional = true
-
-[dependencies.pbkdf2]
-version = "0.13"
-optional = true
-default-features = false
-features = ["hmac"]
-
 [dependencies.base64]
 version = "0.22"
-optional = true
-
-[dependencies.stringprep]
-version = "0.1"
 optional = true
 
 [dev-dependencies]
