@@ -481,6 +481,103 @@ mod tests {
         server_task.await.unwrap();
     }
 
+    /// Drive a SCRAM-SHA-256 server over `st` using ramqp-core's ScramServer,
+    /// authenticating against a verifier derived from `password`.
+    #[cfg(feature = "scram")]
+    async fn drive_scram_server<S: IoStream>(st: &mut FramedTransport<S>, password: &str) {
+        use ramqp_core::sasl::server::{ScramServer, ScramVerifier};
+        use ramqp_core::types::sasl::{SaslChallenge, SaslMechanisms, SaslOutcome};
+
+        st.send_sasl(&SaslFrame::Mechanisms(SaslMechanisms {
+            sasl_server_mechanisms: vec![Symbol::new("SCRAM-SHA-256")],
+        }))
+        .await
+        .unwrap();
+
+        let init = match st.read_frame().await.unwrap().body {
+            FrameBody::Sasl(SaslFrame::Init(i)) => i,
+            other => panic!("expected init, got {other:?}"),
+        };
+        let mut server = ScramServer::new(ScramMechanism::Sha256);
+        let _user = server
+            .on_client_first(init.initial_response.as_deref().unwrap())
+            .unwrap();
+        let verifier =
+            ScramVerifier::derive(ScramMechanism::Sha256, password, b"pepper-salt", 4096).unwrap();
+        let challenge = server.server_first(verifier);
+        st.send_sasl(&SaslFrame::Challenge(SaslChallenge { challenge }))
+            .await
+            .unwrap();
+
+        let response = match st.read_frame().await.unwrap().body {
+            FrameBody::Sasl(SaslFrame::Response(r)) => r,
+            other => panic!("expected response, got {other:?}"),
+        };
+        match server.on_client_final(&response.response) {
+            Ok(server_final) => {
+                st.send_sasl(&SaslFrame::Outcome(SaslOutcome {
+                    code: SaslCode::Ok,
+                    additional_data: Some(server_final),
+                }))
+                .await
+                .unwrap();
+            }
+            Err(_) => {
+                st.send_sasl(&SaslFrame::Outcome(SaslOutcome {
+                    code: SaslCode::Auth,
+                    additional_data: None,
+                }))
+                .await
+                .unwrap();
+            }
+        }
+    }
+
+    /// The client's ScramClient and core's ScramServer interlock end-to-end
+    /// over the real negotiate() flow, including mutual authentication (the
+    /// client verifies the server-final signature).
+    #[cfg(feature = "scram")]
+    #[tokio::test]
+    async fn scram_client_and_core_server_interlock() {
+        let (client, server) = tokio::io::duplex(4096);
+        let mut ct = FramedTransport::new(client, 1 << 16);
+        let mut st = FramedTransport::new(server, 1 << 16);
+
+        let server_task = tokio::spawn(async move {
+            drive_scram_server(&mut st, "pencil").await;
+        });
+        let profile = SaslProfile::Scram {
+            mechanism: ScramMechanism::Sha256,
+            username: "user".into(),
+            password: "pencil".into(),
+        };
+        negotiate(&mut ct, &profile, None).await.unwrap();
+        server_task.await.unwrap();
+    }
+
+    /// A wrong password is rejected by the server's proof verification and
+    /// surfaces to the client as a SASL auth failure.
+    #[cfg(feature = "scram")]
+    #[tokio::test]
+    async fn scram_wrong_password_rejected_by_core_server() {
+        let (client, server) = tokio::io::duplex(4096);
+        let mut ct = FramedTransport::new(client, 1 << 16);
+        let mut st = FramedTransport::new(server, 1 << 16);
+
+        let server_task = tokio::spawn(async move {
+            // Server-side verifier is for a different password.
+            drive_scram_server(&mut st, "correct-horse").await;
+        });
+        let profile = SaslProfile::Scram {
+            mechanism: ScramMechanism::Sha256,
+            username: "user".into(),
+            password: "battery-staple".into(),
+        };
+        let err = negotiate(&mut ct, &profile, None).await.unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::Sasl);
+        server_task.await.unwrap();
+    }
+
     #[tokio::test]
     async fn rejects_unoffered_mechanism() {
         let (client, server) = tokio::io::duplex(4096);

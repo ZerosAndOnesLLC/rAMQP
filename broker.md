@@ -451,11 +451,11 @@ link/session → negotiate/mux/heartbeat → txn/sasl splits.
 - [x] `tests/public_api.rs` locks the full pre-0.8 re-export surface (compile-time, both feature sets).
 - [x] **Gate:** full suite green (default + --all-features), clippy/fmt/docs clean, benches compile; client **0.8.0**, `ramqp-core` **0.1.0**. READMEs + CHANGELOG updated.
 
-### Phase 2 — Server-side primitives in core (additive)
-- [ ] `Session::accept_peer_begin` (peer begin with no remote-channel).
-- [ ] `Session::accept_peer_attach` (mirror link endpoint + responding attach + initial credit for broker-sender).
-- [ ] Server header-sequence helper; server SASL scaffolding hooks + `ScramServer` (credential store deferred to Phase 9).
-- [ ] Unit tests for the new paths. Client unaffected. Commit, bump core (0.2.0).
+### Phase 2 — Server-side primitives in core (additive) ✅
+- [x] `Session::accept_peer_begin` (maps immediately from a peer begin; returns our responding begin; handle allocation bounded by min of both handle-max values) + `Session::knows_link` for driver routing.
+- [x] `Session::accept_peer_attach` (mirror endpoint, responding attach echoing caller-resolved source/target, initial-delivery-count adoption/declaration per spec §2.6.7, optional initial credit flow; duplicate→ProtocolViolation, exhaustion→Capacity) + `SenderLink::accepted`/`ReceiverLink::accepted`.
+- [x] `header::accept` (read-first, echo-or-counteroffer per §2.2); `sasl::server` with `parse_plain_response` + `ScramServer`/`ScramVerifier` (RFC 5802 server side, verifier-based storage — no plaintext; channel-binding demands rejected; credential store itself deferred to Phase 9).
+- [x] Tests: 5 server-session, 2 header-accept pairing, 7 SASL-server (incl. the RFC 5802 server vector), and 2 client⇄core SCRAM interlock tests over the real `negotiate()` (mutual auth + wrong-password rejection). Client untouched. Core → **0.2.0**.
 
 ### Phase 3 — Broker skeleton (`ramqp-broker`)
 - [ ] Acceptor + server `Transport` (plain first), per-connection task. **Shard-partition the queue/dispatch layer now** (§3.3) so runtime escalation stays cheap.

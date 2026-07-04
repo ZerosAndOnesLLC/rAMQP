@@ -8,3 +8,4 @@
 
 #[cfg(feature = "scram")]
 pub mod scram;
+pub mod server;

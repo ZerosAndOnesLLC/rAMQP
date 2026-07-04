@@ -109,6 +109,38 @@ impl ProtocolHeader {
     }
 }
 
+/// Accept a protocol-header exchange in server order: **read the client's
+/// header first**, then reply.
+///
+/// If the client's header is one of `supported`, it is echoed back and
+/// returned — the caller proceeds in that protocol layer (SASL, TLS, or bare
+/// AMQP). Otherwise the spec (§2.2) requires answering with a header we *do*
+/// support before closing: `supported[0]` (the preferred layer) is written and
+/// a protocol error returned; the caller closes the connection.
+///
+/// # Panics
+/// Panics if `supported` is empty.
+pub async fn accept<S: IoStream>(
+    stream: &mut S,
+    supported: &[ProtocolHeader],
+) -> Result<ProtocolHeader, ConnectError> {
+    assert!(!supported.is_empty(), "no supported protocol headers");
+    let client = ProtocolHeader::read(stream).await?;
+    if supported.contains(&client) {
+        client.write(stream).await?;
+        return Ok(client);
+    }
+    supported[0].write(stream).await?;
+    Err(ConnectError::msg(
+        ErrorKind::ProtocolViolation,
+        format!(
+            "unsupported protocol header {:?}; offered {:?}",
+            client.to_bytes(),
+            supported[0].to_bytes()
+        ),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -137,5 +169,36 @@ mod tests {
         });
         ProtocolHeader::AMQP.negotiate(&mut a).await.unwrap();
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn accept_pairs_with_client_negotiate() {
+        // The server accept and the client-shaped negotiate() complete
+        // against each other for a supported header.
+        let (mut client, mut server) = tokio::io::duplex(64);
+        let server_task = tokio::spawn(async move {
+            accept(&mut server, &[ProtocolHeader::SASL, ProtocolHeader::AMQP])
+                .await
+                .unwrap()
+        });
+        ProtocolHeader::SASL.negotiate(&mut client).await.unwrap();
+        assert_eq!(server_task.await.unwrap(), ProtocolHeader::SASL);
+    }
+
+    #[tokio::test]
+    async fn accept_rejects_unsupported_with_counteroffer() {
+        let (mut client, mut server) = tokio::io::duplex(64);
+        let server_task = tokio::spawn(async move {
+            accept(&mut server, &[ProtocolHeader::SASL])
+                .await
+                .expect_err("bare AMQP must be rejected when SASL is required")
+        });
+        // Client offers bare AMQP; server requires SASL.
+        ProtocolHeader::AMQP.write(&mut client).await.unwrap();
+        // The server's counteroffer is the header it does support.
+        let counter = ProtocolHeader::read(&mut client).await.unwrap();
+        assert_eq!(counter, ProtocolHeader::SASL);
+        let err = server_task.await.unwrap();
+        assert_eq!(err.kind(), ErrorKind::ProtocolViolation);
     }
 }

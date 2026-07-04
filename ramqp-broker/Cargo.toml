@@ -10,4 +10,4 @@ keywords = ["amqp", "amqp1", "broker", "messaging", "async"]
 categories = ["network-programming", "asynchronous"]
 
 [dependencies]
-ramqp-core = { path = "../ramqp-core", version = "0.1.0" }
+ramqp-core = { path = "../ramqp-core", version = "0.2.0" }
