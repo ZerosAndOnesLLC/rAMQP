@@ -18,8 +18,11 @@ bytes = "1"
 thiserror = "2"
 ordered-float = "5"
 uuid = { version = "1", features = ["v4"] }
-tokio = { version = "1", features = ["sync", "io-util"] }
+tokio = { version = "1", features = ["sync", "io-util", "time"] }
 url = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
 
 [features]
 default = []

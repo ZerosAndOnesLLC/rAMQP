@@ -43,6 +43,16 @@ pub enum SessionPhase {
     Ended,
 }
 
+/// The outcome of accepting a peer-initiated attach: the local endpoint the
+/// session created to mirror it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AcceptedLink {
+    /// Our local handle for the link.
+    pub handle: Handle,
+    /// The role *we* play on the link (mirror of the peer's).
+    pub role: Role,
+}
+
 /// Per-session protocol state owned by the driver.
 pub struct Session {
     /// Process-local logical id (stable across reconnects).
@@ -140,6 +150,53 @@ impl Session {
                 session_id: self.session_id,
             }));
         }
+    }
+
+    /// Accept a peer-initiated `begin` (server polarity): the peer opened the
+    /// session, so its `begin` has no `remote-channel` and there is no local
+    /// begin future awaiting it. The session is created directly in
+    /// [`SessionPhase::Mapped`], and the returned `begin` is our response —
+    /// the caller queues it on `local_channel` (its `remote-channel` names the
+    /// peer's `remote_channel` per spec §2.7.2).
+    #[allow(clippy::too_many_arguments)]
+    pub fn accept_peer_begin(
+        session_id: SessionId,
+        local_channel: u16,
+        remote_channel: u16,
+        peer_begin: &Begin,
+        config: &SessionConfig,
+        events: mpsc::UnboundedSender<SessionEvent>,
+        metrics: SharedMetrics,
+    ) -> (Self, Begin) {
+        let mut windows = SessionWindows::new(config);
+        windows.on_peer_begin(peer_begin);
+        // Our outbound handles must satisfy both bounds: what the peer accepts
+        // (its handle-max) and what we advertise back (ours).
+        let handle_max = config.handle_max.min(peer_begin.handle_max);
+        let session = Session {
+            session_id,
+            local_channel,
+            remote_channel: Some(remote_channel),
+            phase: SessionPhase::Mapped,
+            windows,
+            handles: HandleAllocator::new(handle_max),
+            remote_handles: RemoteHandleMap::default(),
+            links: HashMap::new(),
+            link_handles: HashMap::new(),
+            events,
+            pending_begin: None,
+            pending_end: None,
+            metrics,
+        };
+        let response = Begin {
+            remote_channel: Some(remote_channel),
+            next_outgoing_id: session.windows.next_outgoing_id,
+            incoming_window: config.incoming_window,
+            outgoing_window: config.outgoing_window,
+            handle_max: config.handle_max,
+            ..Default::default()
+        };
+        (session, response)
     }
 
     /// Mark that we have sent `end` and are awaiting the peer's.
@@ -278,6 +335,116 @@ impl Session {
         if let Some(flow) = flow_to_send {
             transport.queue_amqp(local_channel, &Performative::Flow(flow), None);
         }
+    }
+
+    /// Whether a link with this name was initiated locally (so an inbound
+    /// `attach` for it is the peer's *response*, handled by
+    /// [`Session::on_peer_attach`]). An unknown name on a server is a
+    /// peer-initiated attach for [`Session::accept_peer_attach`].
+    pub fn knows_link(&self, name: &str) -> bool {
+        self.link_handles.contains_key(name)
+    }
+
+    /// Accept a peer-initiated `attach` (server polarity): create the mirror
+    /// endpoint (peer sender → our receiver; peer receiver → our sender),
+    /// queue our responding `attach`, and — when we are the receiver —
+    /// optionally grant `initial_credit` via a `flow`.
+    ///
+    /// The responding `attach` echoes the peer's `source`/`target` verbatim;
+    /// a broker resolves/rewrites the address on `attach` *before* calling
+    /// this (mutating the passed-in value), so what it passes is what the
+    /// peer sees confirmed.
+    ///
+    /// `max_message_size` is our per-delivery cap when we mirror as receiver.
+    pub fn accept_peer_attach<S: IoStream>(
+        &mut self,
+        attach: Attach,
+        credit_mode: CreditMode,
+        initial_credit: u32,
+        max_message_size: Option<u64>,
+        events: mpsc::Sender<LinkEvent>,
+        transport: &mut FramedTransport<S>,
+    ) -> Result<AcceptedLink, LinkError> {
+        if self.link_handles.contains_key(&attach.name) {
+            return Err(LinkError::msg(
+                ErrorKind::ProtocolViolation,
+                format!("duplicate attach for link name {:?}", attach.name),
+            ));
+        }
+        let local = self.handles.allocate().ok_or_else(|| {
+            LinkError::msg(ErrorKind::Capacity, "handle-max exhausted accepting attach")
+        })?;
+
+        // We take the mirror role of the peer's.
+        let our_role = match attach.role {
+            Role::Sender => Role::Receiver,
+            Role::Receiver => Role::Sender,
+        };
+
+        let mut response = Attach {
+            name: attach.name.clone(),
+            handle: local,
+            role: our_role,
+            snd_settle_mode: attach.snd_settle_mode,
+            rcv_settle_mode: attach.rcv_settle_mode,
+            source: attach.source.clone(),
+            target: attach.target.clone(),
+            ..Default::default()
+        };
+
+        let mut flow_to_send = None;
+        let link = match our_role {
+            Role::Receiver => {
+                let mut r = ReceiverLink::accepted(
+                    local,
+                    attach.name.clone(),
+                    events,
+                    attach.rcv_settle_mode,
+                    credit_mode,
+                    max_message_size,
+                );
+                // Adopt the peer sender's initial delivery-count so credit
+                // accounting starts aligned (spec §2.6.7).
+                if let Some(idc) = attach.initial_delivery_count {
+                    r.credit.delivery_count = idc;
+                }
+                response.max_message_size = max_message_size;
+                if initial_credit > 0 {
+                    r.credit.set_credit(initial_credit);
+                    self.metrics.on_credit(local, r.credit.link_credit);
+                    flow_to_send = Some(link_flow(local, &r.credit, &self.windows));
+                }
+                Link::Receiver(r)
+            }
+            Role::Sender => {
+                // As the sender we declare our initial delivery-count (spec:
+                // the sender MUST set it); credit arrives via the peer's flow.
+                response.initial_delivery_count = Some(0);
+                Link::Sender(SenderLink::accepted(
+                    local,
+                    attach.name.clone(),
+                    events,
+                    attach.snd_settle_mode,
+                    credit_mode,
+                ))
+            }
+        };
+
+        let mut link = link;
+        link.set_remote_handle(attach.handle);
+        link.mark_attached();
+        self.link_handles.insert(attach.name.clone(), local);
+        self.remote_handles.bind(attach.handle, local);
+        self.links.insert(local, link);
+
+        transport.queue_amqp(self.local_channel, &Performative::Attach(response), None);
+        if let Some(flow) = flow_to_send {
+            transport.queue_amqp(self.local_channel, &Performative::Flow(flow), None);
+        }
+        Ok(AcceptedLink {
+            handle: Handle(local),
+            role: our_role,
+        })
     }
 
     /// Enqueue an outbound message on a sender link and try to flush it.
@@ -949,5 +1116,271 @@ fn send_message_frames<S: IoStream>(
         windows.record_outgoing();
         offset = end;
         first_frame = false;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::observe::noop_metrics;
+    use crate::transport::frame::FrameBody;
+    use tokio::io::DuplexStream;
+
+    fn server_session(
+        peer_begin: &Begin,
+    ) -> (
+        Session,
+        Begin,
+        mpsc::UnboundedReceiver<SessionEvent>,
+        FramedTransport<DuplexStream>,
+        FramedTransport<DuplexStream>,
+    ) {
+        let (near, far) = tokio::io::duplex(1 << 16);
+        let transport = FramedTransport::new(near, 1 << 16);
+        let far = FramedTransport::new(far, 1 << 16);
+        let (evt_tx, evt_rx) = mpsc::unbounded_channel();
+        let config = SessionConfig {
+            incoming_window: 32,
+            outgoing_window: 16,
+            handle_max: 64,
+        };
+        let (session, response) = Session::accept_peer_begin(
+            SessionId(1),
+            0,
+            5,
+            peer_begin,
+            &config,
+            evt_tx,
+            noop_metrics(),
+        );
+        (session, response, evt_rx, transport, far)
+    }
+
+    fn peer_begin() -> Begin {
+        Begin {
+            remote_channel: None,
+            next_outgoing_id: 7,
+            incoming_window: 100,
+            outgoing_window: 50,
+            handle_max: 8,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn accept_peer_begin_maps_immediately_and_responds() {
+        let (session, response, _evt, _t, _far) = server_session(&peer_begin());
+        assert_eq!(session.phase(), SessionPhase::Mapped);
+        assert_eq!(session.remote_channel, Some(5));
+        // Windows learned from the peer's begin.
+        assert_eq!(session.windows.next_incoming_id, 7);
+        assert_eq!(session.windows.remote_incoming_window, 100);
+        // Our response names the peer's channel and advertises our config.
+        assert_eq!(response.remote_channel, Some(5));
+        assert_eq!(response.incoming_window, 32);
+        assert_eq!(response.outgoing_window, 16);
+        assert_eq!(response.handle_max, 64);
+        assert_eq!(response.next_outgoing_id, 0);
+    }
+
+    #[tokio::test]
+    async fn accept_peer_attach_as_receiver_grants_credit_and_delivers() {
+        let (mut session, _resp, _evt, mut transport, mut far) = server_session(&peer_begin());
+        let (link_tx, mut link_rx) = mpsc::channel(16);
+
+        // Peer attaches as SENDER (a producer publishing to us).
+        let attach = Attach {
+            name: "up".into(),
+            handle: 3,
+            role: Role::Sender,
+            initial_delivery_count: Some(5),
+            ..Default::default()
+        };
+        let accepted = session
+            .accept_peer_attach(
+                attach,
+                CreditMode::Manual,
+                10,
+                Some(1 << 20),
+                link_tx,
+                &mut transport,
+            )
+            .expect("accepted");
+        assert_eq!(accepted.role, Role::Receiver);
+        transport.flush().await.unwrap();
+
+        // The peer sees our responding attach (mirror role), then the credit flow.
+        let frame = far.read_frame().await.unwrap();
+        match frame.body {
+            FrameBody::Amqp(Performative::Attach(a), _) => {
+                assert_eq!(a.name, "up");
+                assert_eq!(a.role, Role::Receiver);
+                assert_eq!(a.handle, accepted.handle.0);
+                assert_eq!(a.max_message_size, Some(1 << 20));
+            }
+            other => panic!("expected attach, got {other:?}"),
+        }
+        let frame = far.read_frame().await.unwrap();
+        match frame.body {
+            FrameBody::Amqp(Performative::Flow(f), _) => {
+                assert_eq!(f.handle, Some(accepted.handle.0));
+                assert_eq!(f.link_credit, Some(10));
+                // Credit accounting starts from the peer's initial-delivery-count.
+                assert_eq!(f.delivery_count, Some(5));
+            }
+            other => panic!("expected flow, got {other:?}"),
+        }
+
+        // An inbound transfer on the peer's handle routes to our mirror link.
+        let transfer = Transfer {
+            handle: 3,
+            delivery_id: Some(0),
+            delivery_tag: Some(Bytes::from_static(b"t0")),
+            settled: Some(true),
+            ..Default::default()
+        };
+        session
+            .on_transfer(
+                transfer,
+                Some(Bytes::from_static(b"payload")),
+                &mut transport,
+            )
+            .await
+            .unwrap();
+        match link_rx.try_recv().expect("delivery emitted") {
+            LinkEvent::Delivery(d) => {
+                assert_eq!(&d.message[..], b"payload");
+                assert!(d.settled);
+            }
+            other => panic!("expected delivery, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn accept_peer_attach_as_sender_sends_once_credited() {
+        let (mut session, _resp, _evt, mut transport, mut far) = server_session(&peer_begin());
+        let (link_tx, _link_rx) = mpsc::channel(16);
+
+        // Peer attaches as RECEIVER (a consumer subscribing from us).
+        let attach = Attach {
+            name: "down".into(),
+            handle: 9,
+            role: Role::Receiver,
+            ..Default::default()
+        };
+        let accepted = session
+            .accept_peer_attach(attach, CreditMode::Manual, 0, None, link_tx, &mut transport)
+            .expect("accepted");
+        assert_eq!(accepted.role, Role::Sender);
+        transport.flush().await.unwrap();
+        let frame = far.read_frame().await.unwrap();
+        match frame.body {
+            FrameBody::Amqp(Performative::Attach(a), _) => {
+                assert_eq!(a.role, Role::Sender);
+                // A sender MUST declare its initial delivery-count.
+                assert_eq!(a.initial_delivery_count, Some(0));
+            }
+            other => panic!("expected attach, got {other:?}"),
+        }
+
+        // Consumer grants credit via flow (identifying the link by ITS handle).
+        let flow = Flow {
+            next_incoming_id: Some(0),
+            incoming_window: 100,
+            next_outgoing_id: 0,
+            outgoing_window: 100,
+            handle: Some(9),
+            link_credit: Some(5),
+            delivery_count: Some(0),
+            ..Default::default()
+        };
+        session.on_flow(flow, &mut transport, 1 << 16);
+
+        // Now a queued message flushes as a transfer.
+        session.send_transfer(
+            accepted.handle.0,
+            Bytes::from_static(b"queued message"),
+            true,
+            0,
+            None,
+            None,
+            &mut transport,
+            1 << 16,
+        );
+        transport.flush().await.unwrap();
+        let frame = far.read_frame().await.unwrap();
+        match frame.body {
+            FrameBody::Amqp(Performative::Transfer(t), payload) => {
+                assert_eq!(t.handle, accepted.handle.0);
+                assert_eq!(payload.as_deref(), Some(&b"queued message"[..]));
+            }
+            other => panic!("expected transfer, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn accept_peer_attach_rejects_duplicates_and_exhaustion() {
+        let (mut session, _resp, _evt, mut transport, _far) = server_session(&peer_begin());
+        let (link_tx, _link_rx) = mpsc::channel(16);
+
+        let attach = Attach {
+            name: "dup".into(),
+            handle: 1,
+            role: Role::Sender,
+            ..Default::default()
+        };
+        session
+            .accept_peer_attach(
+                attach.clone(),
+                CreditMode::Manual,
+                0,
+                None,
+                link_tx.clone(),
+                &mut transport,
+            )
+            .expect("first attach accepted");
+        let err = session
+            .accept_peer_attach(attach, CreditMode::Manual, 0, None, link_tx, &mut transport)
+            .expect_err("duplicate rejected");
+        assert_eq!(err.kind(), ErrorKind::ProtocolViolation);
+    }
+
+    #[tokio::test]
+    async fn accept_peer_attach_respects_handle_max() {
+        // Peer advertises handle-max 0: exactly one handle is available.
+        let begin = Begin {
+            handle_max: 0,
+            ..peer_begin()
+        };
+        let (mut session, _resp, _evt, mut transport, _far) = server_session(&begin);
+        let (link_tx, _link_rx) = mpsc::channel(16);
+
+        let attach = |name: &str, handle: u32| Attach {
+            name: name.into(),
+            handle,
+            role: Role::Sender,
+            ..Default::default()
+        };
+        session
+            .accept_peer_attach(
+                attach("a", 0),
+                CreditMode::Manual,
+                0,
+                None,
+                link_tx.clone(),
+                &mut transport,
+            )
+            .expect("first fits under handle-max");
+        let err = session
+            .accept_peer_attach(
+                attach("b", 1),
+                CreditMode::Manual,
+                0,
+                None,
+                link_tx,
+                &mut transport,
+            )
+            .expect_err("second exceeds handle-max");
+        assert_eq!(err.kind(), ErrorKind::Capacity);
     }
 }

@@ -69,6 +69,31 @@ impl ReceiverLink {
         }
     }
 
+    /// Create a receiver link for a peer-initiated attach (server polarity):
+    /// there is no local attach future awaiting the peer, so no pending reply.
+    pub fn accepted(
+        handle: u32,
+        name: String,
+        events: mpsc::Sender<LinkEvent>,
+        settle_mode: ReceiverSettleMode,
+        credit_mode: CreditMode,
+        max_message_size: Option<u64>,
+    ) -> Self {
+        ReceiverLink {
+            handle,
+            remote_handle: None,
+            name,
+            attached: false,
+            events,
+            pending_attach: None,
+            credit: LinkCredit::new(0, credit_mode),
+            unsettled: UnsettledMap::new(),
+            partial: None,
+            settle_mode,
+            max_message_size,
+        }
+    }
+
     /// The effective per-delivery byte cap (configured size, bounded by the
     /// hard ceiling).
     pub fn size_cap(&self) -> u64 {

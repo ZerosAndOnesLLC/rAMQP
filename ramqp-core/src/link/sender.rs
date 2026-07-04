@@ -91,6 +91,31 @@ impl SenderLink {
         }
     }
 
+    /// Create a sender link for a peer-initiated attach (server polarity):
+    /// there is no local attach future awaiting the peer, so no pending reply.
+    pub fn accepted(
+        handle: u32,
+        name: String,
+        events: mpsc::Sender<LinkEvent>,
+        settle_mode: SenderSettleMode,
+        credit_mode: CreditMode,
+    ) -> Self {
+        SenderLink {
+            handle,
+            remote_handle: None,
+            name,
+            attached: false,
+            events,
+            pending_attach: None,
+            credit: LinkCredit::new(0, credit_mode),
+            unsettled: UnsettledMap::new(),
+            pending: HashMap::new(),
+            outbox: VecDeque::new(),
+            settle_mode,
+            next_tag: 0,
+        }
+    }
+
     /// Allocate the next delivery tag (an 8-byte big-endian counter).
     pub fn next_delivery_tag(&mut self) -> Bytes {
         let tag = self.next_tag;

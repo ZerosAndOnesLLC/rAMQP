@@ -13,7 +13,7 @@ use std::time::Duration;
 /// # Example
 /// ```
 /// use std::sync::atomic::{AtomicU64, Ordering};
-/// use ramqp::observe::Metrics;
+/// use ramqp_core::observe::Metrics;
 ///
 /// #[derive(Default)]
 /// struct Counters {
