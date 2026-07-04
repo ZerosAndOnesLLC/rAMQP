@@ -625,6 +625,7 @@ impl Session {
                             self.metrics.on_inflight(1);
                         }
                         let event = LinkEvent::Delivery(IncomingDelivery {
+                            handle: Handle(r.handle),
                             delivery_id,
                             delivery_tag: tag,
                             settled,
@@ -668,6 +669,7 @@ impl Session {
                             self.metrics.on_inflight(1);
                         }
                         let event = LinkEvent::Delivery(IncomingDelivery {
+                            handle: Handle(r.handle),
                             delivery_id: delivery.delivery_id,
                             delivery_tag: delivery.delivery_tag.clone(),
                             settled: delivery.settled,
@@ -745,7 +747,10 @@ impl Session {
             None,
         );
         if let Some(events) = events {
-            let _ = events.try_send(LinkEvent::Detached { error: Some(error) });
+            let _ = events.try_send(LinkEvent::Detached {
+                handle: Handle(local),
+                error: Some(error),
+            });
         }
         if let Some(r) = remote {
             self.remote_handles.unbind(r);
@@ -790,6 +795,7 @@ impl Session {
                             }
                             if let Some(st) = &state {
                                 let _ = s.events.try_send(LinkEvent::Disposition {
+                                    handle: Handle(s.handle),
                                     delivery_id: DeliveryId(id),
                                     state: st.clone(),
                                     settled,
@@ -898,6 +904,7 @@ impl Session {
                     );
                     self.metrics.on_credit(local, s.credit.link_credit);
                     let _ = s.events.try_send(LinkEvent::Credit {
+                        handle: Handle(local),
                         credit: s.credit.link_credit,
                         drain: s.credit.drain,
                     });
@@ -989,6 +996,7 @@ impl Session {
         let events = self.links.get(&local).map(|l| l.events().clone());
         if let Some(events) = events {
             let _ = events.try_send(LinkEvent::Detached {
+                handle: Handle(local),
                 error: detach.error.clone(),
             });
         }

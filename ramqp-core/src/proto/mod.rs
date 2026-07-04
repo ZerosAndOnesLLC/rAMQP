@@ -166,6 +166,10 @@ pub enum SessionEvent {
 /// A fully assembled inbound delivery handed to a consumer.
 #[derive(Debug, Clone)]
 pub struct IncomingDelivery {
+    /// Our local handle of the link the delivery arrived on. Redundant for the
+    /// client's per-link channels; the attribution a broker needs when many
+    /// links share one event channel.
+    pub handle: Handle,
     /// The delivery id assigned by the peer.
     pub delivery_id: DeliveryId,
     /// The delivery tag chosen by the peer.
@@ -180,12 +184,18 @@ pub struct IncomingDelivery {
 }
 
 /// Events the driver pushes to a link handle (producer or consumer).
+///
+/// Every variant names the link's local [`Handle`]: the client's per-link
+/// channels don't need it, but a broker sharing one event channel across all
+/// accepted links routes by it.
 #[derive(Debug, Clone)]
 pub enum LinkEvent {
     /// A complete inbound delivery (consumer links).
     Delivery(IncomingDelivery),
     /// A disposition update for one of our outbound deliveries (sender links).
     Disposition {
+        /// Our local handle of the link.
+        handle: Handle,
         /// The delivery whose state changed.
         delivery_id: DeliveryId,
         /// The new delivery state.
@@ -195,6 +205,8 @@ pub enum LinkEvent {
     },
     /// Link credit was granted/updated (sender links).
     Credit {
+        /// Our local handle of the link.
+        handle: Handle,
         /// The current link credit.
         credit: u32,
         /// Whether the peer requested drain.
@@ -202,6 +214,8 @@ pub enum LinkEvent {
     },
     /// The link was detached (locally or by the peer).
     Detached {
+        /// Our local handle of the link.
+        handle: Handle,
         /// The peer's error, if the detach was errored.
         error: Option<AmqpError>,
     },

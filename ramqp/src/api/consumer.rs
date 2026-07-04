@@ -90,7 +90,7 @@ impl Consumer {
                     self.after_consume().await;
                     return Ok(delivery);
                 }
-                Some(LinkEvent::Detached { error }) => {
+                Some(LinkEvent::Detached { error, .. }) => {
                     return Err(detached_error(error));
                 }
                 // Credit / disposition events are not relevant to a consumer's recv.
