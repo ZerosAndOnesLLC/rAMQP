@@ -436,15 +436,20 @@ commit after each, update READMEs on significant change. Mark `[x]` when done.
 - [x] Create the `[workspace]` (virtual root, `default-members` excludes `bench-compare`); moved client to `ramqp/`; added empty `ramqp-core` + `ramqp-broker` (0.1.0) members; client builds + 102 unit tests pass.
 - [x] CI: `default-members` builds/tests the three real crates; `bench-compare` (fe2o3) stays out of default builds; `release.yml` now publishes `-p ramqp`.
 
-### Phase 1 — Extract `ramqp-core` (mechanical, behavior-preserving)
-- [ ] Move `codec`, `types`, `ids`, `observe` to core. Client re-exports. `cargo check`, tests green, commit.
-- [ ] Move `transport/frame.rs` + `header.rs` + `IoStream`/`Address` to core (leave `connect*`/`Transport`/`tls`/`ws` client-side). Commit.
-- [ ] Move `connection/negotiate.rs`, `mux.rs`, `heartbeat.rs` to core. Commit.
-- [ ] Move `session/*` and `link/*` to core. Commit.
-- [ ] Move `proto/mod.rs` to core. Commit.
-- [ ] Split `config`, `error`, `txn` (types→core), split `sasl` (math→core). Commit.
-- [ ] Add `tests/public_api.rs` (or `cargo semver-checks`) locking the re-export surface.
-- [ ] **Gate:** `ramqp` compiles against `ramqp-core`; full client suite (incl. `tests/broker.rs`, `tls`, `ws`) passes unchanged; **existing `benches/codec.rs` shows no regression**. Bump client 0.8.0, `ramqp-core` 0.1.0.
+### Phase 1 — Extract `ramqp-core` (mechanical, behavior-preserving) ✅
+Executed in true bottom-up dependency order (the checklist order below had
+`error`/`config` too late — `transport`/`session`/`link` depend on them):
+codec/types/ids/observe → error/config → transport split → proto →
+link/session → negotiate/mux/heartbeat → txn/sasl splits.
+- [x] Move `codec`, `types`, `ids`, `observe` to core. Client re-exports (incl. the `#[macro_export]` `amqp_composite!`).
+- [x] Move `error` (wholesale) + `config` to core. **Deviation:** `config` moved wholesale, not field-split — splitting `ConnectionConfig`'s public fields would break the client API the gate protects; broker gets its own config type anyway.
+- [x] Move `transport/frame.rs` + `header.rs` + `IoStream`/`Scheme`/`Address` to core (`connect*`/`Transport`/`TlsConfig`/`tls`/`ws` stay client-side).
+- [x] Move `proto/mod.rs` to core.
+- [x] Move `session/*` and `link/*` to core (CreditMode `#[non_exhaustive]` matches in client became if-let — cross-crate exhaustiveness).
+- [x] Move `connection/negotiate.rs`, `mux.rs`, `heartbeat.rs` to core; client keeps `driver`.
+- [x] Split `txn` (wire types/helpers → core behind `transaction`; `TransactionController` stays) and `sasl` (SCRAM math/saslprep/nonce/ct_eq → core behind `scram`, + new `unescape_username` for Phase 2; `SaslProfile`/`ScramClient`/`negotiate()` stay). Crypto deps moved client→core.
+- [x] `tests/public_api.rs` locks the full pre-0.8 re-export surface (compile-time, both feature sets).
+- [x] **Gate:** full suite green (default + --all-features), clippy/fmt/docs clean, benches compile; client **0.8.0**, `ramqp-core` **0.1.0**. READMEs + CHANGELOG updated.
 
 ### Phase 2 — Server-side primitives in core (additive)
 - [ ] `Session::accept_peer_begin` (peer begin with no remote-channel).

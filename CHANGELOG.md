@@ -5,6 +5,19 @@ All notable changes to ramqp will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] - 2026-07-01
+
+### Changed
+- **Workspace restructure: the role-agnostic engine moved into `ramqp-core`.**
+  The codec, wire types, ids, config, errors, observability, framing/header
+  transport layer, session/link state machines, open-negotiation/mux/heartbeat,
+  transaction wire types, and the SCRAM math now live in the new `ramqp-core`
+  crate (0.1.0), shared with the upcoming `ramqp-broker`. `ramqp` re-exports
+  everything, so **all existing `ramqp::...` paths keep working** — the public
+  API is unchanged (locked by `tests/public_api.rs`). No behavior changes.
+- The `scram` and `transaction` features now delegate to the corresponding
+  `ramqp-core` features; the SCRAM crypto dependencies moved to `ramqp-core`.
+
 ## [0.7.1] - 2026-06-24
 
 ### Changed (performance)

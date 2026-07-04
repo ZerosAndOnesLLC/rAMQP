@@ -55,7 +55,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-See [`examples/produce_consume.rs`](examples/produce_consume.rs).
+See [`ramqp/examples/produce_consume.rs`](ramqp/examples/produce_consume.rs).
 
 ## Cargo features
 
@@ -73,15 +73,27 @@ plaintext `ws://`.
 
 ## Architecture
 
+The repo is a workspace: the role-agnostic protocol engine lives in
+**`ramqp-core`** and is shared with the in-development **`ramqp-broker`**;
+the published `ramqp` client re-exports it, so all `ramqp::...` paths are
+unchanged.
+
 ```
-PUBLIC API     Connection · Session · Producer · Consumer        (src/api)
-RESILIENCE     supervisor · reconnect · replay · pool            (src/resilience)
-LINK           sender/receiver · settlement · credit · delivery  (src/link)
-SESSION        begin/end · windows · handle registry             (src/session)
-CONNECTION     driver task · open/close · mux · heartbeat        (src/connection)
-TRANSPORT      TCP/TLS/WS · single-pass frame codec · SASL       (src/transport, src/sasl)
-CONTRACTS      errors · ids · config · metrics/events · proto    (src/{error,ids,config,observe,proto})
-CODEC + TYPES  clean-room AMQP 1.0 type system + wire codec      (src/codec, src/types)
+ramqp (client)
+  PUBLIC API     Connection · Session · Producer · Consumer        (ramqp/src/api)
+  RESILIENCE     supervisor · reconnect · replay · pool            (ramqp/src/resilience)
+  DIAL + DRIVER  connect TCP/TLS/WS · client driver task · SASL    (ramqp/src/{transport,connection,sasl})
+
+ramqp-core (shared engine)
+  LINK           sender/receiver · settlement · credit · delivery  (ramqp-core/src/link)
+  SESSION        begin/end · windows · handle registry             (ramqp-core/src/session)
+  CONNECTION     open negotiation · mux · heartbeat                (ramqp-core/src/connection)
+  TRANSPORT      single-pass frame codec · header · addresses      (ramqp-core/src/transport)
+  CONTRACTS      errors · ids · config · metrics/events · proto    (ramqp-core/src/{error,ids,config,observe,proto})
+  CODEC + TYPES  clean-room AMQP 1.0 type system + wire codec      (ramqp-core/src/{codec,types})
+
+ramqp-broker (in development — see broker.md)
+  A performance-first, highly-available AMQP 1.0 broker on the same core.
 ```
 
 ## Status
@@ -126,7 +138,7 @@ soak sustained ~170k messages with flat memory.
 Roadmap: wire-level link resumption (`transfer.resume` + unsettled-map exchange)
 to upgrade the current re-attach + at-least-once resend to in-place resume, and
 interop coverage for more brokers (Azure Service Bus, Qpid). The
-[resume decision matrix](src/link/resume.rs) (resend/resume/settle/abort) is
+[resume decision matrix](ramqp-core/src/link/resume.rs) (resend/resume/settle/abort) is
 already in place for it.
 
 ## License
