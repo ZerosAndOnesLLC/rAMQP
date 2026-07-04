@@ -457,11 +457,11 @@ link/session → negotiate/mux/heartbeat → txn/sasl splits.
 - [x] `header::accept` (read-first, echo-or-counteroffer per §2.2); `sasl::server` with `parse_plain_response` + `ScramServer`/`ScramVerifier` (RFC 5802 server side, verifier-based storage — no plaintext; channel-binding demands rejected; credential store itself deferred to Phase 9).
 - [x] Tests: 5 server-session, 2 header-accept pairing, 7 SASL-server (incl. the RFC 5802 server vector), and 2 client⇄core SCRAM interlock tests over the real `negotiate()` (mutual auth + wrong-password rejection). Client untouched. Core → **0.2.0**.
 
-### Phase 3 — Broker skeleton (`ramqp-broker`)
-- [ ] Acceptor + server `Transport` (plain first), per-connection task. **Shard-partition the queue/dispatch layer now** (§3.3) so runtime escalation stays cheap.
-- [ ] Server handshake: header read-first, server SASL (PLAIN/ANONYMOUS), `open`.
-- [ ] Broker connection driver: inbound routing → core `Session` + `accept_*`.
-- [ ] **Smoke test:** the existing `ramqp` client connects, opens session, attaches — against our broker (loopback). Commit.
+### Phase 3 — Broker skeleton (`ramqp-broker`) ✅
+- [x] TCP acceptor (`Broker::bind` → `BoundBroker::run`), one owning task per connection (client's lock-free actor model), TCP_NODELAY, watch-channel graceful shutdown, `serve_stream` for in-process transports. (Queue/dispatch shard-partitioning lands with the queue layer in Phase 4 — carried there.)
+- [x] Server handshake: `header::accept` read-first (SASL required unless the authenticator allows unauthenticated), server SASL (ANONYMOUS/PLAIN via pluggable `Authenticator`; `AllowAll` + constant-time `StaticPlain`), read-first `open` with the client's frame-size-floor validation, `reconcile`, heartbeat. Handshake bounded by `connect_timeout` (slow-loris guard).
+- [x] Broker connection driver: biased select loop (reads → link/session event drains → heartbeat → shutdown), inbound routing into core `Session` via `accept_peer_begin`/`accept_peer_attach`/`handle_link_frame`; duplicate-open/unknown-channel/SASL-after-open → connection errors; rejected attach → session end with `resource-limit-exceeded`. **Decision (was open): standalone broker driver, not a shared core `Connection` engine** — revisit only if Phase 4+ duplication proves costly.
+- [x] **Smoke test green:** the unmodified `ramqp` client over loopback TCP — ANONYMOUS + PLAIN (good/bad/unoffered credentials), begin/attach producer+consumer, session end/reopen, graceful close, 16 concurrent connections.
 
 ### Phase 4 — Single-node MVP (transient queues) + establish the benchmark
 - [ ] Address→node resolution + in-memory **transient** queues; queue-type in the declaration model.
