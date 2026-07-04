@@ -5,10 +5,11 @@
 //! architecture and phased plan.
 //!
 //! # Status
-//! Phase 3 skeleton: TCP acceptor, server-order handshake (protocol header →
-//! SASL ANONYMOUS/PLAIN → `open`), and a per-connection driver that accepts
-//! peer-initiated sessions and links. Queue semantics land in Phase 4;
-//! clustering (per-queue Raft) in Phases 5–6.
+//! Phase 4 single-node MVP: TCP acceptor, server-order handshake (protocol
+//! header → SASL ANONYMOUS/PLAIN → `open`), a per-connection driver, and
+//! in-memory **transient queues** (one lock-free actor per queue) with
+//! competing consumers, credit-based dispatch, and settlement→ack/requeue.
+//! Durability lands in Phase 7; clustering (per-queue Raft) in Phases 5–6.
 //!
 //! ```no_run
 //! use ramqp_broker::{Broker, BrokerConfig};
@@ -26,6 +27,8 @@ pub mod auth;
 mod broker;
 pub mod config;
 mod connection;
+mod queue;
+mod registry;
 
 pub use auth::{AllowAll, Authenticator, Credentials, StaticPlain};
 pub use broker::{BoundBroker, Broker, ShutdownHandle};

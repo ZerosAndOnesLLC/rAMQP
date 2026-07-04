@@ -1136,6 +1136,7 @@ name = "ramqp-broker"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "futures-util",
  "ramqp",
  "ramqp-core",
  "tokio",

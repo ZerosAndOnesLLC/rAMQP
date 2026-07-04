@@ -1,14 +1,18 @@
 //! The per-connection driver: server-order handshake (header → SASL → `open`)
-//! and the frame-routing event loop.
+//! and the frame-routing event loop, wired to the queue layer.
 //!
 //! One owning task per connection (the same lock-free actor model as the
 //! client): all protocol state lives here, nothing is shared, and writes are
-//! coalesced into one flush per loop iteration.
+//! coalesced into one flush per loop iteration. Queues are actors too; the
+//! only cross-task traffic is bounded channels — deliveries stay `Bytes`
+//! (refcount clones) end to end.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use tokio::sync::{mpsc, watch};
+use futures_util::StreamExt;
+use futures_util::stream::FuturesUnordered;
+use tokio::sync::{mpsc, oneshot, watch};
 
 use ramqp_core::codec::Symbol;
 use ramqp_core::config::CreditMode;
@@ -16,7 +20,7 @@ use ramqp_core::connection::heartbeat::{Heartbeat, HeartbeatAction};
 use ramqp_core::connection::mux::{ChannelAllocator, RemoteChannelMap};
 use ramqp_core::connection::negotiate::{MIN_MAX_FRAME_SIZE, build_open, reconcile};
 use ramqp_core::error::{ConnectError, ErrorKind};
-use ramqp_core::ids::SessionId;
+use ramqp_core::ids::{DeliveryId, SessionId};
 use ramqp_core::observe::{SharedMetrics, noop_metrics};
 use ramqp_core::proto::{LinkEvent, SessionEvent};
 use ramqp_core::sasl::server::parse_plain_response;
@@ -24,23 +28,31 @@ use ramqp_core::session::state::Session;
 use ramqp_core::transport::IoStream;
 use ramqp_core::transport::frame::{Frame, FrameBody, FramedTransport};
 use ramqp_core::transport::header::{ProtocolHeader, accept as accept_header};
-use ramqp_core::types::definitions::Error as AmqpError;
-use ramqp_core::types::performatives::{Begin, Close, End, Performative};
+use ramqp_core::types::definitions::{AmqpError as AmqpCondition, Error as AmqpError, Role};
+use ramqp_core::types::messaging::{Accepted, DeliveryState, Rejected, TargetArchetype};
+use ramqp_core::types::performatives::{Attach, Begin, Close, End, Performative};
 use ramqp_core::types::sasl::{SaslCode, SaslFrame, SaslMechanisms, SaslOutcome};
 
 use crate::auth::{Authenticator, Credentials};
 use crate::config::BrokerConfig;
+use crate::queue::{ConnCmd, PublishAck, QueueHandle, QueueMsg, SettleOutcome, SubId};
+use crate::registry::QueueRegistry;
+
+/// How many queue commands to coalesce under one flush (mirrors the client
+/// driver's batching; bounds per-wakeup work so reads aren't starved).
+const CMD_BATCH_MAX: usize = 64;
 
 /// Serve one accepted byte stream to completion (handshake + event loop).
 pub(crate) async fn serve<S: IoStream>(
     stream: S,
     config: Arc<BrokerConfig>,
     auth: Arc<dyn Authenticator>,
+    registry: Arc<QueueRegistry>,
     shutdown: watch::Receiver<bool>,
 ) -> Result<(), ConnectError> {
     // Bound the whole inbound handshake (header + SASL + open) so a client
     // that connects then stalls cannot pin this task (slow-loris guard).
-    let handshake = handshake(stream, &config, auth.as_ref());
+    let handshake = handshake(stream, &config, auth.as_ref(), registry);
     let mut conn = match config.connection.connect_timeout {
         Some(t) => tokio::time::timeout(t, handshake)
             .await
@@ -48,7 +60,9 @@ pub(crate) async fn serve<S: IoStream>(
         None => handshake.await?,
     };
     conn.shutdown = Some(shutdown);
-    conn.run().await
+    let result = conn.run().await;
+    conn.cleanup().await;
+    result
 }
 
 /// Run the server-order handshake, returning the established connection.
@@ -56,6 +70,7 @@ async fn handshake<S: IoStream>(
     mut stream: S,
     config: &Arc<BrokerConfig>,
     auth: &dyn Authenticator,
+    registry: Arc<QueueRegistry>,
 ) -> Result<BrokerConnection<S>, ConnectError> {
     // 1. Protocol header, read-first. Offer SASL and (if permitted) bare AMQP.
     let supported: &[ProtocolHeader] = if auth.allow_unauthenticated() {
@@ -106,22 +121,28 @@ async fn handshake<S: IoStream>(
     let heartbeat = Heartbeat::new(negotiated.send_interval, negotiated.recv_timeout);
     let (link_events_tx, link_events_rx) = mpsc::channel(1024);
     let (session_events_tx, session_events_rx) = mpsc::unbounded_channel();
+    let (cmd_tx, cmd_rx) = mpsc::channel(1024);
 
     tracing::debug!(container = %peer_open.container_id, "connection open");
     Ok(BrokerConnection {
         transport,
         config: config.clone(),
+        registry,
         max_frame_size: negotiated.max_frame_size as usize,
         heartbeat,
         channels: ChannelAllocator::new(negotiated.channel_max),
         remote_channels: RemoteChannelMap::default(),
         sessions: HashMap::new(),
+        bindings: HashMap::new(),
+        settlements: FuturesUnordered::new(),
         next_session_id: 0,
         metrics: noop_metrics(),
         link_events_tx,
         link_events_rx,
         session_events_tx,
         session_events_rx,
+        cmd_tx,
+        cmd_rx,
         shutdown: None,
     })
 }
@@ -182,24 +203,49 @@ async fn server_sasl<S: IoStream>(
     Ok(())
 }
 
+/// A link's queue binding.
+enum Binding {
+    /// Peer sender → our receiver → publishes into `queue`.
+    Producer {
+        queue: QueueHandle,
+        /// Deliveries since the last credit top-up (batched replenishment).
+        received_since_grant: u32,
+    },
+    /// Peer receiver → our sender → subscribed to `queue` as `sub`.
+    Consumer { queue: QueueHandle, sub: SubId },
+}
+
+/// The resolution of one dispatched delivery: which queue/sub/message it was
+/// and the outcome the consumer settled it with.
+type SettlementResult = (mpsc::Sender<QueueMsg>, SubId, u64, SettleOutcome);
+
 /// An established broker-side connection (post-handshake).
 struct BrokerConnection<S: IoStream> {
     transport: FramedTransport<S>,
     config: Arc<BrokerConfig>,
+    registry: Arc<QueueRegistry>,
     max_frame_size: usize,
     heartbeat: Heartbeat,
     channels: ChannelAllocator,
     remote_channels: RemoteChannelMap,
     /// Sessions keyed by OUR channel.
     sessions: HashMap<u16, Session>,
+    /// Link → queue bindings, keyed by (our channel, our link handle).
+    bindings: HashMap<(u16, u32), Binding>,
+    /// In-flight consumer dispatches awaiting a terminal outcome.
+    settlements: FuturesUnordered<std::pin::Pin<Box<dyn Future<Output = SettlementResult> + Send>>>,
     next_session_id: u64,
     metrics: SharedMetrics,
-    /// Shared event channel for all accepted links on this connection.
-    /// Phase 3 drains it; Phase 4 feeds deliveries into queues instead.
+    /// Shared event channel for all accepted links; drained synchronously
+    /// after every routed frame (emissions only happen inside our own calls,
+    /// so the channel never accumulates across frames).
     link_events_tx: mpsc::Sender<LinkEvent>,
     link_events_rx: mpsc::Receiver<LinkEvent>,
     session_events_tx: mpsc::UnboundedSender<SessionEvent>,
     session_events_rx: mpsc::UnboundedReceiver<SessionEvent>,
+    /// Commands from queue actors (deliveries to dispatch, publish acks).
+    cmd_tx: mpsc::Sender<ConnCmd>,
+    cmd_rx: mpsc::Receiver<ConnCmd>,
     shutdown: Option<watch::Receiver<bool>>,
 }
 
@@ -229,10 +275,21 @@ impl<S: IoStream> BrokerConnection<S> {
                     }
                 }
 
-                // Phase 3: accepted-link events have no queue to land in yet;
-                // drain them so channels never back up.
-                Some(event) = self.link_events_rx.recv() => {
-                    tracing::trace!(?event, "link event (dropped; no queue layer yet)");
+                Some(cmd) = self.cmd_rx.recv() => {
+                    self.handle_cmd(cmd);
+                    // Coalesce a burst of queue commands under one flush.
+                    let mut drained = 0;
+                    while drained < CMD_BATCH_MAX {
+                        match self.cmd_rx.try_recv() {
+                            Ok(next) => { self.handle_cmd(next); drained += 1; }
+                            Err(_) => break,
+                        }
+                    }
+                    self.flush().await?;
+                }
+
+                Some((queue, sub, msg_id, outcome)) = self.settlements.next() => {
+                    let _ = queue.send(QueueMsg::Settle { sub, msg_id, outcome }).await;
                 }
 
                 Some(event) = self.session_events_rx.recv() => {
@@ -267,12 +324,103 @@ impl<S: IoStream> BrokerConnection<S> {
         }
     }
 
+    /// Best-effort teardown: unsubscribe every consumer binding so its
+    /// unacked messages requeue immediately (rather than on the queue's next
+    /// failed dispatch).
+    async fn cleanup(&mut self) {
+        for ((_, _), binding) in self.bindings.drain() {
+            if let Binding::Consumer { queue, sub } = binding {
+                let _ = queue.tx.send(QueueMsg::Unsubscribe { sub }).await;
+            }
+        }
+    }
+
     async fn flush(&mut self) -> Result<(), ConnectError> {
         if self.transport.pending_bytes() > 0 {
             self.transport.flush().await?;
             self.heartbeat.record_send();
         }
         Ok(())
+    }
+
+    /// Handle one command from a queue actor.
+    fn handle_cmd(&mut self, cmd: ConnCmd) {
+        match cmd {
+            ConnCmd::Deliver {
+                channel,
+                handle,
+                msg_id,
+                body,
+            } => {
+                let Some(session) = self.sessions.get_mut(&channel) else {
+                    // Session raced away; the queue will requeue via settle.
+                    self.settle_later_requeue(channel, handle, msg_id);
+                    return;
+                };
+                let Some(Binding::Consumer { queue, sub }) = self.bindings.get(&(channel, handle))
+                else {
+                    return; // link gone; unsubscribe already requeued it
+                };
+                let (reply_tx, reply_rx) = oneshot::channel();
+                let (queue_tx, sub) = (queue.tx.clone(), *sub);
+                session.send_transfer(
+                    handle,
+                    body,
+                    false,
+                    0,
+                    None,
+                    Some(reply_tx),
+                    &mut self.transport,
+                    self.max_frame_size,
+                );
+                self.settlements.push(Box::pin(async move {
+                    let outcome = match reply_rx.await {
+                        Ok(Ok(state)) => state_to_outcome(&state),
+                        // Link/connection died before a terminal outcome:
+                        // requeue (no-op if an unsubscribe already did).
+                        Ok(Err(_)) | Err(_) => SettleOutcome::Requeue,
+                    };
+                    (queue_tx, sub, msg_id, outcome)
+                }));
+            }
+            ConnCmd::SettleIncoming {
+                channel,
+                handle,
+                delivery_id,
+                accepted,
+            } => {
+                if let Some(session) = self.sessions.get_mut(&channel) {
+                    let state = if accepted {
+                        DeliveryState::Accepted(Accepted::default())
+                    } else {
+                        DeliveryState::Rejected(Rejected {
+                            error: Some(AmqpError::new(
+                                AmqpCondition::ResourceLimitExceeded,
+                                Some("queue is full".to_owned()),
+                            )),
+                        })
+                    };
+                    session.send_disposition(
+                        handle,
+                        DeliveryId(delivery_id),
+                        None,
+                        state,
+                        true,
+                        &mut self.transport,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Queue a requeue-settlement for a delivery we can no longer dispatch.
+    fn settle_later_requeue(&mut self, channel: u16, handle: u32, msg_id: u64) {
+        if let Some(Binding::Consumer { queue, sub }) = self.bindings.get(&(channel, handle)) {
+            let (queue_tx, sub) = (queue.tx.clone(), *sub);
+            self.settlements.push(Box::pin(async move {
+                (queue_tx, sub, msg_id, SettleOutcome::Requeue)
+            }));
+        }
     }
 
     /// Route one inbound frame. Returns `Ok(true)` when the connection is done.
@@ -307,17 +455,21 @@ impl<S: IoStream> BrokerConnection<S> {
                 Ok(false)
             }
             Performative::End(end) => {
-                self.handle_end(channel, end);
+                self.handle_end(channel, end).await;
                 Ok(false)
             }
             Performative::Attach(attach) => {
                 let Some(local) = self.remote_channels.resolve(channel) else {
                     return Err(unknown_channel(channel));
                 };
-                let session = self.sessions.get_mut(&local).expect("bound channel");
-                if session.knows_link(&attach.name) {
-                    // A response to a link we initiated (none in Phase 3, but
-                    // the path is uniform).
+                if self
+                    .sessions
+                    .get(&local)
+                    .expect("bound channel")
+                    .knows_link(&attach.name)
+                {
+                    // A response to a link we initiated (none today).
+                    let session = self.sessions.get_mut(&local).expect("bound channel");
                     session
                         .handle_link_frame(
                             Performative::Attach(attach),
@@ -327,33 +479,9 @@ impl<S: IoStream> BrokerConnection<S> {
                         )
                         .await?;
                 } else {
-                    let accepted = session.accept_peer_attach(
-                        attach,
-                        CreditMode::Manual,
-                        self.config.initial_credit,
-                        self.config.max_message_size,
-                        self.link_events_tx.clone(),
-                        &mut self.transport,
-                    );
-                    match accepted {
-                        Ok(link) => {
-                            tracing::debug!(handle = link.handle.0, role = ?link.role, "link accepted");
-                        }
-                        Err(e) => {
-                            // Session-level failure: end the session rather
-                            // than dropping the whole connection.
-                            tracing::warn!(error = %e, "attach rejected; ending session");
-                            self.end_session_with_error(
-                                local,
-                                channel,
-                                AmqpError::new(
-                                    ramqp_core::types::definitions::AmqpError::ResourceLimitExceeded,
-                                    Some(e.to_string()),
-                                ),
-                            );
-                        }
-                    }
+                    self.accept_attach(local, channel, attach).await;
                 }
+                self.drain_link_events(local).await;
                 Ok(false)
             }
             p @ (Performative::Transfer(_)
@@ -367,7 +495,163 @@ impl<S: IoStream> BrokerConnection<S> {
                 session
                     .handle_link_frame(p, payload, &mut self.transport, self.max_frame_size)
                     .await?;
+                self.drain_link_events(local).await;
                 Ok(false)
+            }
+        }
+    }
+
+    /// Accept a peer-initiated attach: resolve its address to a queue, mirror
+    /// the endpoint, and bind it.
+    async fn accept_attach(&mut self, local: u16, remote_channel: u16, attach: Attach) {
+        // Producer (peer sender) targets a queue; consumer (peer receiver)
+        // sources from one.
+        let address = match attach.role {
+            Role::Sender => match &attach.target {
+                Some(TargetArchetype::Target(t)) => t.address.clone(),
+                _ => None,
+            },
+            Role::Receiver => attach.source.as_ref().and_then(|s| s.address.clone()),
+        };
+        let queue = address.as_deref().and_then(|a| self.registry.resolve(a));
+        let Some(queue) = queue else {
+            tracing::debug!(name = %attach.name, ?address, "attach to unresolvable address");
+            self.end_session_with_error(
+                local,
+                remote_channel,
+                AmqpError::new(
+                    AmqpCondition::NotFound,
+                    Some(format!("no queue for address {address:?}")),
+                ),
+            )
+            .await;
+            return;
+        };
+
+        let peer_role = attach.role;
+        let initial_credit = match peer_role {
+            Role::Sender => self.config.initial_credit,
+            Role::Receiver => 0,
+        };
+        let session = self.sessions.get_mut(&local).expect("bound channel");
+        let accepted = session.accept_peer_attach(
+            attach,
+            CreditMode::Manual,
+            initial_credit,
+            self.config.max_message_size,
+            self.link_events_tx.clone(),
+            &mut self.transport,
+        );
+        let accepted = match accepted {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::warn!(error = %e, "attach rejected; ending session");
+                self.end_session_with_error(
+                    local,
+                    remote_channel,
+                    AmqpError::new(AmqpCondition::ResourceLimitExceeded, Some(e.to_string())),
+                )
+                .await;
+                return;
+            }
+        };
+
+        let binding = match peer_role {
+            Role::Sender => Binding::Producer {
+                queue,
+                received_since_grant: 0,
+            },
+            Role::Receiver => {
+                let (reply_tx, reply_rx) = oneshot::channel();
+                let subscribed = queue
+                    .tx
+                    .send(QueueMsg::Subscribe {
+                        conn: self.cmd_tx.clone(),
+                        channel: local,
+                        handle: accepted.handle.0,
+                        reply: reply_tx,
+                    })
+                    .await
+                    .is_ok();
+                let Ok(sub) = reply_rx.await else {
+                    debug_assert!(!subscribed, "queue died between send and reply");
+                    tracing::warn!(queue = %queue.name, "queue actor unavailable");
+                    return;
+                };
+                Binding::Consumer { queue, sub }
+            }
+        };
+        self.bindings.insert((local, accepted.handle.0), binding);
+        tracing::debug!(handle = accepted.handle.0, role = ?accepted.role, "link bound");
+    }
+
+    /// Drain the link events emitted synchronously by the session call we just
+    /// made, routing them to queues. `channel` is the session they came from.
+    async fn drain_link_events(&mut self, channel: u16) {
+        while let Ok(event) = self.link_events_rx.try_recv() {
+            match event {
+                LinkEvent::Delivery(d) => {
+                    let handle = d.handle.0;
+                    let Some(Binding::Producer {
+                        queue,
+                        received_since_grant,
+                    }) = self.bindings.get_mut(&(channel, handle))
+                    else {
+                        continue; // link vanished mid-flight
+                    };
+                    let ack = (!d.settled).then(|| PublishAck {
+                        conn: self.cmd_tx.clone(),
+                        channel,
+                        handle,
+                        delivery_id: d.delivery_id.value(),
+                    });
+                    // Bounded queue mailbox: a full queue back-pressures this
+                    // connection (and thus the producer) — never unbounded.
+                    if queue
+                        .tx
+                        .send(QueueMsg::Publish {
+                            body: d.message,
+                            ack,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        tracing::warn!(queue = %queue.name, "publish to dead queue actor");
+                        continue;
+                    }
+                    // Batched credit replenishment: top the producer back up
+                    // once it has consumed half its window.
+                    *received_since_grant += 1;
+                    let threshold = (self.config.initial_credit / 2).max(1);
+                    if *received_since_grant >= threshold {
+                        let grant = *received_since_grant;
+                        *received_since_grant = 0;
+                        if let Some(session) = self.sessions.get_mut(&channel) {
+                            session.grant_credit(handle, grant, &mut self.transport);
+                        }
+                    }
+                }
+                LinkEvent::Credit {
+                    handle,
+                    credit,
+                    drain: _,
+                } => {
+                    if let Some(Binding::Consumer { queue, sub }) =
+                        self.bindings.get(&(channel, handle.0))
+                    {
+                        let _ = queue.tx.send(QueueMsg::Demand { sub: *sub, credit }).await;
+                    }
+                }
+                LinkEvent::Detached { handle, .. } => {
+                    if let Some(Binding::Consumer { queue, sub }) =
+                        self.bindings.remove(&(channel, handle.0))
+                    {
+                        let _ = queue.tx.send(QueueMsg::Unsubscribe { sub }).await;
+                    }
+                }
+                // Consumer settlements arrive via the per-dispatch replies in
+                // `settlements`, not via Disposition events.
+                LinkEvent::Disposition { .. } => {}
             }
         }
     }
@@ -412,7 +696,7 @@ impl<S: IoStream> BrokerConnection<S> {
     }
 
     /// Handle a peer `end`: acknowledge and tear the session down.
-    fn handle_end(&mut self, remote_channel: u16, end: End) {
+    async fn handle_end(&mut self, remote_channel: u16, end: End) {
         let Some(local) = self.remote_channels.resolve(remote_channel) else {
             return; // already gone — end/end race, ignore
         };
@@ -423,16 +707,33 @@ impl<S: IoStream> BrokerConnection<S> {
             .queue_amqp(local, &Performative::End(End { error: None }), None);
         self.remote_channels.unbind(remote_channel);
         self.channels.release(local);
+        self.release_session_bindings(local).await;
         tracing::debug!(remote_channel, local_channel = local, "session ended");
     }
 
     /// End a session server-side with an error (e.g. a rejected attach).
-    fn end_session_with_error(&mut self, local: u16, remote_channel: u16, error: AmqpError) {
+    async fn end_session_with_error(&mut self, local: u16, remote_channel: u16, error: AmqpError) {
         self.sessions.remove(&local);
         self.transport
             .queue_amqp(local, &Performative::End(End { error: Some(error) }), None);
         self.remote_channels.unbind(remote_channel);
         self.channels.release(local);
+        self.release_session_bindings(local).await;
+    }
+
+    /// Unbind every link on a session, unsubscribing its consumers.
+    async fn release_session_bindings(&mut self, local: u16) {
+        let keys: Vec<_> = self
+            .bindings
+            .keys()
+            .filter(|(ch, _)| *ch == local)
+            .copied()
+            .collect();
+        for key in keys {
+            if let Some(Binding::Consumer { queue, sub }) = self.bindings.remove(&key) {
+                let _ = queue.tx.send(QueueMsg::Unsubscribe { sub }).await;
+            }
+        }
     }
 
     /// After we initiate `close`, wait briefly for the peer's `close`.
@@ -450,6 +751,25 @@ impl<S: IoStream> BrokerConnection<S> {
             }
         })
         .await;
+    }
+}
+
+/// Map a consumer's terminal delivery state onto a queue settlement.
+fn state_to_outcome(state: &DeliveryState) -> SettleOutcome {
+    match state {
+        DeliveryState::Accepted(_) => SettleOutcome::Ack,
+        DeliveryState::Released(_) => SettleOutcome::Requeue,
+        DeliveryState::Modified(m) => {
+            if m.delivery_failed.unwrap_or(false) {
+                SettleOutcome::RequeueFailed
+            } else {
+                SettleOutcome::Requeue
+            }
+        }
+        DeliveryState::Rejected(_) => SettleOutcome::Drop,
+        // Non-terminal or unknown states shouldn't complete a settlement;
+        // requeue is the safe default (at-least-once).
+        _ => SettleOutcome::Requeue,
     }
 }
 

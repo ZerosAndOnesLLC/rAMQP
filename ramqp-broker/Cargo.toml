@@ -12,6 +12,7 @@ categories = ["network-programming", "asynchronous"]
 [dependencies]
 ramqp-core = { path = "../ramqp-core", version = "0.2.0" }
 bytes = "1"
+futures-util = "0.3"
 tokio = { version = "1", features = ["sync", "io-util", "net", "rt", "macros", "time"] }
 tracing = "0.1"
 

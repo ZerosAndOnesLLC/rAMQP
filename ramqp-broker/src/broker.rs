@@ -13,12 +13,14 @@ use ramqp_core::transport::IoStream;
 use crate::auth::{AllowAll, Authenticator};
 use crate::config::BrokerConfig;
 use crate::connection;
+use crate::registry::QueueRegistry;
 
 /// A broker instance under construction.
 #[derive(Clone)]
 pub struct Broker {
     config: Arc<BrokerConfig>,
     auth: Arc<dyn Authenticator>,
+    registry: Arc<QueueRegistry>,
 }
 
 impl std::fmt::Debug for Broker {
@@ -33,9 +35,11 @@ impl Broker {
     /// Create a broker with the given configuration (and [`AllowAll`] auth —
     /// swap it with [`Broker::with_authenticator`] for anything real).
     pub fn new(config: BrokerConfig) -> Self {
+        let registry = Arc::new(QueueRegistry::new(config.max_queue_depth));
         Broker {
             config: Arc::new(config),
             auth: Arc::new(AllowAll),
+            registry,
         }
     }
 
@@ -69,7 +73,10 @@ impl Broker {
     ) -> tokio::task::JoinHandle<Result<(), ConnectError>> {
         let config = self.config.clone();
         let auth = self.auth.clone();
-        tokio::spawn(async move { connection::serve(stream, config, auth, shutdown).await })
+        let registry = self.registry.clone();
+        tokio::spawn(
+            async move { connection::serve(stream, config, auth, registry, shutdown).await },
+        )
     }
 }
 
@@ -127,9 +134,10 @@ impl BoundBroker {
     fn spawn_connection(&self, stream: TcpStream, peer: SocketAddr) {
         let config = self.broker.config.clone();
         let auth = self.broker.auth.clone();
+        let registry = self.broker.registry.clone();
         let shutdown = self.shutdown_rx.clone();
         tokio::spawn(async move {
-            match connection::serve(stream, config, auth, shutdown).await {
+            match connection::serve(stream, config, auth, registry, shutdown).await {
                 Ok(()) => tracing::debug!(%peer, "connection closed"),
                 Err(e) => tracing::debug!(%peer, error = %e, "connection failed"),
             }
