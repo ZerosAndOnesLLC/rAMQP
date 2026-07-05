@@ -8,6 +8,7 @@
 //! (the TCP inter-node transport is the next slice; the router also serves
 //! multi-node tests without sockets).
 
+pub mod bootstrap;
 pub mod meta;
 pub mod network;
 pub mod store;
