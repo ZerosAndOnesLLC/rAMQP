@@ -6,7 +6,10 @@ shared `ramqp-core`, then adding a server crate on top. Clean-room, no external
 AMQP dependencies (same constraint as the client). Clustered from v1; single
 protocol, done excellently; **fast and light before anything else**.
 
-> Status: planning. Nothing in this file has been built yet. Code is untouched.
+> **Status: building — Phases 0–4 complete, Phase 5 nearly complete** (see §11
+> checkboxes). The broker runs, the unmodified `ramqp` client produces/consumes
+> against it, first benchmark numbers vs live RabbitMQ 4.3.1 and Artemis are in
+> `bench-compare/README.md`, and a 3-node Raft metadata cluster forms over TCP.
 > This v2 supersedes the original single-node plan after the scope decisions in §2.
 
 ---
