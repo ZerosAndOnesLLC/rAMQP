@@ -110,3 +110,40 @@ RabbitMQ); `wscompare` sidesteps it with one long-lived connection.
 
 Numbers are from a single-node RabbitMQ on WSL2 and are sensitive to broker
 credit/prefetch dynamics; treat them as directional. Re-run on your own broker.
+
+## First broker numbers — ramqp-broker Phase 4 (2026-07-05)
+
+The `latency` bin (broker.md §3.4 harness): closed-loop e2e latency
+(produce-settled → consume → accept, one in flight, 5000 samples), then a
+50k-message blast-and-drain for throughput. Same machine, same harness, same
+`ramqp` client stack on both legs for every target; 256 B payloads.
+
+| 256 B, defaults | **ramqp-broker** | RabbitMQ 4.3.1 | Artemis (JVM) |
+|---|---|---|---|
+| p50 latency        | **89 µs**   | 251 µs | 227 µs |
+| p90                | **123 µs**  | 323 µs | 326 µs |
+| p99                | **213 µs**  | 519 µs | 576 µs |
+| p99.9              | **428 µs**  | 777 µs | 833 µs |
+| max                | **683 µs**  | 2119 µs | 1299 µs |
+| blast throughput   | **326k msg/s** | 48k msg/s | 79k msg/s |
+| broker memory      | ~40 MiB¹    | 133 MiB² | 715 MiB² |
+
+¹ whole-process RSS *including* the client and harness (in-process broker).
+² `docker stats` container memory, idle-adjacent.
+
+**Read honestly:** first smoke numbers, not a rigorous claim. Incumbents run
+untuned defaults in docker (loopback + docker NAT hop) vs our in-process
+loopback; single queue, single connection, WSL2; RabbitMQ used a durable
+classic queue (4.x forbids transient non-exclusive by default) though
+messages were non-persistent. The tuned, isolated, multi-load comparison is
+the standing §3.4 deliverable. What these numbers do establish: the
+architecture is in the right latency class from day one — every percentile
+2–3× below both incumbents and 4–6× their throughput on identical hardware.
+
+Run it yourself:
+
+```sh
+cargo run -p ramqp-bench-compare --release --bin latency                  # ours, in-process
+LAT_URL=amqp://guest:guest@localhost:5672 LAT_ADDRESS=/queues/bench-lat \
+    cargo run -p ramqp-bench-compare --release --bin latency              # any broker
+```

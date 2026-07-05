@@ -1,0 +1,311 @@
+//! Phase 4 end-to-end tests: the unmodified `ramqp` client produces to and
+//! consumes from this broker's transient queues over loopback TCP —
+//! store-and-forward, live dispatch, competing consumers, and
+//! settlement-driven requeue.
+
+use ramqp::types::messaging::DeliveryState;
+use ramqp::{ConnectionBuilder, Message};
+use ramqp_broker::{Broker, BrokerConfig};
+
+async fn start() -> (std::net::SocketAddr, ramqp_broker::ShutdownHandle) {
+    let bound = Broker::new(BrokerConfig::default())
+        .bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = bound.local_addr();
+    let shutdown = bound.shutdown_handle();
+    tokio::spawn(bound.run());
+    (addr, shutdown)
+}
+
+async fn connect(addr: std::net::SocketAddr) -> ramqp::Connection {
+    ConnectionBuilder::new(format!("amqp://{addr}"))
+        .connect()
+        .await
+        .expect("connect")
+}
+
+fn text_of(delivery: &ramqp::Delivery) -> String {
+    use ramqp::codec::Value;
+    use ramqp::types::messaging::Body;
+    let msg = delivery.message().expect("decodable message");
+    match msg.body {
+        Body::Value(Value::String(s)) => s,
+        other => panic!("expected text body, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn store_and_forward_produce_then_consume() {
+    let (addr, shutdown) = start().await;
+    let conn = connect(addr).await;
+    let session = conn.begin_session().await.expect("session");
+
+    // Produce 10 messages BEFORE any consumer exists; each send's outcome is
+    // the broker's accepted disposition.
+    let producer = session
+        .create_producer("/queues/saf")
+        .await
+        .expect("producer");
+    for i in 0..10 {
+        let outcome = producer
+            .send(Message::text(format!("m{i}")))
+            .await
+            .expect("send");
+        assert!(
+            matches!(outcome, DeliveryState::Accepted(_)),
+            "broker must accept the publish, got {outcome:?}"
+        );
+    }
+
+    // Then consume them all, in order.
+    let mut consumer = session
+        .create_consumer("/queues/saf")
+        .await
+        .expect("consumer");
+    for i in 0..10 {
+        let delivery = consumer.recv().await.expect("delivery");
+        assert_eq!(text_of(&delivery), format!("m{i}"));
+        consumer.accept(&delivery).await.expect("accept");
+    }
+
+    conn.close().await.expect("close");
+    shutdown.shutdown();
+}
+
+#[tokio::test]
+async fn live_dispatch_consumer_first() {
+    let (addr, shutdown) = start().await;
+    let conn = connect(addr).await;
+    let session = conn.begin_session().await.expect("session");
+
+    let mut consumer = session
+        .create_consumer("/queues/live")
+        .await
+        .expect("consumer");
+    let producer = session
+        .create_producer("/queues/live")
+        .await
+        .expect("producer");
+
+    producer
+        .send(Message::text("hot path"))
+        .await
+        .expect("send");
+    let delivery = consumer.recv().await.expect("delivery");
+    assert_eq!(text_of(&delivery), "hot path");
+    consumer.accept(&delivery).await.expect("accept");
+
+    conn.close().await.expect("close");
+    shutdown.shutdown();
+}
+
+#[tokio::test]
+async fn fire_and_forget_settled_sends_arrive() {
+    let (addr, shutdown) = start().await;
+    let conn = connect(addr).await;
+    let session = conn.begin_session().await.expect("session");
+
+    let producer = session
+        .create_producer("/queues/ff")
+        .await
+        .expect("producer");
+    for i in 0..5 {
+        producer
+            .send_settled(Message::text(format!("f{i}")))
+            .await
+            .expect("send_settled");
+    }
+
+    let mut consumer = session
+        .create_consumer("/queues/ff")
+        .await
+        .expect("consumer");
+    for i in 0..5 {
+        let delivery = consumer.recv().await.expect("delivery");
+        assert_eq!(text_of(&delivery), format!("f{i}"));
+        consumer.accept(&delivery).await.expect("accept");
+    }
+
+    conn.close().await.expect("close");
+    shutdown.shutdown();
+}
+
+#[tokio::test]
+async fn competing_consumers_share_the_queue() {
+    let (addr, shutdown) = start().await;
+    let conn = connect(addr).await;
+    let session = conn.begin_session().await.expect("session");
+
+    let mut c1 = session.create_consumer("/queues/comp").await.expect("c1");
+    let mut c2 = session.create_consumer("/queues/comp").await.expect("c2");
+    let producer = session
+        .create_producer("/queues/comp")
+        .await
+        .expect("producer");
+
+    for i in 0..10 {
+        producer
+            .send(Message::text(format!("c{i}")))
+            .await
+            .expect("send");
+    }
+
+    // Round-robin between two consumers with equal demand: each gets 5.
+    let mut got1 = Vec::new();
+    let mut got2 = Vec::new();
+    for _ in 0..5 {
+        let d1 = c1.recv().await.expect("c1 delivery");
+        got1.push(text_of(&d1));
+        c1.accept(&d1).await.expect("accept");
+        let d2 = c2.recv().await.expect("c2 delivery");
+        got2.push(text_of(&d2));
+        c2.accept(&d2).await.expect("accept");
+    }
+    // All ten messages arrived exactly once across the two.
+    let mut all: Vec<String> = got1.into_iter().chain(got2).collect();
+    all.sort();
+    let expected: Vec<String> = (0..10).map(|i| format!("c{i}")).collect();
+    let mut expected = expected;
+    expected.sort();
+    assert_eq!(all, expected);
+
+    conn.close().await.expect("close");
+    shutdown.shutdown();
+}
+
+#[tokio::test]
+async fn released_delivery_is_redelivered() {
+    let (addr, shutdown) = start().await;
+    let conn = connect(addr).await;
+    let session = conn.begin_session().await.expect("session");
+
+    let producer = session
+        .create_producer("/queues/rel")
+        .await
+        .expect("producer");
+    producer.send(Message::text("try me")).await.expect("send");
+
+    let mut consumer = session
+        .create_consumer("/queues/rel")
+        .await
+        .expect("consumer");
+    let first = consumer.recv().await.expect("first delivery");
+    assert_eq!(text_of(&first), "try me");
+    // Decline to process it: released → back on the queue.
+    consumer.release(&first).await.expect("release");
+
+    // The same message comes around again.
+    let second = consumer.recv().await.expect("redelivery");
+    assert_eq!(text_of(&second), "try me");
+    consumer.accept(&second).await.expect("accept");
+
+    conn.close().await.expect("close");
+    shutdown.shutdown();
+}
+
+#[tokio::test]
+async fn consumer_drop_requeues_unacked_for_the_next_consumer() {
+    let (addr, shutdown) = start().await;
+    let conn = connect(addr).await;
+    let session = conn.begin_session().await.expect("session");
+
+    let producer = session
+        .create_producer("/queues/orphan")
+        .await
+        .expect("producer");
+    producer
+        .send(Message::text("orphaned"))
+        .await
+        .expect("send");
+
+    // First consumer receives but never settles, then detaches.
+    let mut c1 = session.create_consumer("/queues/orphan").await.expect("c1");
+    let d = c1.recv().await.expect("delivery");
+    assert_eq!(text_of(&d), "orphaned");
+    c1.detach().await.expect("detach without settling");
+
+    // A new consumer gets the requeued message.
+    let mut c2 = session.create_consumer("/queues/orphan").await.expect("c2");
+    let d = c2.recv().await.expect("redelivery");
+    assert_eq!(text_of(&d), "orphaned");
+    c2.accept(&d).await.expect("accept");
+
+    conn.close().await.expect("close");
+    shutdown.shutdown();
+}
+
+#[tokio::test]
+async fn cross_connection_produce_consume() {
+    let (addr, shutdown) = start().await;
+
+    // Producer and consumer on separate connections (separate driver tasks).
+    let pc = connect(addr).await;
+    let cc = connect(addr).await;
+    let ps = pc.begin_session().await.expect("producer session");
+    let cs = cc.begin_session().await.expect("consumer session");
+
+    let producer = ps.create_producer("/queues/x").await.expect("producer");
+    let mut consumer = cs.create_consumer("/queues/x").await.expect("consumer");
+
+    for i in 0..20 {
+        producer
+            .send(Message::text(format!("x{i}")))
+            .await
+            .expect("send");
+    }
+    for i in 0..20 {
+        let d = consumer.recv().await.expect("delivery");
+        assert_eq!(text_of(&d), format!("x{i}"));
+        consumer.accept(&d).await.expect("accept");
+    }
+
+    pc.close().await.expect("close producer conn");
+    cc.close().await.expect("close consumer conn");
+    shutdown.shutdown();
+}
+
+#[tokio::test]
+async fn queue_overflow_rejects_the_publish() {
+    let config = BrokerConfig {
+        max_queue_depth: 3,
+        ..Default::default()
+    };
+    let bound = Broker::new(config).bind("127.0.0.1:0").await.expect("bind");
+    let addr = bound.local_addr();
+    let shutdown = bound.shutdown_handle();
+    tokio::spawn(bound.run());
+
+    let conn = connect(addr).await;
+    let session = conn.begin_session().await.expect("session");
+    let producer = session
+        .create_producer("/queues/tiny")
+        .await
+        .expect("producer");
+
+    for i in 0..3 {
+        producer
+            .send(Message::text(format!("fits{i}")))
+            .await
+            .expect("fits");
+    }
+    // The fourth overflows: the broker answers `rejected` (the terminal
+    // outcome of the send) rather than growing unbounded.
+    let outcome = producer
+        .send(Message::text("overflow"))
+        .await
+        .expect("send completes with a terminal outcome");
+    match outcome {
+        DeliveryState::Rejected(r) => {
+            let err = r.error.expect("carries the broker's error");
+            assert!(
+                err.to_string().contains("resource-limit-exceeded"),
+                "unexpected rejection error: {err}"
+            );
+        }
+        other => panic!("expected rejected, got {other:?}"),
+    }
+
+    conn.close().await.expect("close");
+    shutdown.shutdown();
+}

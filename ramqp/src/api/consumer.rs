@@ -1,0 +1,289 @@
+//! The [`Consumer`] handle (WP-5.5): receive and settle deliveries.
+
+use futures_core::Stream;
+use tokio::sync::{mpsc, oneshot};
+
+use crate::api::lifecycle::detach_on_drop;
+use crate::error::{ErrorKind, LinkError, RecvError, RemoteError};
+use crate::ids::{ChannelId, DeliveryId, Handle};
+use crate::link::Delivery;
+use crate::proto::{DriverCommand, LinkEvent};
+use crate::types::definitions::Error as AmqpError;
+use crate::types::messaging::{Accepted, DeliveryState, Modified, Outcome, Rejected, Released};
+
+/// A handle for receiving and settling deliveries on a receiver link.
+#[derive(Debug)]
+pub struct Consumer {
+    commands: mpsc::Sender<DriverCommand>,
+    channel: ChannelId,
+    handle: Handle,
+    events: mpsc::Receiver<LinkEvent>,
+    /// Target outstanding credit for auto mode (0 = manual; no auto-replenish).
+    credit_window: u32,
+    /// Replenish once this many deliveries have been consumed since the last top-up.
+    replenish_every: u32,
+    consumed: u32,
+    /// Oldest delivery id received but not yet settled, used as the lower bound
+    /// of a ranged [`accept_through`](Consumer::accept_through).
+    pending_first: Option<DeliveryId>,
+}
+
+impl Consumer {
+    pub(crate) fn new(
+        commands: mpsc::Sender<DriverCommand>,
+        channel: ChannelId,
+        handle: Handle,
+        events: mpsc::Receiver<LinkEvent>,
+        credit_window: u32,
+        low_water: u32,
+    ) -> Self {
+        Consumer {
+            commands,
+            channel,
+            handle,
+            events,
+            credit_window,
+            replenish_every: credit_window.saturating_sub(low_water).max(1),
+            consumed: 0,
+            pending_first: None,
+        }
+    }
+
+    /// The link handle.
+    pub fn handle(&self) -> Handle {
+        self.handle
+    }
+
+    /// Await the next delivery.
+    ///
+    /// Credit is **consumer-driven**: in auto mode the link is granted
+    /// `credit_window` credit and topped back up as deliveries are consumed, so
+    /// the broker can never push more than this handle can buffer (preventing a
+    /// slow consumer from back-pressuring its whole connection). In manual mode
+    /// call [`credit`](Consumer::credit) yourself.
+    ///
+    /// # Examples
+    /// ```no_run
+    /// # async fn ex(consumer: &mut ramqp::Consumer) -> Result<(), Box<dyn std::error::Error>> {
+    /// loop {
+    ///     let delivery = consumer.recv().await?;
+    ///     match delivery.message() {
+    ///         Ok(msg) => {
+    ///             println!("got {msg:?}");
+    ///             consumer.accept(&delivery).await?;   // settle: done with it
+    ///         }
+    ///         Err(_) => consumer.reject(&delivery, None).await?, // can't parse → reject
+    ///     }
+    /// }
+    /// # }
+    /// ```
+    pub async fn recv(&mut self) -> Result<Delivery, RecvError> {
+        loop {
+            match self.events.recv().await {
+                Some(LinkEvent::Delivery(d)) => {
+                    let delivery =
+                        Delivery::new(d.delivery_id, d.delivery_tag, d.settled, d.message)
+                            .with_state(d.state);
+                    if self.pending_first.is_none() {
+                        self.pending_first = Some(delivery.delivery_id);
+                    }
+                    self.after_consume().await;
+                    return Ok(delivery);
+                }
+                Some(LinkEvent::Detached { error, .. }) => {
+                    return Err(detached_error(error));
+                }
+                // Credit / disposition events are not relevant to a consumer's recv.
+                Some(_) => continue,
+                None => return Err(RecvError::msg(ErrorKind::Detached, "link closed")),
+            }
+        }
+    }
+
+    /// Top up auto-credit as the application drains deliveries.
+    ///
+    /// Grants are *additive* (exactly what was consumed), so outstanding credit
+    /// stays ≈ `credit_window` and the broker can never put more in flight than
+    /// the delivery channel can hold.
+    async fn after_consume(&mut self) {
+        if self.credit_window == 0 {
+            return; // manual credit mode
+        }
+        self.consumed += 1;
+        if self.consumed >= self.replenish_every {
+            let grant = self.consumed;
+            self.consumed = 0;
+            let _ = self
+                .commands
+                .send(DriverCommand::GrantCredit {
+                    channel: self.channel,
+                    handle: self.handle,
+                    credit: grant,
+                })
+                .await;
+        }
+    }
+
+    /// Accept a delivery (settles it).
+    ///
+    /// The disposition is *dispatched* to the connection driver, not confirmed
+    /// by the broker: for a settled disposition the receiver is locally
+    /// authoritative, so this returns as soon as the frame is queued (awaiting
+    /// only backpressure / connection liveness). This is what lets a
+    /// `recv → accept` loop pipeline. The same applies to
+    /// [`reject`](Self::reject), [`release`](Self::release),
+    /// [`modify`](Self::modify), and [`settle`](Self::settle). Under
+    /// `ReceiverSettleMode::Second` the final settle still completes when the
+    /// sender confirms (as before — the previous reply never waited for that
+    /// either).
+    pub async fn accept(&self, delivery: &Delivery) -> Result<(), RecvError> {
+        self.dispose(delivery, DeliveryState::Accepted(Accepted::default()))
+            .await
+    }
+
+    /// Accept every delivery from the oldest not-yet-settled one *through*
+    /// `delivery`, in a single ranged disposition frame.
+    ///
+    /// This collapses N per-message dispositions into one `first..last` frame —
+    /// the cheapest way to acknowledge a batch, both in syscalls and in wire
+    /// bytes. Intended for in-order bulk acknowledgement: drive a `recv` loop
+    /// and call `accept_through` on the most recent delivery every so often (or
+    /// at the end of a batch). The receiver applies the outcome only to
+    /// deliveries still unsettled within the range, so a delivery already
+    /// settled individually is left untouched — but do not rely on interleaving
+    /// per-delivery [`reject`](Self::reject) inside a range you then
+    /// `accept_through`, as the broker's handling of a re-referenced settled id
+    /// is undefined.
+    pub async fn accept_through(&mut self, delivery: &Delivery) -> Result<(), RecvError> {
+        let first = self.pending_first.take().unwrap_or(delivery.delivery_id);
+        self.dispose_range(
+            first,
+            Some(delivery.delivery_id),
+            DeliveryState::Accepted(Accepted::default()),
+        )
+        .await
+    }
+
+    /// Reject a delivery with an optional error.
+    pub async fn reject(
+        &self,
+        delivery: &Delivery,
+        error: Option<AmqpError>,
+    ) -> Result<(), RecvError> {
+        self.dispose(delivery, DeliveryState::Rejected(Rejected { error }))
+            .await
+    }
+
+    /// Release a delivery back to the sender.
+    pub async fn release(&self, delivery: &Delivery) -> Result<(), RecvError> {
+        self.dispose(delivery, DeliveryState::Released(Released::default()))
+            .await
+    }
+
+    /// Modify a delivery (with disposition hints).
+    pub async fn modify(&self, delivery: &Delivery, modified: Modified) -> Result<(), RecvError> {
+        self.dispose(delivery, DeliveryState::Modified(modified))
+            .await
+    }
+
+    /// Settle a delivery with an arbitrary terminal [`Outcome`].
+    pub async fn settle(&self, delivery: &Delivery, outcome: Outcome) -> Result<(), RecvError> {
+        self.dispose(delivery, DeliveryState::from(outcome)).await
+    }
+
+    async fn dispose(&self, delivery: &Delivery, state: DeliveryState) -> Result<(), RecvError> {
+        self.dispose_range(delivery.delivery_id, None, state).await
+    }
+
+    /// Dispatch a (possibly ranged) settled disposition **without** awaiting a
+    /// driver round-trip.
+    ///
+    /// For a `settled` disposition the receiver is locally authoritative, so the
+    /// old per-message `oneshot` reply only confirmed that the frame had been
+    /// queued — never a broker acknowledgement. Dropping it lets the
+    /// `recv → settle` loop pipeline instead of stalling on an actor round-trip
+    /// per message (the dominant cost measured in issue #3). The command send is
+    /// still `await`ed, so backpressure and a closed connection are surfaced at
+    /// the call site; only the redundant post-send confirmation is gone.
+    async fn dispose_range(
+        &self,
+        first: DeliveryId,
+        last: Option<DeliveryId>,
+        state: DeliveryState,
+    ) -> Result<(), RecvError> {
+        self.commands
+            .send(DriverCommand::SendDisposition {
+                channel: self.channel,
+                handle: self.handle,
+                first,
+                last,
+                state,
+                settled: true,
+                reply: None,
+            })
+            .await
+            .map_err(|_| RecvError::msg(ErrorKind::NotConnected, "connection closed"))
+    }
+
+    /// Grant additional link credit (manual credit mode).
+    pub async fn credit(&self, credit: u32) -> Result<(), RecvError> {
+        let flow = crate::types::performatives::Flow {
+            handle: Some(self.handle.value()),
+            link_credit: Some(credit),
+            drain: false,
+            ..Default::default()
+        };
+        self.commands
+            .send(DriverCommand::SendFlow {
+                channel: self.channel,
+                flow: Box::new(flow),
+            })
+            .await
+            .map_err(|_| RecvError::msg(ErrorKind::NotConnected, "connection closed"))
+    }
+
+    /// Detach the link and await completion.
+    pub async fn detach(mut self) -> Result<(), LinkError> {
+        let (tx, rx) = oneshot::channel();
+        let commands = self.commands.clone();
+        let handle = std::mem::replace(&mut self.handle, Handle(u32::MAX));
+        commands
+            .send(DriverCommand::DetachLink {
+                channel: self.channel,
+                handle,
+                closed: true,
+                error: None,
+                reply: tx,
+            })
+            .await
+            .map_err(|_| LinkError::msg(ErrorKind::NotConnected, "connection closed"))?;
+        rx.await
+            .map_err(|_| LinkError::msg(ErrorKind::Cancelled, "driver dropped"))?
+    }
+
+    /// Convert into a [`Stream`] of deliveries (ends when the link detaches).
+    pub fn into_stream(self) -> impl Stream<Item = Result<Delivery, RecvError>> {
+        futures_util::stream::unfold(self, |mut consumer| async move {
+            match consumer.recv().await {
+                Ok(delivery) => Some((Ok(delivery), consumer)),
+                Err(e) if e.kind() == ErrorKind::Detached => None,
+                Err(e) => Some((Err(e), consumer)),
+            }
+        })
+    }
+}
+
+fn detached_error(error: Option<AmqpError>) -> RecvError {
+    match error {
+        Some(e) => RecvError::from_remote(ErrorKind::Detached, RemoteError::new(e)),
+        None => RecvError::msg(ErrorKind::Detached, "link detached"),
+    }
+}
+
+impl Drop for Consumer {
+    fn drop(&mut self) {
+        if self.handle != Handle(u32::MAX) {
+            detach_on_drop(&self.commands, self.channel, self.handle);
+        }
+    }
+}

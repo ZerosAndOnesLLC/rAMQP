@@ -16,8 +16,9 @@ target
 # Contains mutation testing data
 **/mutants.out*/
 
-# Test broker TLS material (generated locally by tests/docker/gen-certs.sh)
-tests/docker/certs/
+# Test broker TLS material (generated locally by ramqp/tests/docker/gen-certs.sh)
+# Location-robust so it keeps matching after the client moved under ramqp/.
+**/tests/docker/certs/
 
 # RustRover
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
