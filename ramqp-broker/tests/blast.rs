@@ -6,8 +6,20 @@
 use ramqp::{ConnectionBuilder, Message};
 use ramqp_broker::{Broker, BrokerConfig};
 
+/// The same sustained-load shape against a QUORUM queue: every publish is a
+/// Raft commit, so this also guards the quorum actor's await patterns
+/// (mailbox-bounded publishes must backpressure producers without deadlock).
+#[tokio::test]
+async fn quorum_blast_with_ranged_accepts() {
+    blast("/quorum/blast", 5000).await;
+}
+
 #[tokio::test]
 async fn settled_blast_with_ranged_accepts() {
+    blast("/queues/blast", 50000).await;
+}
+
+async fn blast(address: &str, n: usize) {
     let bound = Broker::new(BrokerConfig::default())
         .bind("127.0.0.1:0")
         .await
@@ -20,23 +32,22 @@ async fn settled_blast_with_ranged_accepts() {
         .await
         .expect("connect");
     let session = conn.begin_session().await.expect("session");
-    let producer = session.create_producer("/queues/blast").await.expect("p");
-    let mut consumer = session.create_consumer("/queues/blast").await.expect("c");
+    let producer = session.create_producer(address).await.expect("p");
+    let mut consumer = session.create_consumer(address).await.expect("c");
 
-    const N: usize = 50000;
-    for _ in 0..N {
+    for _ in 0..n {
         producer
             .send_settled(Message::data(vec![0u8; 256]))
             .await
             .expect("send");
     }
     let mut last = None;
-    for i in 1..=N {
+    for i in 1..=n {
         let d = tokio::time::timeout(std::time::Duration::from_secs(20), consumer.recv())
             .await
             .unwrap_or_else(|_| panic!("recv #{i} timed out (stall regression)"))
             .expect("recv");
-        if i == N {
+        if i == n {
             last = Some(d);
         } else if i % 64 == 0 {
             consumer.accept_through(&d).await.expect("accept_through");
