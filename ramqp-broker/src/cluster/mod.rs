@@ -11,6 +11,7 @@
 pub mod meta;
 pub mod network;
 pub mod store;
+pub mod tcp;
 
 use std::io::Cursor;
 

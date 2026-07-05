@@ -475,7 +475,7 @@ link/session → negotiate/mux/heartbeat → txn/sasl splits.
 ### Phase 5 — Cluster foundation (in progress — foundation slice ✅)
 - [x] `openraft` 0.9.24 integration: `MetaTypeConfig` (declare_raft_types), in-memory `RaftStorage` (log/vote/snapshot/apply via the Adaptor), and an in-process `Router` network — the seam where the TCP inter-node transport slots in next. (Multi-raft manager comes with per-queue groups in Phase 6.)
 - [x] **Metadata Raft group**: replicated queue catalog (`MetaCommand::Create/DeleteQueue`, `QueueSpec{quorum|transient, replicas}`, idempotent apply); membership via openraft (add_learner/change_membership).
-- [ ] Cluster formation/bootstrap over **TCP** (static seeds; the router network is in-process only today) + wire queue declaration through the metadata group.
+- [x] **TCP inter-node transport** (`cluster::tcp`): length-prefixed serde_json RPC (JSON control plane — the binary codec + connection sharing arrive with the Phase 6 multi-raft manager), lazily-reconnecting per-peer clients, `serve_raft` acceptor; 3-node cluster forms and replicates over real sockets. Still open: static-seed bootstrap helper + wiring queue declaration through the metadata group (lands with Phase 6 quorum queues, where the catalog gains a consumer).
 - [x] Tests: single-node group applies/deletes; **3-node cluster forms, catalog replicates to every node; leader kill → re-election → post-failover writes converge on survivors**; learner joins and catches up. (Node-*restart* durability needs the on-disk log — Phase 7.) Bench unchanged: the cluster layer is not yet on any message path.
 
 ### Phase 6 — Quorum queues
