@@ -911,6 +911,23 @@ impl Session {
                 }
                 self.flush_sender(local, transport, max_frame_size);
             }
+        } else {
+            // A pure session flow (no handle) reopens the session window: any
+            // sender stalled on remote-incoming-window exhaustion must resume,
+            // or messages sit in its outbox until an unrelated flush happens
+            // to run (a peer whose sends are dispatch-driven — a broker —
+            // would stall permanently at exactly `incoming-window` transfers).
+            let stalled: Vec<u32> = self
+                .links
+                .iter()
+                .filter_map(|(&h, l)| match l {
+                    Link::Sender(s) if !s.outbox.is_empty() => Some(h),
+                    _ => None,
+                })
+                .collect();
+            for handle in stalled {
+                self.flush_sender(handle, transport, max_frame_size);
+            }
         }
 
         // Respond to an echo request with our current flow state.
@@ -1323,6 +1340,84 @@ mod tests {
                 assert_eq!(payload.as_deref(), Some(&b"queued message"[..]));
             }
             other => panic!("expected transfer, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn session_flow_without_handle_resumes_stalled_senders() {
+        // Peer advertises a 2-transfer incoming window; we have credit for 3.
+        let begin = Begin {
+            incoming_window: 2,
+            ..peer_begin()
+        };
+        let (mut session, _resp, _evt, mut transport, mut far) = server_session(&begin);
+        let (link_tx, _link_rx) = mpsc::channel(16);
+        let attach = Attach {
+            name: "down".into(),
+            handle: 9,
+            role: Role::Receiver,
+            ..Default::default()
+        };
+        let accepted = session
+            .accept_peer_attach(attach, CreditMode::Manual, 0, None, link_tx, &mut transport)
+            .expect("accepted");
+        // Grant link credit 3 via a handle flow.
+        session.on_flow(
+            Flow {
+                next_incoming_id: Some(0),
+                incoming_window: 2,
+                next_outgoing_id: 0,
+                outgoing_window: 100,
+                handle: Some(9),
+                link_credit: Some(3),
+                delivery_count: Some(0),
+                ..Default::default()
+            },
+            &mut transport,
+            1 << 16,
+        );
+        for _ in 0..3 {
+            session.send_transfer(
+                accepted.handle.0,
+                Bytes::from_static(b"m"),
+                true,
+                0,
+                None,
+                None,
+                &mut transport,
+                1 << 16,
+            );
+        }
+        transport.flush().await.unwrap();
+        // Attach response + exactly 2 transfers (window-limited); the third is
+        // stalled in the outbox.
+        let mut transfers = 0;
+        for _ in 0..3 {
+            match far.read_frame().await.unwrap().body {
+                FrameBody::Amqp(Performative::Transfer(_), _) => transfers += 1,
+                FrameBody::Amqp(Performative::Attach(_), _) => {}
+                other => panic!("unexpected frame {other:?}"),
+            }
+        }
+        assert_eq!(transfers, 2, "third transfer must be window-stalled");
+
+        // A pure SESSION flow (no handle) reopens the window: the stalled
+        // transfer must flush without any link-level flow or new send.
+        session.on_flow(
+            Flow {
+                next_incoming_id: Some(2),
+                incoming_window: 100,
+                next_outgoing_id: 0,
+                outgoing_window: 100,
+                ..Default::default()
+            },
+            &mut transport,
+            1 << 16,
+        );
+        transport.flush().await.unwrap();
+        match far.read_frame().await.unwrap().body {
+            FrameBody::Amqp(Performative::Transfer(_), _) => {}
+            other => panic!("expected the stalled transfer, got {other:?}"),
         }
     }
 

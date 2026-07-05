@@ -13,8 +13,10 @@ description = "Comparison benchmark harness: ramqp vs fe2o3-amqp against a live 
 
 [dependencies]
 ramqp = { path = "../ramqp" }
+ramqp-broker = { path = "../ramqp-broker" }
 fe2o3-amqp = "0.15"
 tokio = { version = "1", features = ["full"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [[bin]]
 name = "rig"
@@ -27,3 +29,7 @@ path = "src/bin/bench.rs"
 [[bin]]
 name = "confirm"
 path = "src/bin/confirm.rs"
+
+[[bin]]
+name = "latency"
+path = "src/bin/latency.rs"

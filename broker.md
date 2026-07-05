@@ -463,13 +463,14 @@ link/session → negotiate/mux/heartbeat → txn/sasl splits.
 - [x] Broker connection driver: biased select loop (reads → link/session event drains → heartbeat → shutdown), inbound routing into core `Session` via `accept_peer_begin`/`accept_peer_attach`/`handle_link_frame`; duplicate-open/unknown-channel/SASL-after-open → connection errors; rejected attach → session end with `resource-limit-exceeded`. **Decision (was open): standalone broker driver, not a shared core `Connection` engine** — revisit only if Phase 4+ duplication proves costly.
 - [x] **Smoke test green:** the unmodified `ramqp` client over loopback TCP — ANONYMOUS + PLAIN (good/bad/unoffered credentials), begin/attach producer+consumer, session end/reopen, graceful close, 16 concurrent connections.
 
-### Phase 4 — Single-node MVP (transient queues) + establish the benchmark
-- [ ] Address→node resolution + in-memory **transient** queues; queue-type in the declaration model.
-- [ ] Producer path: peer sender → `ReceiverLink` → enqueue, emit dispositions. Zero-copy, zero steady-state alloc (§3.1).
-- [ ] Consumer path: peer receiver → `SenderLink` → dispatch w/ credit + windows.
-- [ ] Settlement → ack/requeue; competing consumers.
-- [ ] **Stand up the §3.4 latency/RSS harness; pin the real Phase-4 targets vs tuned Artemis/RabbitMQ; wire the CI regression guard.** This is a first-class deliverable of this phase.
-- [ ] End-to-end: client `produce_consume` example runs against our broker; **first published numbers**. Commit.
+### Phase 4 — Single-node MVP (transient queues) + establish the benchmark ✅
+- [x] Address→queue resolution (`/queues/<name>` + bare names, auto-declare) + in-memory transient queues: **one owning actor task per queue** (lock-free; deliberately the shape the Phase-6 Raft state machine needs — Publish/Settle are the future log commands). Bounded depth: overflow → `rejected` (resource-limit-exceeded).
+- [x] Producer path: peer sender → `ReceiverLink` → handle-attributed delivery events → queue Publish (bounded mailbox back-pressures the producer) → disposition acks; batched credit replenishment. Bodies stay `Bytes` end-to-end (refcount only).
+- [x] Consumer path: peer receiver → `SenderLink` → queue Subscribe; peer flow credit → queue demand; round-robin dispatch via per-connection command channel → `send_transfer` (credit + windows enforced by core).
+- [x] Settlement: per-dispatch outcome futures → accepted→ack, released→requeue, modified→requeue(+failure count), rejected→drop; settle-owner verification; unsubscribe/detach/teardown requeue unacked. Competing consumers round-robin.
+- [x] **Two systemic bugs found & fixed under load:** (1) queue⇄connection bounded-channel deadlock — resolved by channel orientation (queue→conn unbounded-but-credit-bounded; conn→queue bounded for producer backpressure; wait-for graph now acyclic); (2) **core bug:** a pure session flow (no handle) never re-flushed window-stalled senders — any dispatch-driven peer stalled at exactly `incoming-window` transfers. Fixed in core + regression tests (core unit + 50k blast).
+- [x] §3.4 harness stood up (`bench-compare/latency`: closed-loop p50/p90/p99/p99.9 + blast throughput + RSS, in-process or any URL) and **first numbers recorded vs live RabbitMQ 4.3.1 and Artemis on this machine** (untuned defaults; see bench-compare/README): **p50 89µs vs 251/227µs, p99.9 428µs vs 777/833µs, 326k msg/s vs 48k/79k, ~40MiB vs 133/715MiB.** Deferred: tuned-incumbent isolated runs; CI regression-guard wiring (needs a perf-stable runner — harness is the tooling).
+- [x] End-to-end: client `produce_consume` example (now env-configurable) runs against `ramqp-brokerd` (new daemon bin); 8 e2e integration tests + blast regression. Commit.
 
 ### Phase 5 — Cluster foundation
 - [ ] `openraft` integration + **multi-raft manager** (shared transport/tick/storage, batched — §3.2/§8).

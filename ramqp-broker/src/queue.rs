@@ -9,6 +9,18 @@
 //!
 //! Message bodies stay `bytes::Bytes` from ingest to dispatch — refcount
 //! clones only, never a copy (broker.md §3.2).
+//!
+//! # Channel orientation (deadlock freedom)
+//! Connection→queue traffic (the actor mailbox) is **bounded**: a full queue
+//! back-pressures the publishing connection, which back-pressures the
+//! producer via TCP — the ingest path always has a real bound. Queue→
+//! connection traffic ([`ConnCmd`]) is **unbounded at the channel but bounded
+//! by protocol**: `Deliver`s are capped by granted demand (≤ consumer link
+//! credit) and publish acks by producer credit. A queue actor therefore
+//! never awaits a connection, so the wait-for graph has only
+//! connection→queue edges and the bounded-channel cycle (driver waiting on a
+//! full mailbox while the queue waits on a full command channel) cannot
+//! form.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -54,7 +66,7 @@ pub(crate) enum QueueMsg {
     /// Add a consumer. Deliveries flow to `conn` as [`ConnCmd::Deliver`].
     Subscribe {
         /// The subscriber's connection command mailbox.
-        conn: mpsc::Sender<ConnCmd>,
+        conn: mpsc::UnboundedSender<ConnCmd>,
         /// The subscriber's session channel (ours) + link handle, echoed into
         /// every `Deliver` so the connection can route it.
         channel: u16,
@@ -90,7 +102,7 @@ pub(crate) enum QueueMsg {
 #[derive(Debug)]
 pub(crate) struct PublishAck {
     /// The producer's connection command mailbox.
-    pub conn: mpsc::Sender<ConnCmd>,
+    pub conn: mpsc::UnboundedSender<ConnCmd>,
     /// The producer's session channel (ours).
     pub channel: u16,
     /// The producer link handle.
@@ -138,7 +150,7 @@ struct Stored {
 #[derive(Debug)]
 struct Subscriber {
     id: SubId,
-    conn: mpsc::Sender<ConnCmd>,
+    conn: mpsc::UnboundedSender<ConnCmd>,
     channel: u16,
     handle: u32,
     demand: u32,
@@ -169,15 +181,12 @@ async fn run(name: String, mut rx: mpsc::Receiver<QueueMsg>, max_depth: usize) {
                 if ready.len() + unacked.len() >= max_depth {
                     // Refuse rather than grow without bound (broker.md §3.2).
                     if let Some(ack) = ack {
-                        let _ = ack
-                            .conn
-                            .send(ConnCmd::SettleIncoming {
-                                channel: ack.channel,
-                                handle: ack.handle,
-                                delivery_id: ack.delivery_id,
-                                accepted: false,
-                            })
-                            .await;
+                        let _ = ack.conn.send(ConnCmd::SettleIncoming {
+                            channel: ack.channel,
+                            handle: ack.handle,
+                            delivery_id: ack.delivery_id,
+                            accepted: false,
+                        });
                     } else {
                         tracing::warn!(queue = %name, "pre-settled publish dropped: queue full");
                     }
@@ -192,15 +201,12 @@ async fn run(name: String, mut rx: mpsc::Receiver<QueueMsg>, max_depth: usize) {
                 // In-memory transient queue: stored == settled. (A durable /
                 // quorum queue confirms here only after fsync / Raft commit.)
                 if let Some(ack) = ack {
-                    let _ = ack
-                        .conn
-                        .send(ConnCmd::SettleIncoming {
-                            channel: ack.channel,
-                            handle: ack.handle,
-                            delivery_id: ack.delivery_id,
-                            accepted: true,
-                        })
-                        .await;
+                    let _ = ack.conn.send(ConnCmd::SettleIncoming {
+                        channel: ack.channel,
+                        handle: ack.handle,
+                        delivery_id: ack.delivery_id,
+                        accepted: true,
+                    });
                 }
             }
             QueueMsg::Subscribe {
@@ -303,7 +309,7 @@ async fn dispatch(
             body: msg.body.clone(),
         };
         let sub_id = sub.id;
-        if sub.conn.send(cmd).await.is_ok() {
+        if sub.conn.send(cmd).is_ok() {
             unacked.insert(msg.id, (msg, sub_id));
         } else {
             // Connection gone: drop the subscriber, put the message back.
@@ -318,7 +324,11 @@ async fn dispatch(
 mod tests {
     use super::*;
 
-    async fn subscribe(q: &QueueHandle, conn: &mpsc::Sender<ConnCmd>, handle: u32) -> SubId {
+    async fn subscribe(
+        q: &QueueHandle,
+        conn: &mpsc::UnboundedSender<ConnCmd>,
+        handle: u32,
+    ) -> SubId {
         let (tx, rx) = tokio::sync::oneshot::channel();
         q.tx.send(QueueMsg::Subscribe {
             conn: conn.clone(),
@@ -334,7 +344,7 @@ mod tests {
     #[tokio::test]
     async fn publish_dispatch_settle_round_trip() {
         let q = spawn("t".into(), 100);
-        let (conn_tx, mut conn_rx) = mpsc::channel(16);
+        let (conn_tx, mut conn_rx) = mpsc::unbounded_channel();
 
         let sub = subscribe(&q, &conn_tx, 7).await;
         q.tx.send(QueueMsg::Demand { sub, credit: 10 })
@@ -371,7 +381,7 @@ mod tests {
     #[tokio::test]
     async fn requeue_redelivers() {
         let q = spawn("t".into(), 100);
-        let (conn_tx, mut conn_rx) = mpsc::channel(16);
+        let (conn_tx, mut conn_rx) = mpsc::unbounded_channel();
         let sub = subscribe(&q, &conn_tx, 1).await;
         q.tx.send(QueueMsg::Demand { sub, credit: 10 })
             .await
@@ -403,8 +413,8 @@ mod tests {
     #[tokio::test]
     async fn competing_consumers_round_robin() {
         let q = spawn("t".into(), 100);
-        let (c1_tx, mut c1_rx) = mpsc::channel(16);
-        let (c2_tx, mut c2_rx) = mpsc::channel(16);
+        let (c1_tx, mut c1_rx) = mpsc::unbounded_channel();
+        let (c2_tx, mut c2_rx) = mpsc::unbounded_channel();
         let s1 = subscribe(&q, &c1_tx, 1).await;
         let s2 = subscribe(&q, &c2_tx, 2).await;
         q.tx.send(QueueMsg::Demand {
@@ -449,7 +459,7 @@ mod tests {
     #[tokio::test]
     async fn unsubscribe_requeues_unacked() {
         let q = spawn("t".into(), 100);
-        let (c1_tx, mut c1_rx) = mpsc::channel(16);
+        let (c1_tx, mut c1_rx) = mpsc::unbounded_channel();
         let s1 = subscribe(&q, &c1_tx, 1).await;
         q.tx.send(QueueMsg::Demand {
             sub: s1,
@@ -469,7 +479,7 @@ mod tests {
 
         // Consumer dies without settling; a new consumer gets the message.
         q.tx.send(QueueMsg::Unsubscribe { sub: s1 }).await.unwrap();
-        let (c2_tx, mut c2_rx) = mpsc::channel(16);
+        let (c2_tx, mut c2_rx) = mpsc::unbounded_channel();
         let s2 = subscribe(&q, &c2_tx, 2).await;
         q.tx.send(QueueMsg::Demand {
             sub: s2,
@@ -486,7 +496,7 @@ mod tests {
     #[tokio::test]
     async fn overflow_rejects_unsettled_publishes() {
         let q = spawn("t".into(), 1);
-        let (conn_tx, mut conn_rx) = mpsc::channel(16);
+        let (conn_tx, mut conn_rx) = mpsc::unbounded_channel();
         // Fill the single slot.
         q.tx.send(QueueMsg::Publish {
             body: Bytes::from_static(b"a"),

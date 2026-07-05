@@ -121,7 +121,7 @@ async fn handshake<S: IoStream>(
     let heartbeat = Heartbeat::new(negotiated.send_interval, negotiated.recv_timeout);
     let (link_events_tx, link_events_rx) = mpsc::channel(1024);
     let (session_events_tx, session_events_rx) = mpsc::unbounded_channel();
-    let (cmd_tx, cmd_rx) = mpsc::channel(1024);
+    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
 
     tracing::debug!(container = %peer_open.container_id, "connection open");
     Ok(BrokerConnection {
@@ -244,8 +244,10 @@ struct BrokerConnection<S: IoStream> {
     session_events_tx: mpsc::UnboundedSender<SessionEvent>,
     session_events_rx: mpsc::UnboundedReceiver<SessionEvent>,
     /// Commands from queue actors (deliveries to dispatch, publish acks).
-    cmd_tx: mpsc::Sender<ConnCmd>,
-    cmd_rx: mpsc::Receiver<ConnCmd>,
+    /// Unbounded at the channel, bounded by protocol (see `queue.rs` docs on
+    /// channel orientation): queues must never await this connection.
+    cmd_tx: mpsc::UnboundedSender<ConnCmd>,
+    cmd_rx: mpsc::UnboundedReceiver<ConnCmd>,
     shutdown: Option<watch::Receiver<bool>>,
 }
 
