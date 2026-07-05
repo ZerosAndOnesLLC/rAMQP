@@ -17,6 +17,7 @@
 use std::collections::BTreeMap;
 use std::io::Cursor;
 
+use bytes::Bytes;
 use openraft::BasicNode;
 use serde::{Deserialize, Serialize};
 
@@ -44,8 +45,10 @@ pub type QueueStore = SharedStore<QueueTypeConfig, QueueState>;
 pub enum QueueCommand {
     /// Store a message.
     Enqueue {
-        /// The raw message bytes as received (all sections).
-        body: Vec<u8>,
+        /// The raw message bytes as received (all sections). `Bytes`, so the
+        /// single-replica path never copies the body; the wire codec for
+        /// multi-node replication handles its own framing.
+        body: Bytes,
     },
     /// Resolve a previously enqueued message.
     Settle {
@@ -77,7 +80,7 @@ pub enum QueueResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplicatedMessage {
     /// The raw message bytes.
-    pub body: Vec<u8>,
+    pub body: Bytes,
     /// Failed delivery attempts (incremented by requeue settles).
     pub failures: u32,
 }
@@ -178,7 +181,7 @@ mod tests {
         for body in [b"m1".as_slice(), b"m2", b"m3"] {
             let resp = raft
                 .client_write(QueueCommand::Enqueue {
-                    body: body.to_vec(),
+                    body: Bytes::copy_from_slice(body),
                 })
                 .await
                 .expect("enqueue");
@@ -190,7 +193,7 @@ mod tests {
         assert_eq!(ids, vec![1, 2, 3]);
         store.with_state(|s| {
             assert_eq!(s.messages.len(), 3);
-            assert_eq!(s.messages[&1].body, b"m1");
+            assert_eq!(&s.messages[&1].body[..], b"m1");
         });
 
         // Ack removes; requeue counts a failure and keeps the message.
@@ -281,7 +284,7 @@ mod tests {
         for i in 0..50u32 {
             let resp = rafts[&leader]
                 .client_write(QueueCommand::Enqueue {
-                    body: i.to_be_bytes().to_vec(),
+                    body: Bytes::copy_from_slice(&i.to_be_bytes()),
                 })
                 .await
                 .expect("committed enqueue");
@@ -311,7 +314,7 @@ mod tests {
         // ...the group stays writable...
         rafts[&new_leader]
             .client_write(QueueCommand::Enqueue {
-                body: b"after failover".to_vec(),
+                body: Bytes::from_static(b"after failover"),
             })
             .await
             .expect("post-failover enqueue");
@@ -334,8 +337,8 @@ mod tests {
         stores[&new_leader].with_state(|s| {
             assert_eq!(s.messages.len(), 51, "50 committed + 1 post-failover");
             // Content intact, order preserved by id.
-            assert_eq!(s.messages[&1].body, 0u32.to_be_bytes().to_vec());
-            assert_eq!(s.messages[&50].body, 49u32.to_be_bytes().to_vec());
+            assert_eq!(&s.messages[&1].body[..], &0u32.to_be_bytes());
+            assert_eq!(&s.messages[&50].body[..], &49u32.to_be_bytes());
         });
     }
 
@@ -343,9 +346,11 @@ mod tests {
     async fn snapshot_round_trips_the_message_store() {
         let (raft, store) = single_node_group().await;
         for i in 0..5u8 {
-            raft.client_write(QueueCommand::Enqueue { body: vec![i] })
-                .await
-                .expect("enqueue");
+            raft.client_write(QueueCommand::Enqueue {
+                body: Bytes::copy_from_slice(&[i]),
+            })
+            .await
+            .expect("enqueue");
         }
 
         // Build a snapshot from the live store, install it into a fresh one.
@@ -359,7 +364,7 @@ mod tests {
         fresh.with_state(|s| {
             assert_eq!(s.messages.len(), 5);
             assert_eq!(s.next_msg_id, 5);
-            assert_eq!(s.messages[&3].body, vec![2]);
+            assert_eq!(&s.messages[&3].body[..], &[2]);
         });
     }
 }
