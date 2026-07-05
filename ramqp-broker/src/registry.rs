@@ -93,6 +93,12 @@ async fn spawn_quorum_group(
         heartbeat_interval: 100,
         election_timeout_min: 300,
         election_timeout_max: 600,
+        // Compaction: snapshot every 5k applied entries and keep only a short
+        // log tail behind it, so log memory tracks queue depth rather than
+        // total messages ever enqueued (broker.md §3.2 bounded-memory rule).
+        snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(5_000),
+        max_in_snapshot_log_to_keep: 1_000,
+        purge_batch_size: 1_000,
         ..Default::default()
     }
     .validate()

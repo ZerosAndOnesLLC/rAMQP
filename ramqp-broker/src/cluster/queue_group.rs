@@ -17,6 +17,7 @@
 use std::collections::BTreeMap;
 use std::io::Cursor;
 
+use bytes::Bytes;
 use openraft::BasicNode;
 use serde::{Deserialize, Serialize};
 
@@ -44,8 +45,10 @@ pub type QueueStore = SharedStore<QueueTypeConfig, QueueState>;
 pub enum QueueCommand {
     /// Store a message.
     Enqueue {
-        /// The raw message bytes as received (all sections).
-        body: Vec<u8>,
+        /// The raw message bytes as received (all sections). `Bytes`, so the
+        /// single-replica path never copies the body; the wire codec for
+        /// multi-node replication handles its own framing.
+        body: Bytes,
     },
     /// Resolve a previously enqueued message.
     Settle {
@@ -77,7 +80,7 @@ pub enum QueueResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplicatedMessage {
     /// The raw message bytes.
-    pub body: Vec<u8>,
+    pub body: Bytes,
     /// Failed delivery attempts (incremented by requeue settles).
     pub failures: u32,
 }
@@ -178,7 +181,7 @@ mod tests {
         for body in [b"m1".as_slice(), b"m2", b"m3"] {
             let resp = raft
                 .client_write(QueueCommand::Enqueue {
-                    body: body.to_vec(),
+                    body: Bytes::copy_from_slice(body),
                 })
                 .await
                 .expect("enqueue");
@@ -190,7 +193,7 @@ mod tests {
         assert_eq!(ids, vec![1, 2, 3]);
         store.with_state(|s| {
             assert_eq!(s.messages.len(), 3);
-            assert_eq!(s.messages[&1].body, b"m1");
+            assert_eq!(&s.messages[&1].body[..], b"m1");
         });
 
         // Ack removes; requeue counts a failure and keeps the message.
@@ -281,7 +284,7 @@ mod tests {
         for i in 0..50u32 {
             let resp = rafts[&leader]
                 .client_write(QueueCommand::Enqueue {
-                    body: i.to_be_bytes().to_vec(),
+                    body: Bytes::copy_from_slice(&i.to_be_bytes()),
                 })
                 .await
                 .expect("committed enqueue");
@@ -311,7 +314,7 @@ mod tests {
         // ...the group stays writable...
         rafts[&new_leader]
             .client_write(QueueCommand::Enqueue {
-                body: b"after failover".to_vec(),
+                body: Bytes::from_static(b"after failover"),
             })
             .await
             .expect("post-failover enqueue");
@@ -334,18 +337,89 @@ mod tests {
         stores[&new_leader].with_state(|s| {
             assert_eq!(s.messages.len(), 51, "50 committed + 1 post-failover");
             // Content intact, order preserved by id.
-            assert_eq!(s.messages[&1].body, 0u32.to_be_bytes().to_vec());
-            assert_eq!(s.messages[&50].body, 49u32.to_be_bytes().to_vec());
+            assert_eq!(&s.messages[&1].body[..], &0u32.to_be_bytes());
+            assert_eq!(&s.messages[&50].body[..], &49u32.to_be_bytes());
         });
+    }
+
+    /// With a snapshot policy configured, the in-memory log is compacted as
+    /// entries apply — log memory tracks queue depth, not total messages
+    /// ever enqueued (broker.md §3.2).
+    #[tokio::test]
+    async fn snapshot_policy_purges_the_log() {
+        let config = Arc::new(
+            Config {
+                heartbeat_interval: 50,
+                election_timeout_min: 150,
+                election_timeout_max: 300,
+                snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(1_000),
+                max_in_snapshot_log_to_keep: 100,
+                purge_batch_size: 500,
+                ..Default::default()
+            }
+            .validate()
+            .expect("valid config"),
+        );
+        let store = QueueStore::default();
+        let (log_store, state_machine) = openraft::storage::Adaptor::new(store.clone());
+        let raft = QueueRaft::new(9, config, UnreachableNetwork, log_store, state_machine)
+            .await
+            .expect("raft");
+        raft.initialize(BTreeMap::from([(9u64, BasicNode::new("local"))]))
+            .await
+            .expect("initialize");
+        raft.wait(Some(Duration::from_secs(5)))
+            .current_leader(9, "self-elect")
+            .await
+            .expect("leader");
+
+        // Enqueue + immediately settle 12k messages (24k log entries), far
+        // past the 1k snapshot threshold.
+        for i in 0..12_000u32 {
+            let resp = raft
+                .client_write(QueueCommand::Enqueue {
+                    body: Bytes::copy_from_slice(&i.to_be_bytes()),
+                })
+                .await
+                .expect("enqueue");
+            let QueueResponse::Enqueued { msg_id } = resp.data else {
+                panic!("expected enqueued");
+            };
+            raft.client_write(QueueCommand::Settle {
+                msg_id,
+                requeue: false,
+            })
+            .await
+            .expect("settle");
+        }
+
+        // Compaction runs asynchronously; wait for the purge to land.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let (log_len, last_purged) = store.log_stats();
+            if last_purged.is_some() && log_len < 5_000 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "log never compacted: {log_len} entries held, purged={last_purged:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        // The applied state is empty (everything settled) regardless of
+        // how much log was kept.
+        store.with_state(|s| assert!(s.messages.is_empty()));
     }
 
     #[tokio::test]
     async fn snapshot_round_trips_the_message_store() {
         let (raft, store) = single_node_group().await;
         for i in 0..5u8 {
-            raft.client_write(QueueCommand::Enqueue { body: vec![i] })
-                .await
-                .expect("enqueue");
+            raft.client_write(QueueCommand::Enqueue {
+                body: Bytes::copy_from_slice(&[i]),
+            })
+            .await
+            .expect("enqueue");
         }
 
         // Build a snapshot from the live store, install it into a fresh one.
@@ -359,7 +433,7 @@ mod tests {
         fresh.with_state(|s| {
             assert_eq!(s.messages.len(), 5);
             assert_eq!(s.next_msg_id, 5);
-            assert_eq!(s.messages[&3].body, vec![2]);
+            assert_eq!(&s.messages[&3].body[..], &[2]);
         });
     }
 }

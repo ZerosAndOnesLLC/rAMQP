@@ -137,6 +137,13 @@ impl<C: RaftTypeConfig, S> SharedStore<C, S> {
     pub fn with_state<T>(&self, f: impl FnOnce(&S) -> T) -> T {
         f(&self.lock().state)
     }
+
+    /// Diagnostics: `(log entries held, last purged index)` — compaction
+    /// visibility for tests and (later) the management surface.
+    pub fn log_stats(&self) -> (usize, Option<u64>) {
+        let inner = self.lock();
+        (inner.log.len(), inner.last_purged.map(|l| l.index))
+    }
 }
 
 /// The metadata group's storage.
@@ -186,7 +193,9 @@ where
             last_membership: inner.last_membership.clone(),
             state: inner.state.clone(),
         };
-        let data = serde_json::to_vec(&payload)
+        // Compact binary encoding: snapshots of binary-heavy queue state must
+        // not inflate (JSON turns 256-byte bodies into ~1 KB integer arrays).
+        let data = bincode::serialize(&payload)
             .map_err(|e| openraft::StorageIOError::write_snapshot(None, &e))?;
         inner.snapshot_idx += 1;
         let meta = SnapshotMeta {
@@ -331,7 +340,7 @@ where
         snapshot: Box<Cursor<Vec<u8>>>,
     ) -> Result<(), StorageError<NodeId>> {
         let data = snapshot.into_inner();
-        let payload: SnapshotPayload<S> = serde_json::from_slice(&data)
+        let payload: SnapshotPayload<S> = bincode::deserialize(&data)
             .map_err(|e| openraft::StorageIOError::read_snapshot(Some(meta.signature()), &e))?;
         let mut inner = self.lock();
         inner.last_applied = payload.last_applied;
