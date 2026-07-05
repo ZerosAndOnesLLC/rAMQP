@@ -133,27 +133,48 @@ pub struct TcpConnection {
     stream: Option<TcpStream>,
 }
 
+/// Whether a reply is the response variant for a given request. A mismatch
+/// means the stream is desynced (we read someone else's reply), so the
+/// connection must be discarded rather than reused.
+fn reply_matches(rpc: &Rpc, reply: &Reply) -> bool {
+    matches!(
+        (rpc, reply),
+        (Rpc::AppendEntries(_), Reply::AppendEntries(_))
+            | (Rpc::Vote(_), Reply::Vote(_))
+            | (Rpc::InstallSnapshot(_), Reply::InstallSnapshot(_))
+    )
+}
+
 impl TcpConnection {
+    /// Send one RPC and read its reply. **Cancellation-safe:** openraft wraps
+    /// each replication RPC in its own timeout and reuses one connection per
+    /// peer, so a timed-out call drops this future mid-await. We therefore take
+    /// the stream *out* of `self` for the whole round trip — if the future is
+    /// dropped, the local stream is dropped with it and `self.stream` stays
+    /// `None`, so a connection with a half-consumed / in-flight reply is never
+    /// reused (which would make the next call read a stale reply as its own and
+    /// falsely acknowledge a quorum). The stream is restored only after a clean,
+    /// correctly-*matched* round trip; any error or a variant mismatch discards
+    /// it so the next call reconnects on a fresh socket.
     async fn call(&mut self, rpc: &Rpc) -> Result<Reply, std::io::Error> {
-        if self.stream.is_none() {
-            let stream = TcpStream::connect(&self.addr).await?;
-            let _ = stream.set_nodelay(true);
-            self.stream = Some(stream);
-        }
-        let stream = self.stream.as_mut().expect("connected above");
-        match async {
-            write_frame(stream, rpc).await?;
-            read_frame::<Reply>(stream).await
-        }
-        .await
-        {
-            Ok(reply) => Ok(reply),
-            Err(e) => {
-                // Poisoned connection: drop it so the next call reconnects.
-                self.stream = None;
-                Err(e)
+        let mut stream = match self.stream.take() {
+            Some(s) => s,
+            None => {
+                let s = TcpStream::connect(&self.addr).await?;
+                let _ = s.set_nodelay(true);
+                s
             }
+        };
+        // If either of these awaits is cancelled, `stream` drops here and
+        // `self.stream` is already None — the connection is not reused.
+        write_frame(&mut stream, rpc).await?;
+        let reply: Reply = read_frame(&mut stream).await?;
+        if !reply_matches(rpc, &reply) {
+            // Desynced stream: discard it (do not restore).
+            return Err(std::io::Error::other("raft rpc reply variant mismatch"));
         }
+        self.stream = Some(stream);
+        Ok(reply)
     }
 }
 
@@ -217,12 +238,95 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use openraft::{BasicNode, Config};
+    use openraft::network::{RPCOption, RaftNetwork};
+    use openraft::raft::{AppendEntriesRequest, VoteResponse};
+    use openraft::{BasicNode, Config, Vote};
 
     use super::super::meta::{MetaCommand, QueueSpec, QueueType};
     use super::super::store::MetaStore;
-    use super::super::{MetaRaft, NodeId};
-    use super::{TcpNetworkFactory, serve_raft};
+    use super::super::{MetaRaft, MetaTypeConfig, NodeId};
+    use super::{Reply, TcpConnection, TcpNetworkFactory, reply_matches, serve_raft, write_frame};
+
+    #[test]
+    fn reply_matches_only_same_variant() {
+        use super::Rpc;
+        let ae = Rpc::AppendEntries(AppendEntriesRequest {
+            vote: Vote::new(1, 1),
+            prev_log_id: None,
+            entries: vec![],
+            leader_commit: None,
+        });
+        assert!(!reply_matches(
+            &ae,
+            &Reply::Vote(Ok(VoteResponse::new(Vote::new(1, 1), None, false)))
+        ));
+    }
+
+    /// CR1 regression: a peer that replies with the WRONG RPC variant (or a
+    /// timed-out/desynced stream) must make the call fail AND poison the
+    /// connection so the next call reconnects on a fresh socket — never reuse a
+    /// desynced stream (which would read a stale reply as its own).
+    #[tokio::test]
+    async fn variant_mismatch_poisons_connection_and_reconnects() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let a2 = accepts.clone();
+        // A hostile server: reads a request, always replies with a Vote reply.
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = listener.accept().await else {
+                    return;
+                };
+                a2.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut len = [0u8; 4];
+                    if s.read_exact(&mut len).await.is_err() {
+                        return;
+                    }
+                    let mut body = vec![0u8; u32::from_be_bytes(len) as usize];
+                    let _ = s.read_exact(&mut body).await;
+                    let reply: Reply =
+                        Reply::Vote(Ok(VoteResponse::new(Vote::new(1, 1), None, false)));
+                    let _ = write_frame(&mut s, &reply).await;
+                });
+            }
+        });
+
+        let mut conn = TcpConnection {
+            target: 2,
+            addr,
+            stream: None,
+        };
+        let req = || AppendEntriesRequest::<MetaTypeConfig> {
+            vote: Vote::new(1, 1),
+            prev_log_id: None,
+            entries: vec![],
+            leader_commit: None,
+        };
+        let opt = RPCOption::new(Duration::from_secs(2));
+
+        // First call: server replies with the wrong variant -> Unreachable, and
+        // the connection must be discarded.
+        let err = conn.append_entries(req(), opt.clone()).await.unwrap_err();
+        assert!(matches!(err, openraft::error::RPCError::Unreachable(_)));
+        assert!(
+            conn.stream.is_none(),
+            "desynced connection must be poisoned"
+        );
+
+        // Second call: must reconnect (a fresh accept), not reuse a wedged
+        // stream. Two total accepts proves no permanent wedge.
+        let _ = conn.append_entries(req(), opt).await;
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            2,
+            "each call reconnected on a fresh socket"
+        );
+    }
 
     /// Bind a raft listener, spawn a node serving it, return (raft, store, addr).
     async fn spawn_tcp_node(id: NodeId) -> (MetaRaft, MetaStore, String) {

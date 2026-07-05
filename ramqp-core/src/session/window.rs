@@ -18,6 +18,9 @@ pub struct SessionWindows {
     pub remote_incoming_window: u32,
     /// Our incoming-window (how many more transfers we will accept).
     pub incoming_window: u32,
+    /// The configured incoming-window we replenish back to (never mutated after
+    /// construction).
+    initial_incoming_window: u32,
     /// The transfer-id we expect on the peer's next transfer.
     pub next_incoming_id: u32,
     /// The peer's advertised outgoing-window.
@@ -34,6 +37,7 @@ impl SessionWindows {
             outgoing_window: config.outgoing_window,
             remote_incoming_window: 0,
             incoming_window: config.incoming_window,
+            initial_incoming_window: config.incoming_window,
             next_incoming_id: 0,
             remote_outgoing_window: 0,
             initialized: false,
@@ -67,9 +71,11 @@ impl SessionWindows {
         self.incoming_window == 0
     }
 
-    /// Reset our incoming-window to `window` (after sending a replenishing flow).
-    pub fn replenish_incoming(&mut self, window: u32) {
-        self.incoming_window = window;
+    /// Reset our incoming-window to the configured value (after sending a
+    /// replenishing flow). Uses the session's own configured incoming-window —
+    /// never the outgoing-window, which is an unrelated (send-side) bound.
+    pub fn replenish_incoming(&mut self) {
+        self.incoming_window = self.initial_incoming_window.max(1);
     }
 
     /// Apply a peer `flow`, recomputing how much we may send.
@@ -170,7 +176,28 @@ mod tests {
         }
         assert_eq!(w.incoming_window, 1);
         assert!(w.record_incoming(0)); // hits zero → replenish
-        w.replenish_incoming(10);
+        w.replenish_incoming(); // back to the configured incoming-window (10)
         assert_eq!(w.incoming_window, 10);
+    }
+
+    #[test]
+    fn replenish_uses_incoming_not_outgoing_window() {
+        // Asymmetric config: a big receive window, a small send window. Replenish
+        // must restore the *incoming* window, not collapse it to outgoing_window.
+        let mut w = SessionWindows::new(&SessionConfig {
+            incoming_window: 2048,
+            outgoing_window: 16,
+            handle_max: 100,
+        });
+        w.on_peer_begin(&Begin::default());
+        for _ in 0..2048 {
+            w.record_incoming(0);
+        }
+        assert_eq!(w.incoming_window, 0);
+        w.replenish_incoming();
+        assert_eq!(
+            w.incoming_window, 2048,
+            "restored to incoming, not outgoing(16)"
+        );
     }
 }

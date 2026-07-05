@@ -684,8 +684,7 @@ impl Session {
 
         // Replenish the session incoming-window if exhausted.
         if need_session_flow {
-            self.windows
-                .replenish_incoming(self.windows.outgoing_window.max(1));
+            self.windows.replenish_incoming();
             let flow = self.windows.build_flow();
             transport.queue_amqp(local_channel, &Performative::Flow(flow), None);
         }
@@ -893,7 +892,10 @@ impl Session {
         transport: &mut FramedTransport<S>,
         max_frame_size: usize,
     ) {
+        // Every inbound flow carries the peer's session-window fields; apply
+        // them first — this is what reopens our remote-incoming-window.
         self.windows.on_peer_flow(&flow);
+        // Apply the link-level credit for a handle-carrying flow...
         if let Some(peer_handle) = flow.handle {
             if let Some(local) = self.remote_handles.resolve(peer_handle) {
                 if let Some(Link::Sender(s)) = self.links.get_mut(&local) {
@@ -909,25 +911,25 @@ impl Session {
                         drain: s.credit.drain,
                     });
                 }
-                self.flush_sender(local, transport, max_frame_size);
             }
-        } else {
-            // A pure session flow (no handle) reopens the session window: any
-            // sender stalled on remote-incoming-window exhaustion must resume,
-            // or messages sit in its outbox until an unrelated flush happens
-            // to run (a peer whose sends are dispatch-driven — a broker —
-            // would stall permanently at exactly `incoming-window` transfers).
-            let stalled: Vec<u32> = self
-                .links
-                .iter()
-                .filter_map(|(&h, l)| match l {
-                    Link::Sender(s) if !s.outbox.is_empty() => Some(h),
-                    _ => None,
-                })
-                .collect();
-            for handle in stalled {
-                self.flush_sender(handle, transport, max_frame_size);
-            }
+        }
+        // ...then flush *every* sender with queued work. The reopened session
+        // window is a shared resource: a flow carrying link B's handle still
+        // advances the window that link A is stalled on, so flushing only the
+        // named link would leave other senders' outboxes stuck indefinitely
+        // (a dispatch-driven peer — a broker — never gets a second nudge).
+        // Each flush is still gated by that link's own credit + the window, so
+        // this neither double-sends nor sends without credit.
+        let stalled: Vec<u32> = self
+            .links
+            .iter()
+            .filter_map(|(&h, l)| match l {
+                Link::Sender(s) if !s.outbox.is_empty() => Some(h),
+                _ => None,
+            })
+            .collect();
+        for handle in stalled {
+            self.flush_sender(handle, transport, max_frame_size);
         }
 
         // Respond to an echo request with our current flow state.
@@ -1419,6 +1421,121 @@ mod tests {
             FrameBody::Amqp(Performative::Transfer(_), _) => {}
             other => panic!("expected the stalled transfer, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn flow_carrying_one_handle_still_unstalls_other_senders() {
+        // Two consumer links (broker is sender to each) share a session whose
+        // remote-incoming-window is tiny. Link A fills the window and stalls
+        // with a message still queued. A flow carrying link B's handle reopens
+        // the shared session window — link A's stalled message must flush.
+        let begin = Begin {
+            incoming_window: 1, // peer will accept only 1 transfer before flow
+            ..peer_begin()
+        };
+        let (mut session, _resp, _evt, mut transport, mut far) = server_session(&begin);
+        let (tx, _rx) = mpsc::channel(16);
+
+        let attach = |name: &str, handle: u32| Attach {
+            name: name.into(),
+            handle,
+            role: Role::Receiver,
+            ..Default::default()
+        };
+        let a = session
+            .accept_peer_attach(
+                attach("A", 1),
+                CreditMode::Manual,
+                0,
+                None,
+                tx.clone(),
+                &mut transport,
+            )
+            .expect("A");
+        let b = session
+            .accept_peer_attach(
+                attach("B", 2),
+                CreditMode::Manual,
+                0,
+                None,
+                tx,
+                &mut transport,
+            )
+            .expect("B");
+
+        // Credit both links generously (link credit is not the bottleneck here).
+        for peer_h in [1u32, 2] {
+            session.on_flow(
+                Flow {
+                    next_incoming_id: Some(0),
+                    incoming_window: 1,
+                    next_outgoing_id: 0,
+                    outgoing_window: 100,
+                    handle: Some(peer_h),
+                    link_credit: Some(10),
+                    delivery_count: Some(0),
+                    ..Default::default()
+                },
+                &mut transport,
+                1 << 16,
+            );
+        }
+
+        // Queue two messages on A: the first consumes the 1-frame window, the
+        // second is stuck.
+        for body in [&b"a1"[..], &b"a2"[..]] {
+            session.send_transfer(
+                a.handle.0,
+                Bytes::copy_from_slice(body),
+                true,
+                0,
+                None,
+                None,
+                &mut transport,
+                1 << 16,
+            );
+        }
+        transport.flush().await.unwrap();
+        // Drain frames emitted so far; exactly one A transfer got out.
+        let mut a_transfers = 0;
+        while let Ok(Ok(f)) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), far.read_frame()).await
+        {
+            if let FrameBody::Amqp(Performative::Transfer(_), _) = f.body {
+                a_transfers += 1;
+            }
+        }
+        assert_eq!(a_transfers, 1, "window allowed only the first transfer");
+
+        // A flow that names link B reopens the shared session window. The fix:
+        // A's stalled second message must now flush even though the flow was
+        // "for" B.
+        session.on_flow(
+            Flow {
+                next_incoming_id: Some(1),
+                incoming_window: 100,
+                next_outgoing_id: 0,
+                outgoing_window: 100,
+                handle: Some(2), // link B's handle — NOT the stalled link A
+                link_credit: Some(10),
+                delivery_count: Some(0),
+                ..Default::default()
+            },
+            &mut transport,
+            1 << 16,
+        );
+        transport.flush().await.unwrap();
+        let f = tokio::time::timeout(std::time::Duration::from_millis(200), far.read_frame())
+            .await
+            .expect("A's stalled transfer must flush")
+            .unwrap();
+        match f.body {
+            FrameBody::Amqp(Performative::Transfer(_), payload) => {
+                assert_eq!(payload.as_deref(), Some(&b"a2"[..]));
+            }
+            other => panic!("expected A's stalled transfer, got {other:?}"),
+        }
+        let _ = b;
     }
 
     #[tokio::test]
