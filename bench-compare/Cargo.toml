@@ -12,15 +12,32 @@ publish = false
 description = "Comparison benchmark harness: ramqp vs fe2o3-amqp against a live AMQP 1.0 broker."
 
 [dependencies]
-ramqp = { path = "../ramqp" }
+ramqp = { path = "../ramqp", features = ["ws"] }
 ramqp-broker = { path = "../ramqp-broker" }
 fe2o3-amqp = "0.15"
 tokio = { version = "1", features = ["full"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# WebSocket->TCP proxy used to benchmark AMQP-over-WebSocket against a plain-TCP
+# broker (RabbitMQ doesn't expose AMQP 1.0 over WS natively).
+tokio-tungstenite = "0.29"
+futures-util = "0.3"
+bytes = "1"
 
 [[bin]]
 name = "rig"
 path = "src/bin/rig.rs"
+
+[[bin]]
+name = "wsproxy"
+path = "src/bin/wsproxy.rs"
+
+[[bin]]
+name = "probe"
+path = "src/bin/probe.rs"
+
+[[bin]]
+name = "wscompare"
+path = "src/bin/wscompare.rs"
 
 [[bin]]
 name = "bench"

@@ -1532,10 +1532,13 @@ dependencies = [
 name = "ramqp-bench-compare"
 version = "0.0.0"
 dependencies = [
+ "bytes",
  "fe2o3-amqp",
+ "futures-util",
  "ramqp",
  "ramqp-broker",
  "tokio",
+ "tokio-tungstenite",
  "tracing-subscriber",
 ]
 

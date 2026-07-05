@@ -64,3 +64,86 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.85
       - run: cargo check --all-features
+
+  # ---------------------------------------------------------------------------
+  # Live broker interop. The `tests/broker.rs` suite is `#[ignore]`d (so a plain
+  # `cargo test` stays green without Docker); these jobs run it for real against
+  # each broker. This is the signal that `ramqp` actually speaks AMQP 1.0 to the
+  # brokers people deploy — not just that it compiles.
+  # ---------------------------------------------------------------------------
+  interop-rabbitmq:
+    name: Interop (RabbitMQ 4.x)
+    runs-on: ubuntu-latest
+    services:
+      rabbitmq:
+        image: rabbitmq:4-management
+        ports:
+          - 5672:5672
+          - 15672:15672
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Declare interop queue
+        # RabbitMQ does NOT auto-create a queue from an AMQP 1.0 attach, and the
+        # management plugin comes up a beat after the node answers pings — so
+        # retry until the HTTP API accepts the declaration.
+        run: |
+          for i in $(seq 1 30); do
+            if curl -fsS -u guest:guest -X PUT \
+                 http://localhost:15672/api/queues/%2F/ramqp_it \
+                 -H content-type:application/json -d '{"durable":true}'; then
+              echo "queue declared"; exit 0
+            fi
+            sleep 2
+          done
+          echo "management API never became ready"; exit 1
+      - name: Broker interop suite
+        env:
+          RAMQP_BROKER_URL: amqp://guest:guest@localhost:5672
+          RAMQP_BROKER_ADDRESS: /queues/ramqp_it
+        run: cargo test --test broker -- --ignored --test-threads=1
+
+  interop-artemis:
+    name: Interop (ActiveMQ Artemis)
+    runs-on: ubuntu-latest
+    services:
+      artemis:
+        image: apache/activemq-artemis:latest-alpine
+        ports:
+          - 5672:5672
+          - 61616:61616
+        env:
+          ARTEMIS_USER: admin
+          ARTEMIS_PASSWORD: admin
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Create ANYCAST queue
+        # Artemis auto-creates MULTICAST addresses (which drop messages sent
+        # before a subscriber exists), so pre-create an ANYCAST/queue-semantics
+        # address. The retry loop doubles as the readiness gate.
+        run: |
+          for i in $(seq 1 40); do
+            if docker exec ${{ job.services.artemis.id }} \
+                 /var/lib/artemis-instance/bin/artemis queue create \
+                 --name ramqp.it --address ramqp.it --anycast --durable \
+                 --preserve-on-no-consumers --auto-create-address \
+                 --url tcp://localhost:61616 --user admin --password admin --silent; then
+              echo "anycast queue created"; exit 0
+            fi
+            sleep 2
+          done
+          echo "Artemis never became ready"; exit 1
+      - name: Broker interop suite
+        env:
+          RAMQP_BROKER_URL: amqp://admin:admin@localhost:5672
+          RAMQP_BROKER_ADDRESS: ramqp.it
+        # Single-node Artemis holds connections for a 60s TTL, so the suite's
+        # rapid open/close churn makes it slow but stable; the suite already
+        # retries connects to absorb this.
+        run: cargo test --test broker -- --ignored --test-threads=1
