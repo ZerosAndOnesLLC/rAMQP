@@ -5,18 +5,48 @@ All notable changes to ramqp will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.8.0] - 2026-07-01
+## [0.8.0] - unreleased
+
+**No `Cargo.toml` or code changes needed to upgrade**: `ramqp = "0.8"` is a
+drop-in replacement for 0.7 — every public path, feature name, and type is
+unchanged (compile-time-locked by `tests/public_api.rs`). `ramqp-core` arrives
+as an ordinary transitive dependency. See `RELEASING.md` for the maintainer
+side (publish order: `ramqp-core` first).
 
 ### Changed
 - **Workspace restructure: the role-agnostic engine moved into `ramqp-core`.**
   The codec, wire types, ids, config, errors, observability, framing/header
   transport layer, session/link state machines, open-negotiation/mux/heartbeat,
   transaction wire types, and the SCRAM math now live in the new `ramqp-core`
-  crate (0.1.0), shared with the upcoming `ramqp-broker`. `ramqp` re-exports
-  everything, so **all existing `ramqp::...` paths keep working** — the public
-  API is unchanged (locked by `tests/public_api.rs`). No behavior changes.
+  crate (0.2.0), shared with the new `ramqp-broker`. `ramqp` re-exports
+  everything, so **all existing `ramqp::...` paths keep working**.
 - The `scram` and `transaction` features now delegate to the corresponding
   `ramqp-core` features; the SCRAM crypto dependencies moved to `ramqp-core`.
+- `proto::LinkEvent` variants and `proto::IncomingDelivery` now carry the
+  link's local `handle` (attribution for multi-link consumers of the internal
+  event vocabulary, e.g. a broker). Only affects code that pattern-matches
+  these low-level internals exhaustively; the `Consumer`/`Producer` API is
+  untouched.
+- The `produce_consume` example accepts `RAMQP_URL` / `RAMQP_ADDRESS`
+  overrides (the URL was hardcoded).
+
+### Fixed
+- **Senders stalled by session-window exhaustion now resume on a handleless
+  (session-level) `flow`.** Previously only flows carrying a link handle
+  re-ran the send path; a peer replenishing just its incoming-window could
+  leave queued messages sitting in the outbox until an unrelated event
+  flushed them. Found by driving 50k-message bursts through `ramqp-broker`;
+  regression-tested at both the session and end-to-end level.
+
+### Added (workspace)
+- **`ramqp-core` 0.2.0** — the engine as its own crate, including net-new
+  server polarity: `Session::accept_peer_begin`/`accept_peer_attach`,
+  read-first `header::accept`, and a SASL server side (PLAIN parsing + an
+  RFC 5802 `ScramServer` with verifier-based credential storage, validated
+  byte-for-byte against the RFC vectors and against `ramqp`'s own client).
+- **`ramqp-broker` 0.1.0 (unpublished)** — the broker: transient + quorum
+  (Raft-replicated) queues, cluster foundation, daemon. See the README and
+  `broker.md`.
 
 ## [0.7.1] - 2026-06-24
 

@@ -3,6 +3,10 @@ name: Release
 # Publishing to crates.io requires a CARGO_REGISTRY_TOKEN repository secret
 # (Settings -> Secrets and variables -> Actions). Create the token at
 # https://crates.io/settings/tokens with the "publish-update" scope.
+#
+# Publish ORDER matters (see RELEASING.md): `ramqp` depends on `ramqp-core`
+# by version, so core must land on crates.io first. `ramqp-broker` is not
+# published yet (pre-alpha); `bench-compare` is publish = false.
 
 on:
   push:
@@ -28,7 +32,29 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: cargo publish
+      - name: Publish ramqp-core
+        # Skips cleanly if this version of ramqp-core is already published
+        # (e.g. a client-only patch release retagging the same core version).
+        run: |
+          if cargo publish -p ramqp-core --token ${{ secrets.CARGO_REGISTRY_TOKEN }} 2>err.log; then
+            echo "ramqp-core published"
+          elif grep -q "already exists" err.log; then
+            echo "ramqp-core version already on crates.io; continuing"
+          else
+            cat err.log; exit 1
+          fi
+      - name: Wait for the index to see ramqp-core
+        run: |
+          core_version=$(cargo metadata --no-deps --format-version 1 \
+            | python3 -c "import json,sys; d=json.load(sys.stdin); print(next(p['version'] for p in d['packages'] if p['name']=='ramqp-core'))")
+          for i in $(seq 1 30); do
+            if cargo info ramqp-core --registry crates-io 2>/dev/null | grep -q "$core_version"; then
+              echo "index has ramqp-core $core_version"; exit 0
+            fi
+            sleep 10
+          done
+          echo "index never showed ramqp-core $core_version"; exit 1
+      - name: Publish ramqp
         run: cargo publish -p ramqp --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
   release:

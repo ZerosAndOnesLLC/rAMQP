@@ -10,6 +10,21 @@ Thank you for your interest in contributing to ramqp. This document covers the p
 4. Make your changes
 5. Submit a pull request
 
+## Workspace layout
+
+The repo is a Cargo workspace of four crates — know where your change goes:
+
+| Crate | Contents |
+|---|---|
+| `ramqp-core/` | The shared protocol engine (codec, types, framing, session/link state machines, SASL). Role-neutral: **both** the client and broker build on it — a change here affects both. |
+| `ramqp/` | The published client (public API, resilience, dial-side transport, client driver). Its public surface is locked by `ramqp/tests/public_api.rs` — if that test breaks, you changed the API. |
+| `ramqp-broker/` | The broker (acceptor, connection driver, queues, cluster). Plan + status: [`broker.md`](broker.md). |
+| `bench-compare/` | Dev-only benchmark harness (never published; the only place `fe2o3-amqp` may appear). |
+
+All the usual commands run from the repo root and cover the workspace's
+default members. `bench-compare` is off the default set — build it explicitly
+with `-p ramqp-bench-compare`.
+
 ## Development Setup
 
 ```bash
@@ -28,10 +43,11 @@ cargo bench --bench codec
 
 ### Testing against a real broker
 
-The broker interop tests (`tests/broker.rs`, `tests/tls.rs`, `tests/ws.rs`) are
+The broker interop tests (`ramqp/tests/broker.rs`, `tls.rs`, `ws.rs`) are
 **env-gated** — they no-op unless their broker URL is set, so a plain `cargo test`
-stays green without Docker. See [`tests/docker/README.md`](tests/docker/README.md)
-for the RabbitMQ / Artemis / TLS / WebSocket harness. Example:
+stays green without Docker. See [`ramqp/tests/docker/README.md`](ramqp/tests/docker/README.md)
+for the RabbitMQ / Artemis / TLS / WebSocket harness. CI also runs the suite
+against live RabbitMQ 4.x and Artemis containers. Example:
 
 ```bash
 RAMQP_BROKER_URL=amqp://guest:guest@localhost:5672 \
@@ -48,7 +64,7 @@ RAMQP_BROKER_ADDRESS=/queues/my-queue \
 - Run `cargo test` (and `cargo test --all-features`) and ensure all tests pass
 - Run `cargo check` with zero errors and no new warnings
 - Use Rust 2024 edition features where appropriate
-- The crate is `#![forbid(unsafe_code)]` — keep it that way
+- Every crate is `#![forbid(unsafe_code)]` — keep it that way
 - Public items must be documented (`#![warn(missing_docs)]` is on)
 
 ### Clean-room constraint
@@ -78,7 +94,10 @@ This is a client on the hot path of message-oriented systems. Allocations matter
 ## Pull Request Process
 
 1. Update `CHANGELOG.md` with your changes
-2. Bump the version in `Cargo.toml` (patch for fixes, minor for features, major for breaking)
+2. Bump the changed crate's version in its `Cargo.toml` (patch for fixes,
+   minor for features, major for breaking). If you bump `ramqp-core`, sync the
+   `version = "…"` pins in `ramqp/Cargo.toml` and `ramqp-broker/Cargo.toml` —
+   see [`RELEASING.md`](RELEASING.md) for why publishing breaks otherwise
 3. Ensure `cargo test` (and `cargo test --all-features`) passes
 4. Ensure `cargo check` and `cargo clippy -- -D warnings` produce no errors
 5. Ensure `cargo fmt --all -- --check` is clean
