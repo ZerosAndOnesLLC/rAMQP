@@ -34,7 +34,7 @@ pub struct ClusterHandle {
     /// The local Raft handle.
     pub raft: MetaRaft,
     /// The local store (applied catalog reads).
-    pub store: Arc<MetaStore>,
+    pub store: MetaStore,
     /// The bound inter-node listen address (useful with port `0`).
     pub raft_addr: std::net::SocketAddr,
 }
@@ -64,7 +64,7 @@ pub async fn bootstrap(config: ClusterConfig) -> std::io::Result<ClusterHandle> 
         .validate()
         .map_err(std::io::Error::other)?,
     );
-    let store = Arc::new(MetaStore::default());
+    let store = MetaStore::default();
     let (log_store, state_machine) = openraft::storage::Adaptor::new(store.clone());
     let raft = MetaRaft::new(
         config.node_id,

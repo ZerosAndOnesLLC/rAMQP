@@ -11,6 +11,7 @@
 pub mod bootstrap;
 pub mod meta;
 pub mod network;
+pub mod queue_group;
 pub mod store;
 pub mod tcp;
 
@@ -49,7 +50,7 @@ mod tests {
     use super::store::MetaStore;
     use super::{MetaRaft, NodeId};
 
-    async fn spawn_node(id: NodeId, router: &Router) -> (MetaRaft, Arc<MetaStore>) {
+    async fn spawn_node(id: NodeId, router: &Router) -> (MetaRaft, MetaStore) {
         let config = Arc::new(
             Config {
                 heartbeat_interval: 50,
@@ -60,7 +61,7 @@ mod tests {
             .validate()
             .expect("valid config"),
         );
-        let store = Arc::new(MetaStore::default());
+        let store = MetaStore::default();
         let (log_store, state_machine) = openraft::storage::Adaptor::new(store.clone());
         let raft = MetaRaft::new(id, config, router.clone(), log_store, state_machine)
             .await

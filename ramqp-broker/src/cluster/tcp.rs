@@ -225,7 +225,7 @@ mod tests {
     use super::{TcpNetworkFactory, serve_raft};
 
     /// Bind a raft listener, spawn a node serving it, return (raft, store, addr).
-    async fn spawn_tcp_node(id: NodeId) -> (MetaRaft, Arc<MetaStore>, String) {
+    async fn spawn_tcp_node(id: NodeId) -> (MetaRaft, MetaStore, String) {
         let config = Arc::new(
             Config {
                 heartbeat_interval: 50,
@@ -236,7 +236,7 @@ mod tests {
             .validate()
             .expect("valid config"),
         );
-        let store = Arc::new(MetaStore::default());
+        let store = MetaStore::default();
         let (log_store, state_machine) = openraft::storage::Adaptor::new(store.clone());
         let raft = MetaRaft::new(id, config, TcpNetworkFactory, log_store, state_machine)
             .await

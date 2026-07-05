@@ -15,15 +15,92 @@ use openraft::raft::{
     VoteRequest, VoteResponse,
 };
 
-use super::{MetaRaft, MetaTypeConfig, NodeId};
+use openraft::RaftTypeConfig;
 
-/// Routes RPCs to co-located Raft nodes by id.
-#[derive(Default, Clone)]
-pub struct Router {
-    nodes: Arc<RwLock<HashMap<NodeId, MetaRaft>>>,
+use super::{MetaTypeConfig, NodeId};
+
+/// A network for groups that never speak to peers (single-node groups, e.g.
+/// an unreplicated queue group or tests): every RPC reports the peer as
+/// unreachable. Generic over the group's type config.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct UnreachableNetwork;
+
+impl<C> RaftNetworkFactory<C> for UnreachableNetwork
+where
+    C: RaftTypeConfig<NodeId = NodeId, Node = BasicNode>,
+{
+    type Network = UnreachableConnection;
+
+    async fn new_client(&mut self, _target: NodeId, _node: &BasicNode) -> Self::Network {
+        UnreachableConnection
+    }
 }
 
-impl std::fmt::Debug for Router {
+/// The connection type of [`UnreachableNetwork`].
+#[derive(Debug)]
+pub struct UnreachableConnection;
+
+impl<C> RaftNetwork<C> for UnreachableConnection
+where
+    C: RaftTypeConfig<NodeId = NodeId, Node = BasicNode>,
+{
+    async fn append_entries(
+        &mut self,
+        _rpc: AppendEntriesRequest<C>,
+        _option: RPCOption,
+    ) -> Result<AppendEntriesResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId>>> {
+        Err(RPCError::Unreachable(Unreachable::new(
+            &std::io::Error::other("single-node group has no peers"),
+        )))
+    }
+
+    async fn install_snapshot(
+        &mut self,
+        _rpc: InstallSnapshotRequest<C>,
+        _option: RPCOption,
+    ) -> Result<
+        InstallSnapshotResponse<NodeId>,
+        RPCError<NodeId, BasicNode, RaftError<NodeId, openraft::error::InstallSnapshotError>>,
+    > {
+        Err(RPCError::Unreachable(Unreachable::new(
+            &std::io::Error::other("single-node group has no peers"),
+        )))
+    }
+
+    async fn vote(
+        &mut self,
+        _rpc: VoteRequest<NodeId>,
+        _option: RPCOption,
+    ) -> Result<VoteResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId>>> {
+        Err(RPCError::Unreachable(Unreachable::new(
+            &std::io::Error::other("single-node group has no peers"),
+        )))
+    }
+}
+
+/// Routes RPCs to co-located Raft nodes by id. Generic over the group's
+/// type config, so it serves the metadata group and queue groups alike.
+pub struct Router<C: RaftTypeConfig = MetaTypeConfig> {
+    nodes: Arc<RwLock<HashMap<NodeId, openraft::Raft<C>>>>,
+}
+
+impl<C: RaftTypeConfig> Default for Router<C> {
+    fn default() -> Self {
+        Router {
+            nodes: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+}
+
+impl<C: RaftTypeConfig> Clone for Router<C> {
+    fn clone(&self) -> Self {
+        Router {
+            nodes: self.nodes.clone(),
+        }
+    }
+}
+
+impl<C: RaftTypeConfig> std::fmt::Debug for Router<C> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let ids: Vec<NodeId> = self
             .nodes
@@ -36,9 +113,9 @@ impl std::fmt::Debug for Router {
     }
 }
 
-impl Router {
+impl<C: RaftTypeConfig> Router<C> {
     /// Make a node reachable under `id`.
-    pub fn register(&self, id: NodeId, raft: MetaRaft) {
+    pub fn register(&self, id: NodeId, raft: openraft::Raft<C>) {
         self.nodes.write().expect("router lock").insert(id, raft);
     }
 
@@ -48,13 +125,16 @@ impl Router {
     }
 
     /// Look up a node's Raft handle.
-    pub fn get(&self, id: NodeId) -> Option<MetaRaft> {
+    pub fn get(&self, id: NodeId) -> Option<openraft::Raft<C>> {
         self.nodes.read().expect("router lock").get(&id).cloned()
     }
 }
 
-impl RaftNetworkFactory<MetaTypeConfig> for Router {
-    type Network = RouterConnection;
+impl<C> RaftNetworkFactory<C> for Router<C>
+where
+    C: RaftTypeConfig<NodeId = NodeId, Node = BasicNode>,
+{
+    type Network = RouterConnection<C>;
 
     async fn new_client(&mut self, target: NodeId, _node: &BasicNode) -> Self::Network {
         RouterConnection {
@@ -65,12 +145,12 @@ impl RaftNetworkFactory<MetaTypeConfig> for Router {
 }
 
 /// A "connection" to one target node through the router.
-pub struct RouterConnection {
+pub struct RouterConnection<C: RaftTypeConfig = MetaTypeConfig> {
     target: NodeId,
-    router: Router,
+    router: Router<C>,
 }
 
-impl std::fmt::Debug for RouterConnection {
+impl<C: RaftTypeConfig> std::fmt::Debug for RouterConnection<C> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RouterConnection")
             .field("target", &self.target)
@@ -78,18 +158,21 @@ impl std::fmt::Debug for RouterConnection {
     }
 }
 
-impl RouterConnection {
-    fn target_raft(&self) -> Result<MetaRaft, Unreachable> {
+impl<C: RaftTypeConfig> RouterConnection<C> {
+    fn target_raft(&self) -> Result<openraft::Raft<C>, Unreachable> {
         self.router
             .get(self.target)
             .ok_or_else(|| Unreachable::new(&std::io::Error::other("node not registered")))
     }
 }
 
-impl RaftNetwork<MetaTypeConfig> for RouterConnection {
+impl<C> RaftNetwork<C> for RouterConnection<C>
+where
+    C: RaftTypeConfig<NodeId = NodeId, Node = BasicNode>,
+{
     async fn append_entries(
         &mut self,
-        rpc: AppendEntriesRequest<MetaTypeConfig>,
+        rpc: AppendEntriesRequest<C>,
         _option: RPCOption,
     ) -> Result<AppendEntriesResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId>>> {
         let raft = self.target_raft().map_err(RPCError::Unreachable)?;
@@ -100,7 +183,7 @@ impl RaftNetwork<MetaTypeConfig> for RouterConnection {
 
     async fn install_snapshot(
         &mut self,
-        rpc: InstallSnapshotRequest<MetaTypeConfig>,
+        rpc: InstallSnapshotRequest<C>,
         _option: RPCOption,
     ) -> Result<
         InstallSnapshotResponse<NodeId>,
