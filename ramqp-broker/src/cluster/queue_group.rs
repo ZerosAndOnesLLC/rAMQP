@@ -342,6 +342,75 @@ mod tests {
         });
     }
 
+    /// With a snapshot policy configured, the in-memory log is compacted as
+    /// entries apply — log memory tracks queue depth, not total messages
+    /// ever enqueued (broker.md §3.2).
+    #[tokio::test]
+    async fn snapshot_policy_purges_the_log() {
+        let config = Arc::new(
+            Config {
+                heartbeat_interval: 50,
+                election_timeout_min: 150,
+                election_timeout_max: 300,
+                snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(1_000),
+                max_in_snapshot_log_to_keep: 100,
+                purge_batch_size: 500,
+                ..Default::default()
+            }
+            .validate()
+            .expect("valid config"),
+        );
+        let store = QueueStore::default();
+        let (log_store, state_machine) = openraft::storage::Adaptor::new(store.clone());
+        let raft = QueueRaft::new(9, config, UnreachableNetwork, log_store, state_machine)
+            .await
+            .expect("raft");
+        raft.initialize(BTreeMap::from([(9u64, BasicNode::new("local"))]))
+            .await
+            .expect("initialize");
+        raft.wait(Some(Duration::from_secs(5)))
+            .current_leader(9, "self-elect")
+            .await
+            .expect("leader");
+
+        // Enqueue + immediately settle 12k messages (24k log entries), far
+        // past the 1k snapshot threshold.
+        for i in 0..12_000u32 {
+            let resp = raft
+                .client_write(QueueCommand::Enqueue {
+                    body: Bytes::copy_from_slice(&i.to_be_bytes()),
+                })
+                .await
+                .expect("enqueue");
+            let QueueResponse::Enqueued { msg_id } = resp.data else {
+                panic!("expected enqueued");
+            };
+            raft.client_write(QueueCommand::Settle {
+                msg_id,
+                requeue: false,
+            })
+            .await
+            .expect("settle");
+        }
+
+        // Compaction runs asynchronously; wait for the purge to land.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let (log_len, last_purged) = store.log_stats();
+            if last_purged.is_some() && log_len < 5_000 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "log never compacted: {log_len} entries held, purged={last_purged:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        // The applied state is empty (everything settled) regardless of
+        // how much log was kept.
+        store.with_state(|s| assert!(s.messages.is_empty()));
+    }
+
     #[tokio::test]
     async fn snapshot_round_trips_the_message_store() {
         let (raft, store) = single_node_group().await;
