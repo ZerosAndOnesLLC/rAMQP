@@ -29,6 +29,7 @@ pub mod cluster;
 pub mod config;
 mod connection;
 mod queue;
+mod quorum;
 mod registry;
 
 pub use auth::{AllowAll, Authenticator, Credentials, StaticPlain};

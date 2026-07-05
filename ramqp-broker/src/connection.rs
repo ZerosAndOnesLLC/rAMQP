@@ -515,7 +515,10 @@ impl<S: IoStream> BrokerConnection<S> {
             },
             Role::Receiver => attach.source.as_ref().and_then(|s| s.address.clone()),
         };
-        let queue = address.as_deref().and_then(|a| self.registry.resolve(a));
+        let queue = match address.as_deref() {
+            Some(a) => self.registry.resolve(a).await,
+            None => None,
+        };
         let Some(queue) = queue else {
             tracing::debug!(name = %attach.name, ?address, "attach to unresolvable address");
             self.end_session_with_error(
