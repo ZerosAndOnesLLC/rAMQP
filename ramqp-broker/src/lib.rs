@@ -25,6 +25,7 @@
 
 pub mod auth;
 mod broker;
+pub mod cluster;
 pub mod config;
 mod connection;
 mod queue;

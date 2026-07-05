@@ -472,11 +472,11 @@ link/session → negotiate/mux/heartbeat → txn/sasl splits.
 - [x] §3.4 harness stood up (`bench-compare/latency`: closed-loop p50/p90/p99/p99.9 + blast throughput + RSS, in-process or any URL) and **first numbers recorded vs live RabbitMQ 4.3.1 and Artemis on this machine** (untuned defaults; see bench-compare/README): **p50 89µs vs 251/227µs, p99.9 428µs vs 777/833µs, 326k msg/s vs 48k/79k, ~40MiB vs 133/715MiB.** Deferred: tuned-incumbent isolated runs; CI regression-guard wiring (needs a perf-stable runner — harness is the tooling).
 - [x] End-to-end: client `produce_consume` example (now env-configurable) runs against `ramqp-brokerd` (new daemon bin); 8 e2e integration tests + blast regression. Commit.
 
-### Phase 5 — Cluster foundation
-- [ ] `openraft` integration + **multi-raft manager** (shared transport/tick/storage, batched — §3.2/§8).
-- [ ] **Metadata Raft group**: membership, queue catalog, placement, policies.
-- [ ] Cluster formation/bootstrap (static seeds first).
-- [ ] Test: 3-node cluster forms, metadata replicates, survives a node restart. **Bench: transient-queue numbers unchanged by the cluster layer.** Commit.
+### Phase 5 — Cluster foundation (in progress — foundation slice ✅)
+- [x] `openraft` 0.9.24 integration: `MetaTypeConfig` (declare_raft_types), in-memory `RaftStorage` (log/vote/snapshot/apply via the Adaptor), and an in-process `Router` network — the seam where the TCP inter-node transport slots in next. (Multi-raft manager comes with per-queue groups in Phase 6.)
+- [x] **Metadata Raft group**: replicated queue catalog (`MetaCommand::Create/DeleteQueue`, `QueueSpec{quorum|transient, replicas}`, idempotent apply); membership via openraft (add_learner/change_membership).
+- [ ] Cluster formation/bootstrap over **TCP** (static seeds; the router network is in-process only today) + wire queue declaration through the metadata group.
+- [x] Tests: single-node group applies/deletes; **3-node cluster forms, catalog replicates to every node; leader kill → re-election → post-failover writes converge on survivors**; learner joins and catches up. (Node-*restart* durability needs the on-disk log — Phase 7.) Bench unchanged: the cluster layer is not yet on any message path.
 
 ### Phase 6 — Quorum queues
 - [ ] Per-queue Raft state machine (enqueue/settle log entries + unacked map).
