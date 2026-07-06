@@ -121,10 +121,17 @@ async fn handshake<S: IoStream>(
     }
     let local_open = build_open(&config.connection);
     let negotiated = reconcile(&local_open, &peer_open);
+    // max-frame-size is DIRECTIONAL (spec §2.7.1): our advertised value bounds
+    // the frames the peer sends US, independent of its own (possibly smaller)
+    // receive limit. So inbound decode stays at OUR advertised max; only the
+    // OUTBOUND framing below uses the negotiated min (peer's advertised size).
+    // A memory-constrained client that advertises 4 KiB may still legally send
+    // us a 32 KiB transfer — rejecting it (via the min) would kill a valid link.
+    let our_max_frame_size = local_open.max_frame_size;
     transport
         .send_amqp(0, &Performative::Open(local_open), None)
         .await?;
-    transport.set_max_frame_size(negotiated.max_frame_size);
+    transport.set_max_frame_size(our_max_frame_size);
 
     let heartbeat = Heartbeat::new(negotiated.send_interval, negotiated.recv_timeout);
     let (link_events_tx, link_events_rx) = mpsc::channel(1024);

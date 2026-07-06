@@ -2,13 +2,14 @@
 //! protocol after a valid handshake, asserting the broker answers with a
 //! `close{error}` carrying an AMQP condition rather than a bare TCP reset.
 
-use tokio::io::AsyncReadExt;
+use bytes::BytesMut;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use ramqp_broker::{Broker, BrokerConfig};
 use ramqp_core::config::ConnectionConfig;
-use ramqp_core::transport::frame::{FrameBody, FramedTransport};
+use ramqp_core::transport::frame::{Frame, FrameBody, FramedTransport, decode_frame};
 use ramqp_core::transport::header::ProtocolHeader;
-use ramqp_core::types::performatives::{Open, Performative};
+use ramqp_core::types::performatives::{Begin, Open, Performative};
 
 async fn start() -> (std::net::SocketAddr, ramqp_broker::ShutdownHandle) {
     let bound = Broker::new(BrokerConfig::default())
@@ -45,6 +46,95 @@ async fn handshake(addr: std::net::SocketAddr) -> FramedTransport<tokio::net::Tc
         }
     }
     transport
+}
+
+/// Encode one AMQP frame to its exact wire bytes (via a scratch transport).
+async fn encode_frame(channel: u16, performative: &Performative) -> Vec<u8> {
+    let (a, mut b) = tokio::io::duplex(1 << 16);
+    let mut t = FramedTransport::new(a, 1 << 16);
+    t.send_amqp(channel, performative, None)
+        .await
+        .expect("encode frame");
+    let mut buf = vec![0u8; 1 << 16];
+    let n = b.read(&mut buf).await.expect("read encoded frame");
+    buf.truncate(n);
+    buf
+}
+
+/// Read one whole AMQP frame from a raw stream, decoding with a generous limit.
+async fn read_raw_frame(stream: &mut tokio::net::TcpStream, buf: &mut BytesMut) -> Frame {
+    loop {
+        if let Some(frame) = decode_frame(buf, 1 << 20).expect("decode") {
+            return frame;
+        }
+        let mut chunk = [0u8; 4096];
+        let n = stream.read(&mut chunk).await.expect("read");
+        assert!(n > 0, "stream closed before a full frame");
+        buf.extend_from_slice(&chunk[..n]);
+    }
+}
+
+/// max-frame-size is directional (spec §2.7.1): a client may advertise a small
+/// receive limit yet legally send frames as large as the BROKER advertised.
+/// The broker's inbound decode must honor its own advertised max, not the
+/// negotiated min — otherwise it kills a spec-legal oversized frame.
+#[tokio::test]
+async fn oversized_inbound_frame_from_small_advertiser_is_accepted() {
+    // Broker advertises the default (128 KiB); the raw client advertises 4 KiB.
+    let (addr, shutdown) = start().await;
+    let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    ProtocolHeader::AMQP
+        .negotiate(&mut stream)
+        .await
+        .expect("header");
+
+    let mut small_open = Open::new("small-advertiser");
+    small_open.max_frame_size = 4096;
+    stream
+        .write_all(&encode_frame(0, &Performative::Open(small_open)).await)
+        .await
+        .expect("send open");
+
+    let mut buf = BytesMut::new();
+    // Consume the broker's open.
+    loop {
+        match read_raw_frame(&mut stream, &mut buf).await.body {
+            FrameBody::Amqp(Performative::Open(_), _) => break,
+            FrameBody::Empty => continue,
+            other => panic!("expected broker open, got {other:?}"),
+        }
+    }
+
+    // Build an 8 KiB Begin frame (> the client's advertised 4 KiB, <= the
+    // broker's 128 KiB): pad the encoded Begin and fix its size header. The
+    // padding decodes as ignored trailing payload.
+    let begin = Begin {
+        next_outgoing_id: 0,
+        incoming_window: 8,
+        outgoing_window: 8,
+        handle_max: 16,
+        ..Default::default()
+    };
+    let mut big = encode_frame(0, &Performative::Begin(begin)).await;
+    assert!(big.len() < 8192);
+    big.resize(8192, 0);
+    big[0..4].copy_from_slice(&(8192u32).to_be_bytes());
+    stream.write_all(&big).await.expect("send big begin");
+
+    // The broker must ACCEPT the oversized frame — a Begin response, not a
+    // close{error: framing-error} from an over-strict inbound limit.
+    match read_raw_frame(&mut stream, &mut buf).await.body {
+        FrameBody::Amqp(Performative::Begin(_), _) => {}
+        FrameBody::Amqp(Performative::Close(c), _) => {
+            panic!(
+                "broker rejected a spec-legal oversized frame: {:?}",
+                c.error
+            )
+        }
+        other => panic!("expected a begin response, got {other:?}"),
+    }
+
+    shutdown.shutdown();
 }
 
 /// Read frames until a `close` arrives; returns whether it carried an error.
