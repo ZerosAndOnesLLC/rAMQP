@@ -7,6 +7,16 @@
 //! state machine, an in-memory log store, and an in-process network router
 //! (the TCP inter-node transport is the next slice; the router also serves
 //! multi-node tests without sockets).
+//!
+//! Crate-internal (not on the public API): these openraft-typed, pre-alpha
+//! internals must not appear on the crates.io semver surface. The
+//! metadata-group formation path (`bootstrap`, `tcp`, `network`, `meta`) is
+//! built and covered by tests but is not yet wired into the *running* broker —
+//! that multi-node integration is Phase-6-remaining work — so it reads as
+//! unused from the non-test crate build; `queue_group`/`store` are live via the
+//! quorum-queue actor. The allow marks this as ahead-of-integration scaffolding
+//! rather than accidental dead code.
+#![allow(dead_code)]
 
 pub mod bootstrap;
 pub mod meta;

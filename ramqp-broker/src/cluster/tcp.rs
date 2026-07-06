@@ -83,7 +83,16 @@ async fn read_frame<T: for<'de> Deserialize<'de>>(
 /// Runs until the listener errors or the task is dropped.
 pub async fn serve_raft(listener: TcpListener, raft: MetaRaft) -> std::io::Result<()> {
     loop {
-        let (mut stream, peer) = listener.accept().await?;
+        let (mut stream, peer) = match listener.accept().await {
+            Ok(pair) => pair,
+            // A transient accept error must not tear down the inter-node
+            // transport (that silently partitions this node). Log and continue.
+            Err(e) => {
+                tracing::warn!(error = %e, "raft accept error; continuing");
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                continue;
+            }
+        };
         let _ = stream.set_nodelay(true);
         let raft = raft.clone();
         tokio::spawn(async move {

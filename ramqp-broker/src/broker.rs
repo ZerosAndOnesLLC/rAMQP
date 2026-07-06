@@ -90,12 +90,16 @@ pub struct BoundBroker {
     shutdown_rx: watch::Receiver<bool>,
 }
 
-/// Signals a running broker to shut down (close listeners + connections).
+/// Signals a running broker to shut down.
 #[derive(Debug, Clone)]
 pub struct ShutdownHandle(watch::Sender<bool>);
 
 impl ShutdownHandle {
-    /// Begin shutdown: stop accepting and close every connection gracefully.
+    /// Begin shutdown: [`BoundBroker::run`] stops accepting and returns, and
+    /// every live connection observes the same signal and closes gracefully
+    /// (sending `close`). Connections close *asynchronously* — `run()` does not
+    /// block on them, so a caller that needs to wait for full drain should
+    /// track the connection tasks itself.
     pub fn shutdown(&self) {
         let _ = self.0.send(true);
     }
@@ -119,9 +123,20 @@ impl BoundBroker {
         loop {
             tokio::select! {
                 accepted = self.listener.accept() => {
-                    let (stream, peer) = accepted?;
-                    let _ = stream.set_nodelay(true);
-                    self.spawn_connection(stream, peer);
+                    match accepted {
+                        Ok((stream, peer)) => {
+                            let _ = stream.set_nodelay(true);
+                            self.spawn_connection(stream, peer);
+                        }
+                        // A per-accept error (fd exhaustion, a connection reset
+                        // before accept, etc.) is transient — log it and keep
+                        // serving rather than killing the whole broker. A short
+                        // pause avoids a busy-spin if the condition persists.
+                        Err(e) => {
+                            tracing::warn!(error = %e, "accept error; continuing");
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        }
+                    }
                 }
                 _ = self.shutdown_rx.changed() => {
                     tracing::info!("broker shutting down");

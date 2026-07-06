@@ -25,7 +25,9 @@
 
 pub mod auth;
 mod broker;
-pub mod cluster;
+// Cluster internals (openraft glue, in-memory storage, in-process router) are
+// not part of the crate's public API — they are pre-alpha and openraft-typed.
+pub(crate) mod cluster;
 pub mod config;
 mod connection;
 mod queue;
