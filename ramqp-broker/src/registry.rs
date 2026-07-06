@@ -30,9 +30,15 @@ pub(crate) enum QueueKind {
 }
 
 /// Resolves addresses to queue actors, declaring queues on first use.
+///
+/// The map is guarded by a *std* mutex held only for the O(1) get-or-insert of
+/// a per-key init cell — never across queue creation. The actual (async,
+/// possibly seconds-long for a quorum group) initialization runs on a
+/// [`tokio::sync::OnceCell`], which serializes only concurrent inits of the
+/// *same* queue; resolving a different queue is never blocked.
 #[derive(Debug)]
 pub(crate) struct QueueRegistry {
-    queues: tokio::sync::Mutex<HashMap<String, QueueHandle>>,
+    queues: std::sync::Mutex<HashMap<String, Arc<tokio::sync::OnceCell<QueueHandle>>>>,
     max_depth: usize,
     /// This node's id for single-replica queue groups.
     node_id: NodeId,
@@ -41,7 +47,7 @@ pub(crate) struct QueueRegistry {
 impl QueueRegistry {
     pub fn new(max_depth: usize) -> Self {
         QueueRegistry {
-            queues: tokio::sync::Mutex::new(HashMap::new()),
+            queues: std::sync::Mutex::new(HashMap::new()),
             max_depth,
             node_id: 1,
         }
@@ -68,22 +74,45 @@ impl QueueRegistry {
             QueueKind::Transient => format!("t:{name}"),
             QueueKind::Quorum => format!("q:{name}"),
         };
-        let mut map = self.queues.lock().await;
-        if let Some(q) = map.get(&key) {
-            return Some(q.clone());
-        }
-        let handle = match kind {
-            QueueKind::Transient => queue::spawn(name.to_owned(), self.max_depth),
-            QueueKind::Quorum => {
-                spawn_quorum_group(name.to_owned(), self.node_id, self.max_depth).await?
+        // Bounded retry so a queue that dies on spawn can't loop forever.
+        for _ in 0..3 {
+            // Brief lock: get or create this key's init cell, then release.
+            let cell = {
+                let mut map = self.queues.lock().expect("registry lock");
+                map.entry(key.clone()).or_default().clone()
+            };
+            // Initialize outside the lock; the cell serializes same-key inits.
+            let handle = cell
+                .get_or_try_init(|| async {
+                    let h = match kind {
+                        QueueKind::Transient => queue::spawn(name.to_owned(), self.max_depth),
+                        QueueKind::Quorum => {
+                            spawn_quorum_group(name.to_owned(), self.node_id, self.max_depth)
+                                .await
+                                .ok_or(())?
+                        }
+                    };
+                    Ok::<_, ()>(h)
+                })
+                .await
+                .ok()?;
+            // Evict a dead queue (its actor task stopped) and re-declare, so a
+            // publish/attach never hangs against a defunct handle.
+            if handle.tx.is_closed() {
+                let mut map = self.queues.lock().expect("registry lock");
+                if map.get(&key).is_some_and(|c| Arc::ptr_eq(c, &cell)) {
+                    map.remove(&key);
+                }
+                continue;
             }
-        };
-        map.insert(key, handle.clone());
-        Some(handle)
+            return Some(handle.clone());
+        }
+        None
     }
 }
 
-/// Start a single-replica queue group and its quorum actor.
+/// Start a single-replica queue group and its quorum actor. Logs (rather than
+/// silently swallows) each failure so a resolution error is diagnosable.
 async fn spawn_quorum_group(
     name: String,
     node_id: NodeId,
@@ -102,6 +131,7 @@ async fn spawn_quorum_group(
         ..Default::default()
     }
     .validate()
+    .map_err(|e| tracing::error!(queue = %name, error = %e, "quorum config invalid"))
     .ok()?;
     let store = QueueStore::default();
     let (log_store, state_machine) = openraft::storage::Adaptor::new(store.clone());
@@ -113,16 +143,19 @@ async fn spawn_quorum_group(
         state_machine,
     )
     .await
+    .map_err(|e| tracing::error!(queue = %name, error = %e, "quorum raft init failed"))
     .ok()?;
     raft.initialize(std::collections::BTreeMap::from([(
         node_id,
         BasicNode::new("local"),
     )]))
     .await
+    .map_err(|e| tracing::error!(queue = %name, error = %e, "quorum initialize failed"))
     .ok()?;
     raft.wait(Some(std::time::Duration::from_secs(10)))
         .current_leader(node_id, "single-replica leader")
         .await
+        .map_err(|e| tracing::error!(queue = %name, error = %e, "quorum leader-wait failed"))
         .ok()?;
     Some(quorum::spawn(name, raft, store, max_depth))
 }
