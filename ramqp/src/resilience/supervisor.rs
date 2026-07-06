@@ -57,9 +57,10 @@ impl Backoff {
             return None;
         }
         if let Some(max) = self.policy.max_retries
-            && self.attempt >= max {
-                return None;
-            }
+            && self.attempt >= max
+        {
+            return None;
+        }
         self.attempt += 1;
         let base = self.current.min(self.policy.max_backoff);
         let delay = apply_jitter(base, self.policy.jitter);

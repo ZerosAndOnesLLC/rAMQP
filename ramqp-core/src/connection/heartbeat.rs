@@ -95,13 +95,15 @@ impl Heartbeat {
                     self.last_send = now;
                 }
                 if let Some(to) = self.recv_timeout
-                    && now.saturating_duration_since(self.last_recv) >= to {
-                        return HeartbeatAction::PeerTimedOut;
-                    }
+                    && now.saturating_duration_since(self.last_recv) >= to
+                {
+                    return HeartbeatAction::PeerTimedOut;
+                }
                 if let Some(sa) = self.send_after
-                    && now.saturating_duration_since(self.last_send) >= sa {
-                        return HeartbeatAction::SendEmpty;
-                    }
+                    && now.saturating_duration_since(self.last_send) >= sa
+                {
+                    return HeartbeatAction::SendEmpty;
+                }
                 HeartbeatAction::Idle
             }
             None => std::future::pending().await,

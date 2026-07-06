@@ -508,9 +508,10 @@ impl<S: IoStream> BrokerConnection<S> {
             _ => 0,
         };
         if grant > 0
-            && let Some(session) = self.sessions.get_mut(&channel) {
-                session.grant_credit(handle, grant, &mut self.transport);
-            }
+            && let Some(session) = self.sessions.get_mut(&channel)
+        {
+            session.grant_credit(handle, grant, &mut self.transport);
+        }
     }
 
     /// Resolve a peer channel to our local channel for an inbound link frame.
