@@ -187,30 +187,41 @@ where
     S: ReplicatedState<Command = C::D, Response = C::R>,
 {
     async fn build_snapshot(&mut self) -> Result<Snapshot<C>, StorageError<NodeId>> {
-        let mut inner = self.lock();
-        let payload = SnapshotPayload {
-            last_applied: inner.last_applied,
-            last_membership: inner.last_membership.clone(),
-            state: inner.state.clone(),
+        // Capture a cheap point-in-time copy under the lock, then RELEASE it —
+        // the same mutex serializes apply/append and every catalog/dispatch
+        // read, so serializing a deep queue's state (potentially multi-second)
+        // while holding it would stall the whole group and time out followers.
+        let (payload, meta) = {
+            let mut inner = self.lock();
+            inner.snapshot_idx += 1;
+            let meta = SnapshotMeta {
+                last_log_id: inner.last_applied,
+                last_membership: inner.last_membership.clone(),
+                snapshot_id: format!(
+                    "{}-{}",
+                    inner
+                        .last_applied
+                        .map(|l| l.index.to_string())
+                        .unwrap_or_else(|| "none".to_owned()),
+                    inner.snapshot_idx
+                ),
+            };
+            let payload = SnapshotPayload {
+                last_applied: inner.last_applied,
+                last_membership: inner.last_membership.clone(),
+                state: inner.state.clone(),
+            };
+            (payload, meta)
         };
-        // Compact binary encoding: snapshots of binary-heavy queue state must
-        // not inflate (JSON turns 256-byte bodies into ~1 KB integer arrays).
-        let data = bincode::serialize(&payload)
+        // Serialize off the async worker (CPU-heavy for large state) and
+        // off-lock. Compact binary encoding: snapshots of binary-heavy queue
+        // state must not inflate (JSON turns 256-byte bodies into ~1 KB arrays).
+        let data = tokio::task::spawn_blocking(move || bincode::serialize(&payload))
+            .await
+            .map_err(|e| openraft::StorageIOError::write_snapshot(None, &e))?
             .map_err(|e| openraft::StorageIOError::write_snapshot(None, &e))?;
-        inner.snapshot_idx += 1;
-        let meta = SnapshotMeta {
-            last_log_id: inner.last_applied,
-            last_membership: inner.last_membership.clone(),
-            snapshot_id: format!(
-                "{}-{}",
-                inner
-                    .last_applied
-                    .map(|l| l.index.to_string())
-                    .unwrap_or_else(|| "none".to_owned()),
-                inner.snapshot_idx
-            ),
-        };
-        inner.snapshot = Some((meta.clone(), data.clone()));
+        // Briefly re-lock only to publish the finished snapshot.
+        self.lock().snapshot = Some((meta.clone(), data.clone()));
         Ok(Snapshot {
             meta,
             snapshot: Box::new(Cursor::new(data)),

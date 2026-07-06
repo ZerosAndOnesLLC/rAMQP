@@ -1,6 +1,6 @@
 [package]
 name = "ramqp-broker"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2024"
 rust-version = "1.85"
 description = "A performance-first, highly-available AMQP 1.0 broker in Rust (in development)."
