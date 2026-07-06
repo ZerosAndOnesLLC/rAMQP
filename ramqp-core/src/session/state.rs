@@ -645,14 +645,13 @@ impl Session {
                 r.credit.record_received();
             } else {
                 // A continuation transfer must carry the same delivery-id (or none).
-                if let (Some(partial), Some(did)) = (r.partial.as_ref(), transfer.delivery_id) {
-                    if partial.delivery_id().value() != did {
+                if let (Some(partial), Some(did)) = (r.partial.as_ref(), transfer.delivery_id)
+                    && partial.delivery_id().value() != did {
                         return Err(ConnectError::msg(
                             ErrorKind::ProtocolViolation,
                             "interleaved delivery-id during multi-frame transfer",
                         ));
                     }
-                }
                 let payload = payload.unwrap_or_default();
                 let cap = r.size_cap();
                 if r.partial.is_none() && !transfer.more {
@@ -830,12 +829,11 @@ impl Session {
                                 _ if settled => Some(DeliveryState::Accepted(Accepted::default())),
                                 _ => None,
                             };
-                            if let Some(rs) = resolve {
-                                if let Some((reply, sent_at)) = s.pending.remove(&id) {
+                            if let Some(rs) = resolve
+                                && let Some((reply, sent_at)) = s.pending.remove(&id) {
                                     let _ = reply.send(Ok(rs));
                                     self.metrics.on_send_to_settle(sent_at.elapsed());
                                 }
-                            }
                             if settled {
                                 self.metrics.on_inflight(-1);
                             }
@@ -854,12 +852,11 @@ impl Session {
             // Peer (sender) is settling deliveries we received.
             Role::Sender => {
                 for link in self.links.values_mut() {
-                    if let Link::Receiver(r) = link {
-                        if !r.unsettled.is_empty() {
+                    if let Link::Receiver(r) = link
+                        && !r.unsettled.is_empty() {
                             r.unsettled
                                 .apply_disposition(first, last, state.as_ref(), settled);
                         }
-                    }
                 }
             }
         }
@@ -902,8 +899,8 @@ impl Session {
         );
 
         // Apply only to the owning link (no full-table scan).
-        if let Some(Link::Receiver(r)) = self.links.get_mut(&handle) {
-            if !r.unsettled.is_empty() {
+        if let Some(Link::Receiver(r)) = self.links.get_mut(&handle)
+            && !r.unsettled.is_empty() {
                 let affected = r
                     .unsettled
                     .apply_disposition(f, l, Some(&state), wire_settled);
@@ -911,7 +908,6 @@ impl Session {
                     self.metrics.on_inflight(-(affected.len() as i64));
                 }
             }
-        }
     }
 
     /// Grant *additional* receiver credit and advertise it (consumer-driven
@@ -943,9 +939,9 @@ impl Session {
         // them first — this is what reopens our remote-incoming-window.
         self.windows.on_peer_flow(&flow);
         // Apply the link-level credit for a handle-carrying flow...
-        if let Some(peer_handle) = flow.handle {
-            if let Some(local) = self.remote_handles.resolve(peer_handle) {
-                if let Some(Link::Sender(s)) = self.links.get_mut(&local) {
+        if let Some(peer_handle) = flow.handle
+            && let Some(local) = self.remote_handles.resolve(peer_handle)
+                && let Some(Link::Sender(s)) = self.links.get_mut(&local) {
                     s.credit.apply_flow_as_sender(
                         flow.delivery_count,
                         flow.link_credit,
@@ -958,8 +954,6 @@ impl Session {
                         drain: s.credit.drain,
                     });
                 }
-            }
-        }
         // ...then flush *every* sender with queued work. The reopened session
         // window is a shared resource: a flow carrying link B's handle still
         // advances the window that link A is stalled on, so flushing only the
@@ -982,8 +976,8 @@ impl Session {
         // Respond to an echo request with our current flow state.
         if flow.echo {
             let mut response = self.windows.build_flow();
-            if let Some(peer_handle) = flow.handle {
-                if let Some(local) = self.remote_handles.resolve(peer_handle) {
+            if let Some(peer_handle) = flow.handle
+                && let Some(local) = self.remote_handles.resolve(peer_handle) {
                     match self.links.get(&local) {
                         Some(Link::Sender(s)) => {
                             response.handle = Some(local);
@@ -998,7 +992,6 @@ impl Session {
                         None => {}
                     }
                 }
-            }
             transport.queue_amqp(self.local_channel, &Performative::Flow(response), None);
         }
     }
@@ -1006,13 +999,11 @@ impl Session {
     /// Issue link/session flow (e.g. manual consumer credit).
     pub fn send_flow<S: IoStream>(&mut self, flow: Flow, transport: &mut FramedTransport<S>) {
         // Apply credit locally for receiver links so accounting stays consistent.
-        if let Some(peer_handle) = flow.handle {
-            if let Some(Link::Receiver(r)) = self.links.get_mut(&peer_handle) {
-                if let Some(lc) = flow.link_credit {
+        if let Some(peer_handle) = flow.handle
+            && let Some(Link::Receiver(r)) = self.links.get_mut(&peer_handle)
+                && let Some(lc) = flow.link_credit {
                     r.credit.set_credit(lc);
                 }
-            }
-        }
         let mut flow = flow;
         let win = self.windows.build_flow();
         flow.next_incoming_id = win.next_incoming_id;
