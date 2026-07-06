@@ -28,7 +28,7 @@ with `-p ramqp-bench-compare`.
 ## Development Setup
 
 ```bash
-# Install Rust (stable; ramqp's MSRV is 1.85, edition 2024)
+# Install Rust (latest stable; edition 2024)
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
 # Build and test

@@ -99,7 +99,7 @@ side (publish order: `ramqp-core` first).
 ### Changed
 - Repository hygiene: community health files (`CONTRIBUTING`, `SECURITY`,
   `CODE_OF_CONDUCT`, `SUPPORT`, this changelog, issue/PR templates), GitHub
-  Actions CI (check / test / fmt / clippy `-D warnings` / docs / MSRV) and a
+  Actions CI (check / test / fmt / clippy `-D warnings` / docs) and a
   tag-driven crates.io release workflow.
 - The tree is now `cargo clippy -D warnings` and `cargo fmt` clean.
 
