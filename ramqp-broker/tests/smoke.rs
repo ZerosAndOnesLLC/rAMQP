@@ -97,6 +97,53 @@ async fn sessions_can_end_and_reopen() {
 }
 
 #[tokio::test]
+async fn connection_limit_refuses_excess_then_recovers() {
+    let config = BrokerConfig {
+        max_connections: 1,
+        ..Default::default()
+    };
+    let (addr, shutdown) = start(Broker::new(config)).await;
+
+    // The first connection establishes and holds the sole permit.
+    let c1 = ConnectionBuilder::new(format!("amqp://{addr}"))
+        .connect()
+        .await
+        .expect("first connection accepted");
+
+    // A second connection is refused: the broker drops the socket without
+    // completing the handshake, so the client's connect fails.
+    let refused = ConnectionBuilder::new(format!("amqp://{addr}"))
+        .connect()
+        .await;
+    assert!(
+        refused.is_err(),
+        "second connection must be refused at the cap"
+    );
+
+    // Closing the first frees the permit; a fresh connection then succeeds
+    // (the permit release is async, so allow a few attempts).
+    c1.close().await.expect("close first");
+    let mut recovered = None;
+    for _ in 0..50 {
+        if let Ok(c) = ConnectionBuilder::new(format!("amqp://{addr}"))
+            .connect()
+            .await
+        {
+            recovered = Some(c);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    recovered
+        .expect("a permit frees up after the first connection closes")
+        .close()
+        .await
+        .expect("close recovered");
+
+    shutdown.shutdown();
+}
+
+#[tokio::test]
 async fn many_concurrent_connections() {
     let (addr, shutdown) = start(Broker::new(BrokerConfig::default())).await;
 

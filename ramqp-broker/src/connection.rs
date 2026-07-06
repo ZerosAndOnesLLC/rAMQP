@@ -28,7 +28,9 @@ use ramqp_core::session::state::Session;
 use ramqp_core::transport::IoStream;
 use ramqp_core::transport::frame::{Frame, FrameBody, FramedTransport};
 use ramqp_core::transport::header::{ProtocolHeader, accept as accept_header};
-use ramqp_core::types::definitions::{AmqpError as AmqpCondition, Error as AmqpError, Role};
+use ramqp_core::types::definitions::{
+    AmqpError as AmqpCondition, ConnectionError, Error as AmqpError, ErrorCondition, Role,
+};
 use ramqp_core::types::messaging::{Accepted, DeliveryState, Rejected, TargetArchetype};
 use ramqp_core::types::performatives::{Attach, Begin, Close, End, Performative};
 use ramqp_core::types::sasl::{SaslCode, SaslFrame, SaslMechanisms, SaslOutcome};
@@ -61,6 +63,12 @@ pub(crate) async fn serve<S: IoStream>(
     };
     conn.shutdown = Some(shutdown);
     let result = conn.run().await;
+    // On a fatal error, tell the peer why with a close{error} before the socket
+    // drops (AMQP requires the condition; a bare TCP reset leaves the peer to
+    // guess). Clean completion (peer close / shutdown) returns Ok and skips this.
+    if let Err(err) = &result {
+        conn.close_with_error(err).await;
+    }
     conn.cleanup().await;
     result
 }
@@ -871,6 +879,32 @@ impl<S: IoStream> BrokerConnection<S> {
                 let _ = queue.tx.send(QueueMsg::Unsubscribe { sub }).await;
             }
         }
+    }
+
+    /// Best-effort `close{error}` sent to the peer when the connection fails,
+    /// so the peer learns the condition instead of only seeing a TCP reset.
+    /// Errors that mean the socket is already gone (I/O, peer-closed) or a
+    /// clean local cancellation are skipped — there is no one to tell.
+    async fn close_with_error(&mut self, err: &ConnectError) {
+        let condition: ErrorCondition = match err.kind() {
+            ErrorKind::ProtocolViolation => ConnectionError::FramingError.into(),
+            ErrorKind::Timeout => ConnectionError::ConnectionForced.into(),
+            ErrorKind::Sasl => AmqpCondition::UnauthorizedAccess.into(),
+            ErrorKind::Capacity => AmqpCondition::ResourceLimitExceeded.into(),
+            ErrorKind::Settlement | ErrorKind::Encode => AmqpCondition::InternalError.into(),
+            // Socket already gone or a clean local stop: nothing to send.
+            ErrorKind::Io
+            | ErrorKind::Tls
+            | ErrorKind::PeerClosed
+            | ErrorKind::NotConnected
+            | ErrorKind::Cancelled => return,
+            _ => AmqpCondition::InternalError.into(),
+        };
+        let error = AmqpError::new(condition, Some(err.to_string()));
+        let _ = self
+            .transport
+            .send_amqp(0, &Performative::Close(Close { error: Some(error) }), None)
+            .await;
     }
 
     /// After we initiate `close`, wait briefly for the peer's `close`.
