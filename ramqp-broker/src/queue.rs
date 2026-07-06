@@ -27,6 +27,8 @@ use std::collections::{HashMap, VecDeque};
 use bytes::Bytes;
 use tokio::sync::mpsc;
 
+use crate::dispatch::{Subscriber, complete_drains, confirm_publish, pick_ready, refuse_publish};
+
 /// A queue's identity + mailbox, cheap to clone.
 #[derive(Debug, Clone)]
 pub(crate) struct QueueHandle {
@@ -168,18 +170,6 @@ struct Stored {
     failures: u32,
 }
 
-#[derive(Debug)]
-struct Subscriber {
-    id: SubId,
-    conn: mpsc::UnboundedSender<ConnCmd>,
-    channel: u16,
-    handle: u32,
-    binding_gen: u64,
-    demand: u32,
-    /// A drain is in progress: zero any leftover demand after the next dispatch.
-    drain_pending: bool,
-}
-
 /// Spawn a queue actor; the returned handle is its only address.
 pub(crate) fn spawn(name: String, max_depth: usize) -> QueueHandle {
     let (tx, rx) = mpsc::channel(1024);
@@ -204,17 +194,7 @@ async fn run(name: String, mut rx: mpsc::Receiver<QueueMsg>, max_depth: usize) {
             QueueMsg::Publish { body, ack } => {
                 if ready.len() + unacked.len() >= max_depth {
                     // Refuse rather than grow without bound (broker.md §3.2).
-                    if let Some(ack) = ack {
-                        let _ = ack.conn.send(ConnCmd::SettleIncoming {
-                            channel: ack.channel,
-                            handle: ack.handle,
-                            binding_gen: ack.binding_gen,
-                            delivery_id: ack.delivery_id,
-                            accepted: false,
-                        });
-                    } else {
-                        tracing::warn!(queue = %name, "pre-settled publish dropped: queue full");
-                    }
+                    refuse_publish(&name, ack);
                     continue;
                 }
                 next_msg_id += 1;
@@ -225,15 +205,7 @@ async fn run(name: String, mut rx: mpsc::Receiver<QueueMsg>, max_depth: usize) {
                 });
                 // In-memory transient queue: stored == settled. (A durable /
                 // quorum queue confirms here only after fsync / Raft commit.)
-                if let Some(ack) = ack {
-                    let _ = ack.conn.send(ConnCmd::SettleIncoming {
-                        channel: ack.channel,
-                        handle: ack.handle,
-                        binding_gen: ack.binding_gen,
-                        delivery_id: ack.delivery_id,
-                        accepted: true,
-                    });
-                }
+                confirm_publish(ack);
             }
             QueueMsg::Subscribe {
                 conn,
@@ -243,24 +215,21 @@ async fn run(name: String, mut rx: mpsc::Receiver<QueueMsg>, max_depth: usize) {
                 reply,
             } => {
                 next_sub_id += 1;
-                subs.push(Subscriber {
-                    id: next_sub_id,
+                subs.push(Subscriber::new(
+                    next_sub_id,
                     conn,
                     channel,
                     handle,
                     binding_gen,
-                    demand: 0,
-                    drain_pending: false,
-                });
+                ));
                 let _ = reply.send(next_sub_id);
             }
             QueueMsg::Demand { sub, credit, drain } => {
                 if let Some(s) = subs.iter_mut().find(|s| s.id == sub) {
-                    s.demand = s.demand.saturating_add(credit);
                     // A drain zeros whatever is left *after* this cycle's
                     // dispatch, so the consumer's "then stop" is honored without
                     // stranding messages that are available right now.
-                    s.drain_pending = drain;
+                    s.grant(credit, drain);
                 }
             }
             QueueMsg::Settle {
@@ -316,21 +285,11 @@ async fn dispatch(
     rr: &mut usize,
 ) {
     while !ready.is_empty() {
-        // Find the next subscriber with demand, round-robin.
-        let n = subs.len();
-        if n == 0 {
+        // Next subscriber with demand (round-robin); stop if none want work.
+        let Some(idx) = pick_ready(subs, *rr) else {
             return;
-        }
-        let mut picked = None;
-        for i in 0..n {
-            let idx = (*rr + i) % n;
-            if subs[idx].demand > 0 {
-                picked = Some(idx);
-                break;
-            }
-        }
-        let Some(idx) = picked else { return };
-        *rr = (idx + 1) % n;
+        };
+        *rr = (idx + 1) % subs.len();
 
         let msg = ready.pop_front().expect("non-empty");
         let sub = &mut subs[idx];
@@ -353,15 +312,7 @@ async fn dispatch(
         }
     }
 
-    // Drain completion: a subscriber that asked to drain keeps only the demand
-    // it could satisfy from `ready` this cycle; the rest is dropped so it isn't
-    // re-armed against messages that arrive later (the consumer said "stop").
-    for s in subs.iter_mut() {
-        if s.drain_pending {
-            s.demand = 0;
-            s.drain_pending = false;
-        }
-    }
+    complete_drains(subs);
 }
 
 #[cfg(test)]

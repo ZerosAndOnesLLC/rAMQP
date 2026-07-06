@@ -30,6 +30,7 @@ mod broker;
 pub(crate) mod cluster;
 pub mod config;
 mod connection;
+mod dispatch;
 mod queue;
 mod quorum;
 mod registry;
