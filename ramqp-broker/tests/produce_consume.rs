@@ -101,6 +101,93 @@ async fn consumer_handle_reuse_across_queues_never_cross_delivers() {
     shutdown.shutdown();
 }
 
+/// Refusing one link (here: an attach that trips the queue cap) must detach
+/// only that link — the session and its sibling links stay fully usable. A
+/// bad address must never tear the whole session down.
+#[tokio::test]
+async fn link_refusal_keeps_the_session_alive() {
+    let config = BrokerConfig {
+        max_queues: 1,
+        ..Default::default()
+    };
+    let bound = Broker::new(config).bind("127.0.0.1:0").await.expect("bind");
+    let addr = bound.local_addr();
+    let shutdown = bound.shutdown_handle();
+    tokio::spawn(bound.run());
+
+    let conn = connect(addr).await;
+    let session = conn.begin_session().await.expect("session");
+
+    // Declare the one allowed queue and publish to it.
+    let producer = session
+        .create_producer("/queues/only")
+        .await
+        .expect("producer declares the sole queue");
+    producer.send(Message::text("hi")).await.expect("send");
+
+    // A consumer on a *new* address is refused at the cap. However it surfaces
+    // (error, or an immediately-detached link), it must not kill the session.
+    let _refused = session.create_consumer("/queues/second").await;
+
+    // The session is still alive: consume from the queue that does exist.
+    let mut consumer = session
+        .create_consumer("/queues/only")
+        .await
+        .expect("consumer on the still-live session");
+    let d = consumer.recv().await.expect("delivery");
+    assert_eq!(text_of(&d), "hi");
+    consumer.accept(&d).await.expect("accept");
+
+    conn.close().await.expect("close");
+    shutdown.shutdown();
+}
+
+/// An abrupt connection drop (crash — no detach/close) must requeue the
+/// consumer's unsettled deliveries for the next consumer. Exercises the
+/// broker's connection-death cleanup path, not the graceful-detach path.
+#[tokio::test]
+async fn abrupt_connection_drop_requeues_unacked() {
+    let (addr, shutdown) = start().await;
+
+    // Producer publishes one message on its own connection.
+    let pc = connect(addr).await;
+    let ps = pc.begin_session().await.expect("producer session");
+    let producer = ps
+        .create_producer("/queues/abrupt")
+        .await
+        .expect("producer");
+    producer.send(Message::text("survive")).await.expect("send");
+
+    // Consumer receives it but never settles, then the whole connection is
+    // dropped without any detach/close — a simulated crash.
+    let cc = connect(addr).await;
+    let cs = cc.begin_session().await.expect("consumer session");
+    let mut consumer = cs
+        .create_consumer("/queues/abrupt")
+        .await
+        .expect("consumer");
+    let d = consumer.recv().await.expect("delivery");
+    assert_eq!(text_of(&d), "survive");
+    drop(consumer);
+    drop(cs);
+    drop(cc); // dropping the Connection tears the driver task down → TCP closes
+
+    // A fresh consumer (new connection) gets the requeued message.
+    let cc2 = connect(addr).await;
+    let cs2 = cc2.begin_session().await.expect("second consumer session");
+    let mut c2 = cs2
+        .create_consumer("/queues/abrupt")
+        .await
+        .expect("second consumer");
+    let d2 = c2.recv().await.expect("redelivery after abrupt drop");
+    assert_eq!(text_of(&d2), "survive");
+    c2.accept(&d2).await.expect("accept");
+
+    pc.close().await.expect("close producer");
+    cc2.close().await.expect("close consumer");
+    shutdown.shutdown();
+}
+
 #[tokio::test]
 async fn store_and_forward_produce_then_consume() {
     let (addr, shutdown) = start().await;

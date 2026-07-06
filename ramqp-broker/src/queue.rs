@@ -583,6 +583,74 @@ mod tests {
         assert_eq!(&body[..], b"m");
     }
 
+    /// The settle-owner rule: once a message is requeued and redispatched to a
+    /// new subscriber, a late settle from the *former* owner must be ignored —
+    /// otherwise a stale ack would drop a message the new owner still holds.
+    #[tokio::test]
+    async fn stale_settle_from_former_owner_is_ignored() {
+        let q = spawn("t".into(), 100);
+        let (c1_tx, mut c1_rx) = mpsc::unbounded_channel();
+        let s1 = subscribe(&q, &c1_tx, 1).await;
+        q.tx.send(QueueMsg::Demand {
+            sub: s1,
+            credit: 10,
+            drain: false,
+        })
+        .await
+        .unwrap();
+        q.tx.send(QueueMsg::Publish {
+            body: Bytes::from_static(b"m"),
+            ack: None,
+        })
+        .await
+        .unwrap();
+        let ConnCmd::Deliver { msg_id, .. } = c1_rx.recv().await.unwrap() else {
+            panic!("expected deliver");
+        };
+
+        // s1 drops; the message requeues and is redispatched to s2 (new owner).
+        q.tx.send(QueueMsg::Unsubscribe { sub: s1 }).await.unwrap();
+        let (c2_tx, mut c2_rx) = mpsc::unbounded_channel();
+        let s2 = subscribe(&q, &c2_tx, 2).await;
+        q.tx.send(QueueMsg::Demand {
+            sub: s2,
+            credit: 10,
+            drain: false,
+        })
+        .await
+        .unwrap();
+        let ConnCmd::Deliver { msg_id: m2, .. } = c2_rx.recv().await.unwrap() else {
+            panic!("expected redelivery to s2");
+        };
+        assert_eq!(m2, msg_id, "same message redelivered");
+
+        // A stale Ack from s1 (the former owner) must NOT remove it from s2.
+        q.tx.send(QueueMsg::Settle {
+            sub: s1,
+            msg_id,
+            outcome: SettleOutcome::Ack,
+        })
+        .await
+        .unwrap();
+
+        // Proof it still belongs to s2: dropping s2 requeues it, and a third
+        // consumer receives it again. (A stale-ack drop would lose it here.)
+        q.tx.send(QueueMsg::Unsubscribe { sub: s2 }).await.unwrap();
+        let (c3_tx, mut c3_rx) = mpsc::unbounded_channel();
+        let s3 = subscribe(&q, &c3_tx, 3).await;
+        q.tx.send(QueueMsg::Demand {
+            sub: s3,
+            credit: 10,
+            drain: false,
+        })
+        .await
+        .unwrap();
+        let ConnCmd::Deliver { msg_id: m3, .. } = c3_rx.recv().await.unwrap() else {
+            panic!("message was lost to the stale ack");
+        };
+        assert_eq!(m3, msg_id, "message survived the stale former-owner ack");
+    }
+
     #[tokio::test]
     async fn overflow_rejects_unsettled_publishes() {
         let q = spawn("t".into(), 1);
