@@ -94,15 +94,15 @@ impl Heartbeat {
                 if std::mem::take(&mut self.send_since_tick) {
                     self.last_send = now;
                 }
-                if let Some(to) = self.recv_timeout {
-                    if now.saturating_duration_since(self.last_recv) >= to {
-                        return HeartbeatAction::PeerTimedOut;
-                    }
+                if let Some(to) = self.recv_timeout
+                    && now.saturating_duration_since(self.last_recv) >= to
+                {
+                    return HeartbeatAction::PeerTimedOut;
                 }
-                if let Some(sa) = self.send_after {
-                    if now.saturating_duration_since(self.last_send) >= sa {
-                        return HeartbeatAction::SendEmpty;
-                    }
+                if let Some(sa) = self.send_after
+                    && now.saturating_duration_since(self.last_send) >= sa
+                {
+                    return HeartbeatAction::SendEmpty;
                 }
                 HeartbeatAction::Idle
             }

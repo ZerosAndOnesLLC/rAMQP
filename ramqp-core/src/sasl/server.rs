@@ -300,8 +300,18 @@ mod scram_server {
                 return Err(ScramServerError::BadProof);
             }
 
-            // client-final-without-proof is everything before ",p=".
-            let without_proof = &msg[..msg.rfind(",p=").expect("p= parsed above")];
+            // client-final-without-proof is everything before ",p=". RFC 5802
+            // requires the proof to be the *last* attribute; a client that
+            // reorders it (p= not preceded by a comma) is malformed — reject
+            // it rather than panicking on the missing separator.
+            let without_proof = match msg.rfind(",p=") {
+                Some(i) => &msg[..i],
+                None => {
+                    return Err(ScramServerError::Malformed(
+                        "client-final proof attribute must be last",
+                    ));
+                }
+            };
             let auth_message = format!(
                 "{},{},{}",
                 self.client_first_bare, self.server_first_msg, without_proof
@@ -404,6 +414,22 @@ mod tests {
             // Tampered nonce.
             let err = s
                 .on_client_final(b"c=biws,r=tampered,p=v0X8v3Bz2T0CJGbJQyF0X+HI4Ts=")
+                .unwrap_err();
+            assert!(matches!(err, ScramServerError::Malformed(_)));
+        }
+
+        #[test]
+        fn reordered_proof_first_is_rejected_not_panicked() {
+            // A client-final with p= as the first attribute (proof not last)
+            // must be rejected as malformed, never panic (CVE-shaped DoS).
+            let mut s = ScramServer::with_nonce(ScramMechanism::Sha1, SERVER_NONCE.into());
+            s.on_client_first(CLIENT_FIRST).unwrap();
+            s.server_first(rfc_verifier());
+            let err = s
+                .on_client_final(
+                    b"p=v0X8v3Bz2T0CJGbJQyF0X+HI4Ts=,c=biws,\
+                      r=fyko+d2lbbFgONRv9qkxdawL3rfcNHYJY1ZVvWVs7j",
+                )
                 .unwrap_err();
             assert!(matches!(err, ScramServerError::Malformed(_)));
         }

@@ -447,6 +447,53 @@ impl Session {
         })
     }
 
+    /// Refuse a peer-initiated attach we cannot honor (e.g. an unresolvable
+    /// address), scoped to just that link. Per AMQP 1.0 §2.6.3 the responder
+    /// completes the attach with the offending terminus set to null, then
+    /// immediately detaches (closed) with the error. No link state is retained,
+    /// and the session and its sibling links stay up — a bad address on one
+    /// link must not tear the whole session down.
+    pub fn refuse_peer_attach<S: IoStream>(
+        &mut self,
+        attach: &Attach,
+        error: AmqpError,
+        transport: &mut FramedTransport<S>,
+    ) {
+        let our_role = match attach.role {
+            Role::Sender => Role::Receiver,
+            Role::Receiver => Role::Sender,
+        };
+        // Name the link with a throwaway handle so the attach/detach pair is
+        // well-formed; release it right back since we retain no link.
+        let handle = self.handles.allocate();
+        let local = handle.unwrap_or(0);
+        // Null source AND target: the unambiguous "terminus refused" signal
+        // regardless of which side the peer asked us to resolve.
+        let response = Attach {
+            name: attach.name.clone(),
+            handle: local,
+            role: our_role,
+            snd_settle_mode: attach.snd_settle_mode,
+            rcv_settle_mode: attach.rcv_settle_mode,
+            source: None,
+            target: None,
+            ..Default::default()
+        };
+        transport.queue_amqp(self.local_channel, &Performative::Attach(response), None);
+        transport.queue_amqp(
+            self.local_channel,
+            &Performative::Detach(Detach {
+                handle: local,
+                closed: true,
+                error: Some(error),
+            }),
+            None,
+        );
+        if handle.is_some() {
+            self.handles.release(local);
+        }
+    }
+
     /// Enqueue an outbound message on a sender link and try to flush it.
     #[allow(clippy::too_many_arguments)]
     pub fn send_transfer<S: IoStream>(
@@ -598,13 +645,13 @@ impl Session {
                 r.credit.record_received();
             } else {
                 // A continuation transfer must carry the same delivery-id (or none).
-                if let (Some(partial), Some(did)) = (r.partial.as_ref(), transfer.delivery_id) {
-                    if partial.delivery_id().value() != did {
-                        return Err(ConnectError::msg(
-                            ErrorKind::ProtocolViolation,
-                            "interleaved delivery-id during multi-frame transfer",
-                        ));
-                    }
+                if let (Some(partial), Some(did)) = (r.partial.as_ref(), transfer.delivery_id)
+                    && partial.delivery_id().value() != did
+                {
+                    return Err(ConnectError::msg(
+                        ErrorKind::ProtocolViolation,
+                        "interleaved delivery-id during multi-frame transfer",
+                    ));
                 }
                 let payload = payload.unwrap_or_default();
                 let cap = r.size_cap();
@@ -684,8 +731,7 @@ impl Session {
 
         // Replenish the session incoming-window if exhausted.
         if need_session_flow {
-            self.windows
-                .replenish_incoming(self.windows.outgoing_window.max(1));
+            self.windows.replenish_incoming();
             let flow = self.windows.build_flow();
             transport.queue_amqp(local_channel, &Performative::Flow(flow), None);
         }
@@ -784,11 +830,11 @@ impl Session {
                                 _ if settled => Some(DeliveryState::Accepted(Accepted::default())),
                                 _ => None,
                             };
-                            if let Some(rs) = resolve {
-                                if let Some((reply, sent_at)) = s.pending.remove(&id) {
-                                    let _ = reply.send(Ok(rs));
-                                    self.metrics.on_send_to_settle(sent_at.elapsed());
-                                }
+                            if let Some(rs) = resolve
+                                && let Some((reply, sent_at)) = s.pending.remove(&id)
+                            {
+                                let _ = reply.send(Ok(rs));
+                                self.metrics.on_send_to_settle(sent_at.elapsed());
                             }
                             if settled {
                                 self.metrics.on_inflight(-1);
@@ -808,11 +854,11 @@ impl Session {
             // Peer (sender) is settling deliveries we received.
             Role::Sender => {
                 for link in self.links.values_mut() {
-                    if let Link::Receiver(r) = link {
-                        if !r.unsettled.is_empty() {
-                            r.unsettled
-                                .apply_disposition(first, last, state.as_ref(), settled);
-                        }
+                    if let Link::Receiver(r) = link
+                        && !r.unsettled.is_empty()
+                    {
+                        r.unsettled
+                            .apply_disposition(first, last, state.as_ref(), settled);
                     }
                 }
             }
@@ -856,14 +902,14 @@ impl Session {
         );
 
         // Apply only to the owning link (no full-table scan).
-        if let Some(Link::Receiver(r)) = self.links.get_mut(&handle) {
-            if !r.unsettled.is_empty() {
-                let affected = r
-                    .unsettled
-                    .apply_disposition(f, l, Some(&state), wire_settled);
-                if wire_settled {
-                    self.metrics.on_inflight(-(affected.len() as i64));
-                }
+        if let Some(Link::Receiver(r)) = self.links.get_mut(&handle)
+            && !r.unsettled.is_empty()
+        {
+            let affected = r
+                .unsettled
+                .apply_disposition(f, l, Some(&state), wire_settled);
+            if wire_settled {
+                self.metrics.on_inflight(-(affected.len() as i64));
             }
         }
     }
@@ -893,61 +939,60 @@ impl Session {
         transport: &mut FramedTransport<S>,
         max_frame_size: usize,
     ) {
+        // Every inbound flow carries the peer's session-window fields; apply
+        // them first — this is what reopens our remote-incoming-window.
         self.windows.on_peer_flow(&flow);
-        if let Some(peer_handle) = flow.handle {
-            if let Some(local) = self.remote_handles.resolve(peer_handle) {
-                if let Some(Link::Sender(s)) = self.links.get_mut(&local) {
-                    s.credit.apply_flow_as_sender(
-                        flow.delivery_count,
-                        flow.link_credit,
-                        flow.drain,
-                    );
-                    self.metrics.on_credit(local, s.credit.link_credit);
-                    let _ = s.events.try_send(LinkEvent::Credit {
-                        handle: Handle(local),
-                        credit: s.credit.link_credit,
-                        drain: s.credit.drain,
-                    });
-                }
-                self.flush_sender(local, transport, max_frame_size);
-            }
-        } else {
-            // A pure session flow (no handle) reopens the session window: any
-            // sender stalled on remote-incoming-window exhaustion must resume,
-            // or messages sit in its outbox until an unrelated flush happens
-            // to run (a peer whose sends are dispatch-driven — a broker —
-            // would stall permanently at exactly `incoming-window` transfers).
-            let stalled: Vec<u32> = self
-                .links
-                .iter()
-                .filter_map(|(&h, l)| match l {
-                    Link::Sender(s) if !s.outbox.is_empty() => Some(h),
-                    _ => None,
-                })
-                .collect();
-            for handle in stalled {
-                self.flush_sender(handle, transport, max_frame_size);
-            }
+        // Apply the link-level credit for a handle-carrying flow...
+        if let Some(peer_handle) = flow.handle
+            && let Some(local) = self.remote_handles.resolve(peer_handle)
+            && let Some(Link::Sender(s)) = self.links.get_mut(&local)
+        {
+            s.credit
+                .apply_flow_as_sender(flow.delivery_count, flow.link_credit, flow.drain);
+            self.metrics.on_credit(local, s.credit.link_credit);
+            let _ = s.events.try_send(LinkEvent::Credit {
+                handle: Handle(local),
+                credit: s.credit.link_credit,
+                drain: s.credit.drain,
+            });
+        }
+        // ...then flush *every* sender with queued work. The reopened session
+        // window is a shared resource: a flow carrying link B's handle still
+        // advances the window that link A is stalled on, so flushing only the
+        // named link would leave other senders' outboxes stuck indefinitely
+        // (a dispatch-driven peer — a broker — never gets a second nudge).
+        // Each flush is still gated by that link's own credit + the window, so
+        // this neither double-sends nor sends without credit.
+        let stalled: Vec<u32> = self
+            .links
+            .iter()
+            .filter_map(|(&h, l)| match l {
+                Link::Sender(s) if !s.outbox.is_empty() => Some(h),
+                _ => None,
+            })
+            .collect();
+        for handle in stalled {
+            self.flush_sender(handle, transport, max_frame_size);
         }
 
         // Respond to an echo request with our current flow state.
         if flow.echo {
             let mut response = self.windows.build_flow();
-            if let Some(peer_handle) = flow.handle {
-                if let Some(local) = self.remote_handles.resolve(peer_handle) {
-                    match self.links.get(&local) {
-                        Some(Link::Sender(s)) => {
-                            response.handle = Some(local);
-                            response.delivery_count = Some(s.credit.delivery_count);
-                            response.link_credit = Some(s.credit.link_credit);
-                        }
-                        Some(Link::Receiver(r)) => {
-                            response.handle = Some(local);
-                            response.delivery_count = Some(r.credit.delivery_count);
-                            response.link_credit = Some(r.credit.link_credit);
-                        }
-                        None => {}
+            if let Some(peer_handle) = flow.handle
+                && let Some(local) = self.remote_handles.resolve(peer_handle)
+            {
+                match self.links.get(&local) {
+                    Some(Link::Sender(s)) => {
+                        response.handle = Some(local);
+                        response.delivery_count = Some(s.credit.delivery_count);
+                        response.link_credit = Some(s.credit.link_credit);
                     }
+                    Some(Link::Receiver(r)) => {
+                        response.handle = Some(local);
+                        response.delivery_count = Some(r.credit.delivery_count);
+                        response.link_credit = Some(r.credit.link_credit);
+                    }
+                    None => {}
                 }
             }
             transport.queue_amqp(self.local_channel, &Performative::Flow(response), None);
@@ -957,12 +1002,11 @@ impl Session {
     /// Issue link/session flow (e.g. manual consumer credit).
     pub fn send_flow<S: IoStream>(&mut self, flow: Flow, transport: &mut FramedTransport<S>) {
         // Apply credit locally for receiver links so accounting stays consistent.
-        if let Some(peer_handle) = flow.handle {
-            if let Some(Link::Receiver(r)) = self.links.get_mut(&peer_handle) {
-                if let Some(lc) = flow.link_credit {
-                    r.credit.set_credit(lc);
-                }
-            }
+        if let Some(peer_handle) = flow.handle
+            && let Some(Link::Receiver(r)) = self.links.get_mut(&peer_handle)
+            && let Some(lc) = flow.link_credit
+        {
+            r.credit.set_credit(lc);
         }
         let mut flow = flow;
         let win = self.windows.build_flow();
@@ -1281,6 +1325,48 @@ mod tests {
         }
     }
 
+    /// Refusing an attach (unresolvable address) completes the attach with a
+    /// null source/target then immediately detaches (closed) with the error —
+    /// a link-scoped refusal that leaves the session and its handles intact.
+    #[tokio::test]
+    async fn refuse_peer_attach_responds_null_terminus_then_detaches() {
+        let (mut session, _resp, _evt, mut transport, mut far) = server_session(&peer_begin());
+        let attach = Attach {
+            name: "bad".into(),
+            handle: 4,
+            role: Role::Receiver, // peer wants to consume from an address we can't resolve
+            source: Some(crate::types::messaging::Source::new("/nope")),
+            ..Default::default()
+        };
+        let err = AmqpError::new(
+            crate::types::definitions::AmqpError::NotFound,
+            Some("no queue".into()),
+        );
+        session.refuse_peer_attach(&attach, err, &mut transport);
+        transport.flush().await.unwrap();
+
+        // Attach response first: our (mirror) role, null source AND target.
+        match far.read_frame().await.unwrap().body {
+            FrameBody::Amqp(Performative::Attach(a), _) => {
+                assert_eq!(a.name, "bad");
+                assert_eq!(a.role, Role::Sender);
+                assert!(a.source.is_none(), "refused source must be null");
+                assert!(a.target.is_none(), "refused target must be null");
+            }
+            other => panic!("expected attach, got {other:?}"),
+        }
+        // ...then a closed detach carrying the error.
+        match far.read_frame().await.unwrap().body {
+            FrameBody::Amqp(Performative::Detach(d), _) => {
+                assert!(d.closed);
+                assert!(d.error.is_some(), "detach carries the refusal error");
+            }
+            other => panic!("expected detach, got {other:?}"),
+        }
+        // The throwaway handle was released: the session can still attach links.
+        assert!(!session.knows_link("bad"));
+    }
+
     #[tokio::test]
     async fn accept_peer_attach_as_sender_sends_once_credited() {
         let (mut session, _resp, _evt, mut transport, mut far) = server_session(&peer_begin());
@@ -1419,6 +1505,121 @@ mod tests {
             FrameBody::Amqp(Performative::Transfer(_), _) => {}
             other => panic!("expected the stalled transfer, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn flow_carrying_one_handle_still_unstalls_other_senders() {
+        // Two consumer links (broker is sender to each) share a session whose
+        // remote-incoming-window is tiny. Link A fills the window and stalls
+        // with a message still queued. A flow carrying link B's handle reopens
+        // the shared session window — link A's stalled message must flush.
+        let begin = Begin {
+            incoming_window: 1, // peer will accept only 1 transfer before flow
+            ..peer_begin()
+        };
+        let (mut session, _resp, _evt, mut transport, mut far) = server_session(&begin);
+        let (tx, _rx) = mpsc::channel(16);
+
+        let attach = |name: &str, handle: u32| Attach {
+            name: name.into(),
+            handle,
+            role: Role::Receiver,
+            ..Default::default()
+        };
+        let a = session
+            .accept_peer_attach(
+                attach("A", 1),
+                CreditMode::Manual,
+                0,
+                None,
+                tx.clone(),
+                &mut transport,
+            )
+            .expect("A");
+        let b = session
+            .accept_peer_attach(
+                attach("B", 2),
+                CreditMode::Manual,
+                0,
+                None,
+                tx,
+                &mut transport,
+            )
+            .expect("B");
+
+        // Credit both links generously (link credit is not the bottleneck here).
+        for peer_h in [1u32, 2] {
+            session.on_flow(
+                Flow {
+                    next_incoming_id: Some(0),
+                    incoming_window: 1,
+                    next_outgoing_id: 0,
+                    outgoing_window: 100,
+                    handle: Some(peer_h),
+                    link_credit: Some(10),
+                    delivery_count: Some(0),
+                    ..Default::default()
+                },
+                &mut transport,
+                1 << 16,
+            );
+        }
+
+        // Queue two messages on A: the first consumes the 1-frame window, the
+        // second is stuck.
+        for body in [&b"a1"[..], &b"a2"[..]] {
+            session.send_transfer(
+                a.handle.0,
+                Bytes::copy_from_slice(body),
+                true,
+                0,
+                None,
+                None,
+                &mut transport,
+                1 << 16,
+            );
+        }
+        transport.flush().await.unwrap();
+        // Drain frames emitted so far; exactly one A transfer got out.
+        let mut a_transfers = 0;
+        while let Ok(Ok(f)) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), far.read_frame()).await
+        {
+            if let FrameBody::Amqp(Performative::Transfer(_), _) = f.body {
+                a_transfers += 1;
+            }
+        }
+        assert_eq!(a_transfers, 1, "window allowed only the first transfer");
+
+        // A flow that names link B reopens the shared session window. The fix:
+        // A's stalled second message must now flush even though the flow was
+        // "for" B.
+        session.on_flow(
+            Flow {
+                next_incoming_id: Some(1),
+                incoming_window: 100,
+                next_outgoing_id: 0,
+                outgoing_window: 100,
+                handle: Some(2), // link B's handle — NOT the stalled link A
+                link_credit: Some(10),
+                delivery_count: Some(0),
+                ..Default::default()
+            },
+            &mut transport,
+            1 << 16,
+        );
+        transport.flush().await.unwrap();
+        let f = tokio::time::timeout(std::time::Duration::from_millis(200), far.read_frame())
+            .await
+            .expect("A's stalled transfer must flush")
+            .unwrap();
+        match f.body {
+            FrameBody::Amqp(Performative::Transfer(_), payload) => {
+                assert_eq!(payload.as_deref(), Some(&b"a2"[..]));
+            }
+            other => panic!("expected A's stalled transfer, got {other:?}"),
+        }
+        let _ = b;
     }
 
     #[tokio::test]

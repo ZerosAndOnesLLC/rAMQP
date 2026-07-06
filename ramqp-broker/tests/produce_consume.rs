@@ -35,6 +35,159 @@ fn text_of(delivery: &ramqp::Delivery) -> String {
     }
 }
 
+/// Detaching a consumer and attaching another on the same session reuses the
+/// link handle (client allocates LIFO). The broker must rebind that reused
+/// (channel, handle) to the new queue and route only that queue's messages to
+/// it — the binding-generation guarantee (H1): a stale command for the old
+/// binding must never be misrouted to the link that now occupies the handle.
+///
+/// Asserts the *routing* property (a queue-A message never reaches a queue-B
+/// consumer and vice-versa) under repeated handle-reuse churn; it tolerates
+/// at-least-once redelivery within a queue.
+#[tokio::test]
+async fn consumer_handle_reuse_across_queues_never_cross_delivers() {
+    let (addr, shutdown) = start().await;
+    let conn = connect(addr).await;
+    let session = conn.begin_session().await.expect("session");
+
+    let pa = session
+        .create_producer("/queues/reuse-a")
+        .await
+        .expect("pa");
+    let pb = session
+        .create_producer("/queues/reuse-b")
+        .await
+        .expect("pb");
+
+    for round in 0..8 {
+        pa.send(Message::text(format!("a{round}")))
+            .await
+            .expect("send a");
+        pb.send(Message::text(format!("b{round}")))
+            .await
+            .expect("send b");
+
+        // Consume from A on a fresh consumer, then detach it (frees the handle).
+        let mut ca = session
+            .create_consumer("/queues/reuse-a")
+            .await
+            .expect("ca");
+        let da = ca.recv().await.expect("recv a");
+        assert!(
+            text_of(&da).starts_with('a'),
+            "queue-A consumer received a non-A message: {:?}",
+            text_of(&da)
+        );
+        ca.accept(&da).await.expect("accept a");
+        ca.detach().await.expect("detach a");
+
+        // A new consumer on B reuses A's just-freed handle. It must only ever
+        // receive B's messages — never one of A's (the misrouting bug).
+        let mut cb = session
+            .create_consumer("/queues/reuse-b")
+            .await
+            .expect("cb");
+        let db = cb.recv().await.expect("recv b");
+        assert!(
+            text_of(&db).starts_with('b'),
+            "reused handle received the wrong queue's message: {:?}",
+            text_of(&db)
+        );
+        cb.accept(&db).await.expect("accept b");
+        cb.detach().await.expect("detach b");
+    }
+
+    conn.close().await.expect("close");
+    shutdown.shutdown();
+}
+
+/// Refusing one link (here: an attach that trips the queue cap) must detach
+/// only that link — the session and its sibling links stay fully usable. A
+/// bad address must never tear the whole session down.
+#[tokio::test]
+async fn link_refusal_keeps_the_session_alive() {
+    let config = BrokerConfig {
+        max_queues: 1,
+        ..Default::default()
+    };
+    let bound = Broker::new(config).bind("127.0.0.1:0").await.expect("bind");
+    let addr = bound.local_addr();
+    let shutdown = bound.shutdown_handle();
+    tokio::spawn(bound.run());
+
+    let conn = connect(addr).await;
+    let session = conn.begin_session().await.expect("session");
+
+    // Declare the one allowed queue and publish to it.
+    let producer = session
+        .create_producer("/queues/only")
+        .await
+        .expect("producer declares the sole queue");
+    producer.send(Message::text("hi")).await.expect("send");
+
+    // A consumer on a *new* address is refused at the cap. However it surfaces
+    // (error, or an immediately-detached link), it must not kill the session.
+    let _refused = session.create_consumer("/queues/second").await;
+
+    // The session is still alive: consume from the queue that does exist.
+    let mut consumer = session
+        .create_consumer("/queues/only")
+        .await
+        .expect("consumer on the still-live session");
+    let d = consumer.recv().await.expect("delivery");
+    assert_eq!(text_of(&d), "hi");
+    consumer.accept(&d).await.expect("accept");
+
+    conn.close().await.expect("close");
+    shutdown.shutdown();
+}
+
+/// An abrupt connection drop (crash — no detach/close) must requeue the
+/// consumer's unsettled deliveries for the next consumer. Exercises the
+/// broker's connection-death cleanup path, not the graceful-detach path.
+#[tokio::test]
+async fn abrupt_connection_drop_requeues_unacked() {
+    let (addr, shutdown) = start().await;
+
+    // Producer publishes one message on its own connection.
+    let pc = connect(addr).await;
+    let ps = pc.begin_session().await.expect("producer session");
+    let producer = ps
+        .create_producer("/queues/abrupt")
+        .await
+        .expect("producer");
+    producer.send(Message::text("survive")).await.expect("send");
+
+    // Consumer receives it but never settles, then the whole connection is
+    // dropped without any detach/close — a simulated crash.
+    let cc = connect(addr).await;
+    let cs = cc.begin_session().await.expect("consumer session");
+    let mut consumer = cs
+        .create_consumer("/queues/abrupt")
+        .await
+        .expect("consumer");
+    let d = consumer.recv().await.expect("delivery");
+    assert_eq!(text_of(&d), "survive");
+    drop(consumer);
+    drop(cs);
+    drop(cc); // dropping the Connection tears the driver task down → TCP closes
+
+    // A fresh consumer (new connection) gets the requeued message.
+    let cc2 = connect(addr).await;
+    let cs2 = cc2.begin_session().await.expect("second consumer session");
+    let mut c2 = cs2
+        .create_consumer("/queues/abrupt")
+        .await
+        .expect("second consumer");
+    let d2 = c2.recv().await.expect("redelivery after abrupt drop");
+    assert_eq!(text_of(&d2), "survive");
+    c2.accept(&d2).await.expect("accept");
+
+    pc.close().await.expect("close producer");
+    cc2.close().await.expect("close consumer");
+    shutdown.shutdown();
+}
+
 #[tokio::test]
 async fn store_and_forward_produce_then_consume() {
     let (addr, shutdown) = start().await;

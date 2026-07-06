@@ -77,10 +77,18 @@ impl Authenticator for StaticPlain {
     fn verify(&self, credentials: Credentials<'_>) -> bool {
         match credentials {
             Credentials::Anonymous => false,
-            Credentials::Plain { authcid, passwd } => self
-                .users
-                .get(authcid)
-                .is_some_and(|expected| ct_str_eq(expected, passwd)),
+            Credentials::Plain { authcid, passwd } => {
+                // Normalize timing between "no such user" and "wrong password":
+                // always perform a comparison (against a placeholder for a
+                // missing user) so a fast negative doesn't reveal that the
+                // username exists. StaticPlain stores plaintext and is a
+                // dev/testing helper — for production use an Authenticator that
+                // verifies against salted hashes (e.g. via ScramServer).
+                const PLACEHOLDER: &str = "\0no-such-user-placeholder\0";
+                let expected = self.users.get(authcid).map(String::as_str);
+                let ok = ct_str_eq(expected.unwrap_or(PLACEHOLDER), passwd);
+                expected.is_some() && ok
+            }
         }
     }
 }

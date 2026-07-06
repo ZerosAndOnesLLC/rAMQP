@@ -11,12 +11,22 @@ use ramqp_broker::{Broker, BrokerConfig};
 /// (mailbox-bounded publishes must backpressure producers without deadlock).
 #[tokio::test]
 async fn quorum_blast_with_ranged_accepts() {
-    blast("/quorum/blast", 5000).await;
+    // Full size in release (the perf regression guard); scaled down in debug
+    // so a plain `cargo test` stays fast.
+    blast(
+        "/quorum/blast",
+        if cfg!(debug_assertions) { 800 } else { 5000 },
+    )
+    .await;
 }
 
 #[tokio::test]
 async fn settled_blast_with_ranged_accepts() {
-    blast("/queues/blast", 50000).await;
+    blast(
+        "/queues/blast",
+        if cfg!(debug_assertions) { 3000 } else { 50000 },
+    )
+    .await;
 }
 
 async fn blast(address: &str, n: usize) {

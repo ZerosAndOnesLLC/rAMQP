@@ -2,7 +2,6 @@
 name = "ramqp"
 version = "0.8.0"
 edition = "2024"
-rust-version = "1.85"
 description = "Async AMQP 1.0 client for Rust on tokio — connects to RabbitMQ 4.x, ActiveMQ Artemis, and other AMQP 1.0 brokers."
 license = "MIT"
 repository = "https://github.com/ZerosAndOnesLLC/rAMQP"

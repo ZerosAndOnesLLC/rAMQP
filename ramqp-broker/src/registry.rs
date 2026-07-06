@@ -30,19 +30,29 @@ pub(crate) enum QueueKind {
 }
 
 /// Resolves addresses to queue actors, declaring queues on first use.
+///
+/// The map is guarded by a *std* mutex held only for the O(1) get-or-insert of
+/// a per-key init cell — never across queue creation. The actual (async,
+/// possibly seconds-long for a quorum group) initialization runs on a
+/// [`tokio::sync::OnceCell`], which serializes only concurrent inits of the
+/// *same* queue; resolving a different queue is never blocked.
 #[derive(Debug)]
 pub(crate) struct QueueRegistry {
-    queues: tokio::sync::Mutex<HashMap<String, QueueHandle>>,
+    queues: std::sync::Mutex<HashMap<String, Arc<tokio::sync::OnceCell<QueueHandle>>>>,
     max_depth: usize,
+    /// Cap on the number of distinct queues (0 = unbounded); bounds how many
+    /// actors / Raft groups a client can auto-declare.
+    max_queues: usize,
     /// This node's id for single-replica queue groups.
     node_id: NodeId,
 }
 
 impl QueueRegistry {
-    pub fn new(max_depth: usize) -> Self {
+    pub fn new(max_depth: usize, max_queues: usize) -> Self {
         QueueRegistry {
-            queues: tokio::sync::Mutex::new(HashMap::new()),
+            queues: std::sync::Mutex::new(HashMap::new()),
             max_depth,
+            max_queues,
             node_id: 1,
         }
     }
@@ -68,22 +78,69 @@ impl QueueRegistry {
             QueueKind::Transient => format!("t:{name}"),
             QueueKind::Quorum => format!("q:{name}"),
         };
-        let mut map = self.queues.lock().await;
-        if let Some(q) = map.get(&key) {
-            return Some(q.clone());
-        }
-        let handle = match kind {
-            QueueKind::Transient => queue::spawn(name.to_owned(), self.max_depth),
-            QueueKind::Quorum => {
-                spawn_quorum_group(name.to_owned(), self.node_id, self.max_depth).await?
+        // Bounded retry so a queue that dies on spawn can't loop forever.
+        for _ in 0..3 {
+            // Brief lock: get or create this key's init cell, then release. A
+            // brand-new key is refused once the queue cap is reached (an
+            // unbounded auto-declare DoS guard); existing queues still resolve.
+            let cell = {
+                let mut map = self.queues.lock().expect("registry lock");
+                if !map.contains_key(&key) && self.max_queues != 0 && map.len() >= self.max_queues {
+                    tracing::warn!(
+                        queue = %name,
+                        max = self.max_queues,
+                        "queue limit reached; refusing to auto-declare"
+                    );
+                    return None;
+                }
+                map.entry(key.clone()).or_default().clone()
+            };
+            // Initialize outside the lock; the cell serializes same-key inits.
+            let init = cell
+                .get_or_try_init(|| async {
+                    let h = match kind {
+                        QueueKind::Transient => queue::spawn(name.to_owned(), self.max_depth),
+                        QueueKind::Quorum => {
+                            spawn_quorum_group(name.to_owned(), self.node_id, self.max_depth)
+                                .await
+                                .ok_or(())?
+                        }
+                    };
+                    Ok::<_, ()>(h)
+                })
+                .await;
+            let handle = match init {
+                Ok(h) => h,
+                // Init failed: drop the empty cell so it neither counts against
+                // the cap nor serves a poisoned entry; the next attach retries.
+                Err(()) => {
+                    let mut map = self.queues.lock().expect("registry lock");
+                    if map
+                        .get(&key)
+                        .is_some_and(|c| Arc::ptr_eq(c, &cell) && c.get().is_none())
+                    {
+                        map.remove(&key);
+                    }
+                    return None;
+                }
+            };
+            // Evict a dead queue (its actor task stopped) and re-declare, so a
+            // publish/attach never hangs against a defunct handle.
+            if handle.tx.is_closed() {
+                let mut map = self.queues.lock().expect("registry lock");
+                if map.get(&key).is_some_and(|c| Arc::ptr_eq(c, &cell)) {
+                    map.remove(&key);
+                }
+                continue;
             }
-        };
-        map.insert(key, handle.clone());
-        Some(handle)
+            return Some(handle.clone());
+        }
+        None
     }
 }
 
-/// Start a single-replica queue group and its quorum actor.
+/// Start a single-replica queue group and its quorum actor. Logs (rather than
+/// silently swallows) each failure so a resolution error is diagnosable.
 async fn spawn_quorum_group(
     name: String,
     node_id: NodeId,
@@ -102,6 +159,7 @@ async fn spawn_quorum_group(
         ..Default::default()
     }
     .validate()
+    .map_err(|e| tracing::error!(queue = %name, error = %e, "quorum config invalid"))
     .ok()?;
     let store = QueueStore::default();
     let (log_store, state_machine) = openraft::storage::Adaptor::new(store.clone());
@@ -113,16 +171,19 @@ async fn spawn_quorum_group(
         state_machine,
     )
     .await
+    .map_err(|e| tracing::error!(queue = %name, error = %e, "quorum raft init failed"))
     .ok()?;
     raft.initialize(std::collections::BTreeMap::from([(
         node_id,
         BasicNode::new("local"),
     )]))
     .await
+    .map_err(|e| tracing::error!(queue = %name, error = %e, "quorum initialize failed"))
     .ok()?;
     raft.wait(Some(std::time::Duration::from_secs(10)))
         .current_leader(node_id, "single-replica leader")
         .await
+        .map_err(|e| tracing::error!(queue = %name, error = %e, "quorum leader-wait failed"))
         .ok()?;
     Some(quorum::spawn(name, raft, store, max_depth))
 }
@@ -156,7 +217,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_is_idempotent_and_kind_scoped() {
-        let r = QueueRegistry::new(10);
+        let r = QueueRegistry::new(10, 0);
         let a = r.resolve("/queues/q1").await.unwrap();
         let b = r.resolve("q1").await.unwrap();
         assert!(a.tx.same_channel(&b.tx), "same transient queue");
@@ -168,5 +229,18 @@ mod tests {
         );
         let quorum2 = r.resolve("/quorum/q1").await.unwrap();
         assert!(quorum.tx.same_channel(&quorum2.tx));
+    }
+
+    #[tokio::test]
+    async fn resolve_enforces_the_queue_cap() {
+        let r = QueueRegistry::new(10, 2);
+        // Two distinct queues declare fine.
+        assert!(r.resolve("/queues/a").await.is_some());
+        assert!(r.resolve("/queues/b").await.is_some());
+        // A third *new* queue is refused at the cap...
+        assert!(r.resolve("/queues/c").await.is_none());
+        // ...but already-declared queues still resolve.
+        assert!(r.resolve("/queues/a").await.is_some());
+        assert!(r.resolve("b").await.is_some());
     }
 }

@@ -152,7 +152,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         received += 1;
         if received == thr_n {
             last = Some(d);
-        } else if received % 64 == 0 {
+        } else if received.is_multiple_of(64) {
             // Batched settlement (cheap ranged disposition).
             consumer.accept_through(&d).await?;
         }

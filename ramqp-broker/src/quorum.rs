@@ -31,16 +31,8 @@ use futures_util::stream::FuturesUnordered;
 use tokio::sync::mpsc;
 
 use crate::cluster::queue_group::{QueueCommand, QueueRaft, QueueResponse, QueueStore};
+use crate::dispatch::{Subscriber, complete_drains, confirm_publish, pick_ready, refuse_publish};
 use crate::queue::{ConnCmd, PublishAck, QueueHandle, QueueMsg, SettleOutcome, SubId};
-
-#[derive(Debug)]
-struct Subscriber {
-    id: SubId,
-    conn: mpsc::UnboundedSender<ConnCmd>,
-    channel: u16,
-    handle: u32,
-    demand: u32,
-}
 
 /// The resolution of a pipelined commit.
 enum Committed {
@@ -124,19 +116,13 @@ async fn run(
                         publishes_pending -= 1;
                         match result {
                             Ok(msg_id) => {
+                                // Committed to the Raft log: confirm to the producer.
                                 ready.insert(msg_id);
-                                if let Some(ack) = ack {
-                                    let _ = ack.conn.send(ConnCmd::SettleIncoming {
-                                        channel: ack.channel,
-                                        handle: ack.handle,
-                                        delivery_id: ack.delivery_id,
-                                        accepted: true,
-                                    });
-                                }
+                                confirm_publish(ack);
                             }
                             Err(e) => {
                                 tracing::warn!(queue = %name, error = %e, "enqueue not committed");
-                                refuse(&name, ack);
+                                refuse_publish(&name, ack);
                             }
                         }
                     }
@@ -179,7 +165,7 @@ fn handle_msg(
         QueueMsg::Publish { body, ack } => {
             // Depth bound counts everything stored or about to be.
             if ready.len() + inflight.len() + *publishes_pending >= max_depth {
-                refuse(name, ack);
+                refuse_publish(name, ack);
                 return;
             }
             *publishes_pending += 1;
@@ -199,21 +185,22 @@ fn handle_msg(
             conn,
             channel,
             handle,
+            binding_gen,
             reply,
         } => {
             *next_sub_id += 1;
-            subs.push(Subscriber {
-                id: *next_sub_id,
+            subs.push(Subscriber::new(
+                *next_sub_id,
                 conn,
                 channel,
                 handle,
-                demand: 0,
-            });
+                binding_gen,
+            ));
             let _ = reply.send(*next_sub_id);
         }
-        QueueMsg::Demand { sub, credit } => {
+        QueueMsg::Demand { sub, credit, drain } => {
             if let Some(s) = subs.iter_mut().find(|s| s.id == sub) {
-                s.demand = credit;
+                s.grant(credit, drain);
             }
         }
         QueueMsg::Settle {
@@ -278,19 +265,6 @@ fn handle_msg(
     }
 }
 
-fn refuse(name: &str, ack: Option<PublishAck>) {
-    if let Some(ack) = ack {
-        let _ = ack.conn.send(ConnCmd::SettleIncoming {
-            channel: ack.channel,
-            handle: ack.handle,
-            delivery_id: ack.delivery_id,
-            accepted: false,
-        });
-    } else {
-        tracing::warn!(queue = %name, "pre-settled publish dropped: not committed/full");
-    }
-}
-
 /// Round-robin dispatch: the oldest ready message to the next subscriber with
 /// demand. Bodies come out of applied state as refcount clones.
 fn dispatch(
@@ -302,19 +276,10 @@ fn dispatch(
     rr: &mut usize,
 ) {
     while !ready.is_empty() {
-        let n = subs.len();
-        if n == 0 {
+        // Next subscriber with demand (round-robin); stop if none want work.
+        let Some(idx) = pick_ready(subs, *rr) else {
             return;
-        }
-        let mut picked = None;
-        for i in 0..n {
-            let idx = (*rr + i) % n;
-            if subs[idx].demand > 0 {
-                picked = Some(idx);
-                break;
-            }
-        }
-        let Some(idx) = picked else { return };
+        };
 
         let msg_id = *ready.first().expect("non-empty");
         let Some(body) = store.with_state(|s| s.messages.get(&msg_id).map(|m| m.body.clone()))
@@ -325,7 +290,7 @@ fn dispatch(
             continue;
         };
         ready.remove(&msg_id);
-        *rr = (idx + 1) % n;
+        *rr = (idx + 1) % subs.len();
 
         let sub = &mut subs[idx];
         sub.demand -= 1;
@@ -333,6 +298,7 @@ fn dispatch(
         let cmd = ConnCmd::Deliver {
             channel: sub.channel,
             handle: sub.handle,
+            binding_gen: sub.binding_gen,
             msg_id,
             body,
         };
@@ -344,4 +310,6 @@ fn dispatch(
             subs.retain(|s| s.id != sub_id);
         }
     }
+
+    complete_drains(subs);
 }

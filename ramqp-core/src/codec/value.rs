@@ -461,7 +461,7 @@ fn decode_map(
     count: u32,
     depth: u32,
 ) -> Result<OrderedMap<Value, Value>, DecodeError> {
-    if count % 2 != 0 {
+    if !count.is_multiple_of(2) {
         return Err(DecodeError::InvalidValue(format!(
             "map has an odd element count {count}"
         )));

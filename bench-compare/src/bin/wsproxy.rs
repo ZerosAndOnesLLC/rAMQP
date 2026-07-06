@@ -42,7 +42,9 @@ async fn main() -> Result<(), BoxErr> {
 async fn handle(sock: TcpStream, upstream: &str) -> Result<(), BoxErr> {
     sock.set_nodelay(true).ok();
     // Complete the WS handshake, selecting the `amqp` subprotocol in the response
-    // (the client rejects the connection otherwise).
+    // (the client rejects the connection otherwise). The callback's large `Err`
+    // variant is tungstenite's `ErrorResponse` type — fixed by its API, not ours.
+    #[allow(clippy::result_large_err)]
     let ws = tokio_tungstenite::accept_hdr_async(sock, |_req: &Request, mut resp: Response| {
         resp.headers_mut()
             .insert(SEC_WEBSOCKET_PROTOCOL, HeaderValue::from_static("amqp"));

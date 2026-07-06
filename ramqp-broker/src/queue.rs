@@ -27,6 +27,8 @@ use std::collections::{HashMap, VecDeque};
 use bytes::Bytes;
 use tokio::sync::mpsc;
 
+use crate::dispatch::{Subscriber, complete_drains, confirm_publish, pick_ready, refuse_publish};
+
 /// A queue's identity + mailbox, cheap to clone.
 #[derive(Debug, Clone)]
 pub(crate) struct QueueHandle {
@@ -72,15 +74,24 @@ pub(crate) enum QueueMsg {
         channel: u16,
         /// Link handle on that channel.
         handle: u32,
+        /// The connection's binding generation for this link, echoed into every
+        /// `Deliver` so a stale delivery to a reused handle is dropped.
+        binding_gen: u64,
         /// Replies with the assigned subscriber id.
         reply: tokio::sync::oneshot::Sender<SubId>,
     },
-    /// Set a subscriber's demand (its current link credit).
+    /// Grant a subscriber additional demand (an *increment*, not an absolute
+    /// set-point). The connection computes this delta from the peer's flow
+    /// reconciled against dispatches still in flight, so a restated flow never
+    /// re-arms demand that in-flight `Deliver`s already account for.
     Demand {
         /// Which subscriber.
         sub: SubId,
-        /// Messages it may be sent (absolute, from the peer's flow).
+        /// Additional messages it may be sent (added to current demand).
         credit: u32,
+        /// The peer set `drain`: after dispatching what is available now, drop
+        /// any unmet demand rather than holding it (a poll-to-empty).
+        drain: bool,
     },
     /// A consumer settled a dispatched message.
     Settle {
@@ -107,6 +118,9 @@ pub(crate) struct PublishAck {
     pub channel: u16,
     /// The producer link handle.
     pub handle: u32,
+    /// The connection's binding generation for this producer link, echoed back
+    /// so a stale settlement to a reused handle is dropped.
+    pub binding_gen: u64,
     /// The peer's delivery id to settle.
     pub delivery_id: u32,
 }
@@ -120,6 +134,12 @@ pub(crate) enum ConnCmd {
         channel: u16,
         /// The consumer link handle.
         handle: u32,
+        /// The binding generation this command was issued for. `(channel,
+        /// handle)` are reused after detach/end, so the connection drops a
+        /// command whose generation no longer matches the live binding (else a
+        /// stale delivery would be misrouted to a reused link — cross-queue
+        /// delivery and wrong-message settlement).
+        binding_gen: u64,
         /// The queue-assigned message id (echo back in `Settle`).
         msg_id: u64,
         /// The message bytes.
@@ -131,6 +151,9 @@ pub(crate) enum ConnCmd {
         channel: u16,
         /// The producer link handle.
         handle: u32,
+        /// The binding generation this settlement was issued for (see
+        /// [`ConnCmd::Deliver::binding_gen`]).
+        binding_gen: u64,
         /// The peer's delivery id.
         delivery_id: u32,
         /// `true` → accepted; `false` → rejected (e.g. queue full).
@@ -145,15 +168,6 @@ struct Stored {
     body: Bytes,
     /// Delivery attempts that failed (modified{delivery-failed}).
     failures: u32,
-}
-
-#[derive(Debug)]
-struct Subscriber {
-    id: SubId,
-    conn: mpsc::UnboundedSender<ConnCmd>,
-    channel: u16,
-    handle: u32,
-    demand: u32,
 }
 
 /// Spawn a queue actor; the returned handle is its only address.
@@ -180,16 +194,7 @@ async fn run(name: String, mut rx: mpsc::Receiver<QueueMsg>, max_depth: usize) {
             QueueMsg::Publish { body, ack } => {
                 if ready.len() + unacked.len() >= max_depth {
                     // Refuse rather than grow without bound (broker.md §3.2).
-                    if let Some(ack) = ack {
-                        let _ = ack.conn.send(ConnCmd::SettleIncoming {
-                            channel: ack.channel,
-                            handle: ack.handle,
-                            delivery_id: ack.delivery_id,
-                            accepted: false,
-                        });
-                    } else {
-                        tracing::warn!(queue = %name, "pre-settled publish dropped: queue full");
-                    }
+                    refuse_publish(&name, ack);
                     continue;
                 }
                 next_msg_id += 1;
@@ -200,34 +205,31 @@ async fn run(name: String, mut rx: mpsc::Receiver<QueueMsg>, max_depth: usize) {
                 });
                 // In-memory transient queue: stored == settled. (A durable /
                 // quorum queue confirms here only after fsync / Raft commit.)
-                if let Some(ack) = ack {
-                    let _ = ack.conn.send(ConnCmd::SettleIncoming {
-                        channel: ack.channel,
-                        handle: ack.handle,
-                        delivery_id: ack.delivery_id,
-                        accepted: true,
-                    });
-                }
+                confirm_publish(ack);
             }
             QueueMsg::Subscribe {
                 conn,
                 channel,
                 handle,
+                binding_gen,
                 reply,
             } => {
                 next_sub_id += 1;
-                subs.push(Subscriber {
-                    id: next_sub_id,
+                subs.push(Subscriber::new(
+                    next_sub_id,
                     conn,
                     channel,
                     handle,
-                    demand: 0,
-                });
+                    binding_gen,
+                ));
                 let _ = reply.send(next_sub_id);
             }
-            QueueMsg::Demand { sub, credit } => {
+            QueueMsg::Demand { sub, credit, drain } => {
                 if let Some(s) = subs.iter_mut().find(|s| s.id == sub) {
-                    s.demand = credit;
+                    // A drain zeros whatever is left *after* this cycle's
+                    // dispatch, so the consumer's "then stop" is honored without
+                    // stranding messages that are available right now.
+                    s.grant(credit, drain);
                 }
             }
             QueueMsg::Settle {
@@ -283,21 +285,11 @@ async fn dispatch(
     rr: &mut usize,
 ) {
     while !ready.is_empty() {
-        // Find the next subscriber with demand, round-robin.
-        let n = subs.len();
-        if n == 0 {
+        // Next subscriber with demand (round-robin); stop if none want work.
+        let Some(idx) = pick_ready(subs, *rr) else {
             return;
-        }
-        let mut picked = None;
-        for i in 0..n {
-            let idx = (*rr + i) % n;
-            if subs[idx].demand > 0 {
-                picked = Some(idx);
-                break;
-            }
-        }
-        let Some(idx) = picked else { return };
-        *rr = (idx + 1) % n;
+        };
+        *rr = (idx + 1) % subs.len();
 
         let msg = ready.pop_front().expect("non-empty");
         let sub = &mut subs[idx];
@@ -305,6 +297,7 @@ async fn dispatch(
         let cmd = ConnCmd::Deliver {
             channel: sub.channel,
             handle: sub.handle,
+            binding_gen: sub.binding_gen,
             msg_id: msg.id,
             body: msg.body.clone(),
         };
@@ -318,6 +311,8 @@ async fn dispatch(
             subs.retain(|s| s.id != sub_id);
         }
     }
+
+    complete_drains(subs);
 }
 
 #[cfg(test)]
@@ -334,6 +329,7 @@ mod tests {
             conn: conn.clone(),
             channel: 0,
             handle,
+            binding_gen: 0,
             reply: tx,
         })
         .await
@@ -347,9 +343,13 @@ mod tests {
         let (conn_tx, mut conn_rx) = mpsc::unbounded_channel();
 
         let sub = subscribe(&q, &conn_tx, 7).await;
-        q.tx.send(QueueMsg::Demand { sub, credit: 10 })
-            .await
-            .unwrap();
+        q.tx.send(QueueMsg::Demand {
+            sub,
+            credit: 10,
+            drain: false,
+        })
+        .await
+        .unwrap();
         q.tx.send(QueueMsg::Publish {
             body: Bytes::from_static(b"m1"),
             ack: None,
@@ -383,9 +383,13 @@ mod tests {
         let q = spawn("t".into(), 100);
         let (conn_tx, mut conn_rx) = mpsc::unbounded_channel();
         let sub = subscribe(&q, &conn_tx, 1).await;
-        q.tx.send(QueueMsg::Demand { sub, credit: 10 })
-            .await
-            .unwrap();
+        q.tx.send(QueueMsg::Demand {
+            sub,
+            credit: 10,
+            drain: false,
+        })
+        .await
+        .unwrap();
         q.tx.send(QueueMsg::Publish {
             body: Bytes::from_static(b"m"),
             ack: None,
@@ -410,6 +414,88 @@ mod tests {
         assert_eq!(again, msg_id);
     }
 
+    /// Demand is an increment, not an absolute set-point: two grants of 1 issued
+    /// before any dispatch must let two messages through (an absolute overwrite
+    /// would cap at 1 — the over/under-dispatch reconciliation the connection
+    /// relies on).
+    #[tokio::test]
+    async fn demand_grants_are_additive() {
+        let q = spawn("t".into(), 100);
+        let (conn_tx, mut conn_rx) = mpsc::unbounded_channel();
+        let sub = subscribe(&q, &conn_tx, 1).await;
+        q.tx.send(QueueMsg::Demand {
+            sub,
+            credit: 1,
+            drain: false,
+        })
+        .await
+        .unwrap();
+        q.tx.send(QueueMsg::Demand {
+            sub,
+            credit: 1,
+            drain: false,
+        })
+        .await
+        .unwrap();
+        for i in 0..2u8 {
+            q.tx.send(QueueMsg::Publish {
+                body: Bytes::copy_from_slice(&[i]),
+                ack: None,
+            })
+            .await
+            .unwrap();
+        }
+        // Both messages come through on the accumulated demand of 2.
+        for _ in 0..2 {
+            assert!(matches!(
+                conn_rx.recv().await.unwrap(),
+                ConnCmd::Deliver { .. }
+            ));
+        }
+    }
+
+    /// A drain grant delivers what is available *now*, then drops the unmet
+    /// remainder so a later publish is not dispatched against stale credit.
+    #[tokio::test]
+    async fn drain_drops_unmet_demand() {
+        let q = spawn("t".into(), 100);
+        let (conn_tx, mut conn_rx) = mpsc::unbounded_channel();
+        let sub = subscribe(&q, &conn_tx, 1).await;
+        // One message is ready; drain-grant credit for five.
+        q.tx.send(QueueMsg::Publish {
+            body: Bytes::from_static(b"now"),
+            ack: None,
+        })
+        .await
+        .unwrap();
+        q.tx.send(QueueMsg::Demand {
+            sub,
+            credit: 5,
+            drain: true,
+        })
+        .await
+        .unwrap();
+        // The available message is delivered...
+        assert!(matches!(
+            conn_rx.recv().await.unwrap(),
+            ConnCmd::Deliver { .. }
+        ));
+        // ...but the 4 units of unmet demand were dropped: a later publish is
+        // NOT dispatched (the consumer said "then stop").
+        q.tx.send(QueueMsg::Publish {
+            body: Bytes::from_static(b"later"),
+            ack: None,
+        })
+        .await
+        .unwrap();
+        let idle =
+            tokio::time::timeout(std::time::Duration::from_millis(100), conn_rx.recv()).await;
+        assert!(
+            idle.is_err(),
+            "drain must not leave demand armed for later messages"
+        );
+    }
+
     #[tokio::test]
     async fn competing_consumers_round_robin() {
         let q = spawn("t".into(), 100);
@@ -420,12 +506,14 @@ mod tests {
         q.tx.send(QueueMsg::Demand {
             sub: s1,
             credit: 10,
+            drain: false,
         })
         .await
         .unwrap();
         q.tx.send(QueueMsg::Demand {
             sub: s2,
             credit: 10,
+            drain: false,
         })
         .await
         .unwrap();
@@ -464,6 +552,7 @@ mod tests {
         q.tx.send(QueueMsg::Demand {
             sub: s1,
             credit: 10,
+            drain: false,
         })
         .await
         .unwrap();
@@ -484,6 +573,7 @@ mod tests {
         q.tx.send(QueueMsg::Demand {
             sub: s2,
             credit: 10,
+            drain: false,
         })
         .await
         .unwrap();
@@ -491,6 +581,74 @@ mod tests {
             panic!("expected redelivery");
         };
         assert_eq!(&body[..], b"m");
+    }
+
+    /// The settle-owner rule: once a message is requeued and redispatched to a
+    /// new subscriber, a late settle from the *former* owner must be ignored —
+    /// otherwise a stale ack would drop a message the new owner still holds.
+    #[tokio::test]
+    async fn stale_settle_from_former_owner_is_ignored() {
+        let q = spawn("t".into(), 100);
+        let (c1_tx, mut c1_rx) = mpsc::unbounded_channel();
+        let s1 = subscribe(&q, &c1_tx, 1).await;
+        q.tx.send(QueueMsg::Demand {
+            sub: s1,
+            credit: 10,
+            drain: false,
+        })
+        .await
+        .unwrap();
+        q.tx.send(QueueMsg::Publish {
+            body: Bytes::from_static(b"m"),
+            ack: None,
+        })
+        .await
+        .unwrap();
+        let ConnCmd::Deliver { msg_id, .. } = c1_rx.recv().await.unwrap() else {
+            panic!("expected deliver");
+        };
+
+        // s1 drops; the message requeues and is redispatched to s2 (new owner).
+        q.tx.send(QueueMsg::Unsubscribe { sub: s1 }).await.unwrap();
+        let (c2_tx, mut c2_rx) = mpsc::unbounded_channel();
+        let s2 = subscribe(&q, &c2_tx, 2).await;
+        q.tx.send(QueueMsg::Demand {
+            sub: s2,
+            credit: 10,
+            drain: false,
+        })
+        .await
+        .unwrap();
+        let ConnCmd::Deliver { msg_id: m2, .. } = c2_rx.recv().await.unwrap() else {
+            panic!("expected redelivery to s2");
+        };
+        assert_eq!(m2, msg_id, "same message redelivered");
+
+        // A stale Ack from s1 (the former owner) must NOT remove it from s2.
+        q.tx.send(QueueMsg::Settle {
+            sub: s1,
+            msg_id,
+            outcome: SettleOutcome::Ack,
+        })
+        .await
+        .unwrap();
+
+        // Proof it still belongs to s2: dropping s2 requeues it, and a third
+        // consumer receives it again. (A stale-ack drop would lose it here.)
+        q.tx.send(QueueMsg::Unsubscribe { sub: s2 }).await.unwrap();
+        let (c3_tx, mut c3_rx) = mpsc::unbounded_channel();
+        let s3 = subscribe(&q, &c3_tx, 3).await;
+        q.tx.send(QueueMsg::Demand {
+            sub: s3,
+            credit: 10,
+            drain: false,
+        })
+        .await
+        .unwrap();
+        let ConnCmd::Deliver { msg_id: m3, .. } = c3_rx.recv().await.unwrap() else {
+            panic!("message was lost to the stale ack");
+        };
+        assert_eq!(m3, msg_id, "message survived the stale former-owner ack");
     }
 
     #[tokio::test]
@@ -511,6 +669,7 @@ mod tests {
                 conn: conn_tx.clone(),
                 channel: 3,
                 handle: 9,
+                binding_gen: 0,
                 delivery_id: 42,
             }),
         })

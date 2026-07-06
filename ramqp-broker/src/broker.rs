@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::watch;
+use tokio::sync::{Semaphore, watch};
 
 use ramqp_core::error::ConnectError;
 use ramqp_core::transport::IoStream;
@@ -35,7 +35,10 @@ impl Broker {
     /// Create a broker with the given configuration (and [`AllowAll`] auth —
     /// swap it with [`Broker::with_authenticator`] for anything real).
     pub fn new(config: BrokerConfig) -> Self {
-        let registry = Arc::new(QueueRegistry::new(config.max_queue_depth));
+        let registry = Arc::new(QueueRegistry::new(
+            config.max_queue_depth,
+            config.max_queues,
+        ));
         Broker {
             config: Arc::new(config),
             auth: Arc::new(AllowAll),
@@ -54,12 +57,19 @@ impl Broker {
         let listener = TcpListener::bind(addr).await?;
         let local_addr = listener.local_addr()?;
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        // A `0` cap disables the limit (unbounded); otherwise a permit is held
+        // for each connection's lifetime, bounding concurrent connections.
+        let conn_limit = match self.config.max_connections {
+            0 => None,
+            n => Some(Arc::new(Semaphore::new(n))),
+        };
         Ok(BoundBroker {
             broker: self,
             listener,
             local_addr,
             shutdown_tx,
             shutdown_rx,
+            conn_limit,
         })
     }
 
@@ -88,14 +98,21 @@ pub struct BoundBroker {
     local_addr: SocketAddr,
     shutdown_tx: watch::Sender<bool>,
     shutdown_rx: watch::Receiver<bool>,
+    /// Bounds concurrent connections (a permit per live connection). `None`
+    /// when the cap is disabled (`max_connections == 0`).
+    conn_limit: Option<Arc<Semaphore>>,
 }
 
-/// Signals a running broker to shut down (close listeners + connections).
+/// Signals a running broker to shut down.
 #[derive(Debug, Clone)]
 pub struct ShutdownHandle(watch::Sender<bool>);
 
 impl ShutdownHandle {
-    /// Begin shutdown: stop accepting and close every connection gracefully.
+    /// Begin shutdown: [`BoundBroker::run`] stops accepting and returns, and
+    /// every live connection observes the same signal and closes gracefully
+    /// (sending `close`). Connections close *asynchronously* — `run()` does not
+    /// block on them, so a caller that needs to wait for full drain should
+    /// track the connection tasks itself.
     pub fn shutdown(&self) {
         let _ = self.0.send(true);
     }
@@ -119,9 +136,38 @@ impl BoundBroker {
         loop {
             tokio::select! {
                 accepted = self.listener.accept() => {
-                    let (stream, peer) = accepted?;
-                    let _ = stream.set_nodelay(true);
-                    self.spawn_connection(stream, peer);
+                    match accepted {
+                        Ok((stream, peer)) => {
+                            // Acquire a connection permit first; at the cap we
+                            // drop the socket immediately rather than spawn
+                            // unbounded per-connection state (DoS guard).
+                            let permit = match &self.conn_limit {
+                                Some(sem) => match sem.clone().try_acquire_owned() {
+                                    Ok(p) => Some(p),
+                                    Err(_) => {
+                                        tracing::warn!(
+                                            %peer,
+                                            limit = self.broker.config.max_connections,
+                                            "connection limit reached; refusing"
+                                        );
+                                        drop(stream);
+                                        continue;
+                                    }
+                                },
+                                None => None,
+                            };
+                            let _ = stream.set_nodelay(true);
+                            self.spawn_connection(stream, peer, permit);
+                        }
+                        // A per-accept error (fd exhaustion, a connection reset
+                        // before accept, etc.) is transient — log it and keep
+                        // serving rather than killing the whole broker. A short
+                        // pause avoids a busy-spin if the condition persists.
+                        Err(e) => {
+                            tracing::warn!(error = %e, "accept error; continuing");
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        }
+                    }
                 }
                 _ = self.shutdown_rx.changed() => {
                     tracing::info!("broker shutting down");
@@ -131,7 +177,12 @@ impl BoundBroker {
         }
     }
 
-    fn spawn_connection(&self, stream: TcpStream, peer: SocketAddr) {
+    fn spawn_connection(
+        &self,
+        stream: TcpStream,
+        peer: SocketAddr,
+        permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    ) {
         let config = self.broker.config.clone();
         let auth = self.broker.auth.clone();
         let registry = self.broker.registry.clone();
@@ -141,6 +192,8 @@ impl BoundBroker {
                 Ok(()) => tracing::debug!(%peer, "connection closed"),
                 Err(e) => tracing::debug!(%peer, error = %e, "connection failed"),
             }
+            // Held until here: the permit is released when the connection ends.
+            drop(permit);
         });
     }
 }

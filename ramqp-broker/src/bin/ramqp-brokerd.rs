@@ -40,6 +40,20 @@ async fn main() -> std::io::Result<()> {
 
     let addr = listen_addr();
     let bound = Broker::new(BrokerConfig::default()).bind(&addr).await?;
+
+    // The default broker accepts every connection (AllowAll). That is fine on a
+    // loopback / trusted network but an open relay on a public bind — warn
+    // loudly so it is never an accident.
+    let listen = bound.local_addr();
+    if !listen.ip().is_loopback() {
+        tracing::warn!(
+            addr = %listen,
+            "listening on a non-loopback address with NO authentication (AllowAll) — \
+             anyone who can reach this port can use the broker; configure an authenticator \
+             before exposing it"
+        );
+    }
+
     let shutdown = bound.shutdown_handle();
 
     tokio::spawn(async move {
