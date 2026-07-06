@@ -18,7 +18,7 @@ side (publish order: `ramqp-core` first).
   The codec, wire types, ids, config, errors, observability, framing/header
   transport layer, session/link state machines, open-negotiation/mux/heartbeat,
   transaction wire types, and the SCRAM math now live in the new `ramqp-core`
-  crate (0.2.0), shared with the new `ramqp-broker`. `ramqp` re-exports
+  crate (0.2.1), shared with the new `ramqp-broker`. `ramqp` re-exports
   everything, so **all existing `ramqp::...` paths keep working**.
 - The `scram` and `transaction` features now delegate to the corresponding
   `ramqp-core` features; the SCRAM crypto dependencies moved to `ramqp-core`.
@@ -39,7 +39,7 @@ side (publish order: `ramqp-core` first).
   regression-tested at both the session and end-to-end level.
 
 ### Added (workspace)
-- **`ramqp-core` 0.2.0** — the engine as its own crate, including net-new
+- **`ramqp-core` 0.2.1** — the engine as its own crate, including net-new
   server polarity: `Session::accept_peer_begin`/`accept_peer_attach`,
   read-first `header::accept`, and a SASL server side (PLAIN parsing + an
   RFC 5802 `ScramServer` with verifier-based credential storage, validated
