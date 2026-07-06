@@ -39,6 +39,7 @@ struct Subscriber {
     conn: mpsc::UnboundedSender<ConnCmd>,
     channel: u16,
     handle: u32,
+    binding_gen: u64,
     demand: u32,
 }
 
@@ -129,6 +130,7 @@ async fn run(
                                     let _ = ack.conn.send(ConnCmd::SettleIncoming {
                                         channel: ack.channel,
                                         handle: ack.handle,
+                                        binding_gen: ack.binding_gen,
                                         delivery_id: ack.delivery_id,
                                         accepted: true,
                                     });
@@ -199,6 +201,7 @@ fn handle_msg(
             conn,
             channel,
             handle,
+            binding_gen,
             reply,
         } => {
             *next_sub_id += 1;
@@ -207,6 +210,7 @@ fn handle_msg(
                 conn,
                 channel,
                 handle,
+                binding_gen,
                 demand: 0,
             });
             let _ = reply.send(*next_sub_id);
@@ -283,6 +287,7 @@ fn refuse(name: &str, ack: Option<PublishAck>) {
         let _ = ack.conn.send(ConnCmd::SettleIncoming {
             channel: ack.channel,
             handle: ack.handle,
+            binding_gen: ack.binding_gen,
             delivery_id: ack.delivery_id,
             accepted: false,
         });
@@ -333,6 +338,7 @@ fn dispatch(
         let cmd = ConnCmd::Deliver {
             channel: sub.channel,
             handle: sub.handle,
+            binding_gen: sub.binding_gen,
             msg_id,
             body,
         };

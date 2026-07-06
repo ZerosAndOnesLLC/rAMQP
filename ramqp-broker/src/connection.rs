@@ -134,6 +134,7 @@ async fn handshake<S: IoStream>(
         remote_channels: RemoteChannelMap::default(),
         sessions: HashMap::new(),
         bindings: HashMap::new(),
+        next_gen: 0,
         settlements: FuturesUnordered::new(),
         next_session_id: 0,
         metrics: noop_metrics(),
@@ -208,11 +209,22 @@ enum Binding {
     /// Peer sender → our receiver → publishes into `queue`.
     Producer {
         queue: QueueHandle,
-        /// Deliveries since the last credit top-up (batched replenishment).
-        received_since_grant: u32,
+        /// This binding's generation (see [`Binding::epoch`]).
+        epoch: u64,
+        /// Publish acks received since the last credit top-up. Producer credit
+        /// is replenished from the *ack* path (not the publish path), so the
+        /// in-flight publish window — and thus the unbounded queue→connection
+        /// command backlog — is bounded by the granted credit: a producer whose
+        /// acks are not draining runs out of credit and stops (backpressure).
+        acked_since_grant: u32,
     },
     /// Peer receiver → our sender → subscribed to `queue` as `sub`.
-    Consumer { queue: QueueHandle, sub: SubId },
+    Consumer {
+        queue: QueueHandle,
+        sub: SubId,
+        /// This binding's generation.
+        epoch: u64,
+    },
 }
 
 /// The resolution of one dispatched delivery: which queue/sub/message it was
@@ -232,6 +244,10 @@ struct BrokerConnection<S: IoStream> {
     sessions: HashMap<u16, Session>,
     /// Link → queue bindings, keyed by (our channel, our link handle).
     bindings: HashMap<(u16, u32), Binding>,
+    /// Monotonic binding-generation counter (never reused within a connection),
+    /// stamped onto each binding and echoed by queue commands so a command for a
+    /// since-replaced `(channel, handle)` is dropped instead of misrouted.
+    next_gen: u64,
     /// In-flight consumer dispatches awaiting a terminal outcome.
     settlements: FuturesUnordered<std::pin::Pin<Box<dyn Future<Output = SettlementResult> + Send>>>,
     next_session_id: u64,
@@ -331,7 +347,7 @@ impl<S: IoStream> BrokerConnection<S> {
     /// failed dispatch).
     async fn cleanup(&mut self) {
         for ((_, _), binding) in self.bindings.drain() {
-            if let Binding::Consumer { queue, sub } = binding {
+            if let Binding::Consumer { queue, sub, .. } = binding {
                 let _ = queue.tx.send(QueueMsg::Unsubscribe { sub }).await;
             }
         }
@@ -345,26 +361,37 @@ impl<S: IoStream> BrokerConnection<S> {
         Ok(())
     }
 
-    /// Handle one command from a queue actor.
+    /// Handle one command from a queue actor. Both commands carry the
+    /// generation of the binding they were issued for; a command whose
+    /// generation no longer matches the live binding at `(channel, handle)` is
+    /// dropped (the `(channel, handle)` was reused by a different link — routing
+    /// the stale command would deliver/settle against the wrong queue).
     fn handle_cmd(&mut self, cmd: ConnCmd) {
         match cmd {
             ConnCmd::Deliver {
                 channel,
                 handle,
+                binding_gen,
                 msg_id,
                 body,
             } => {
+                // Validate against the live binding; capture its queue+sub.
+                let (queue_tx, sub) = match self.bindings.get(&(channel, handle)) {
+                    Some(Binding::Consumer { queue, sub, epoch }) if *epoch == binding_gen => {
+                        (queue.tx.clone(), *sub)
+                    }
+                    // Link detached / reused / gone: the old subscriber's
+                    // Unsubscribe already requeued this message on its queue.
+                    _ => return,
+                };
                 let Some(session) = self.sessions.get_mut(&channel) else {
-                    // Session raced away; the queue will requeue via settle.
-                    self.settle_later_requeue(channel, handle, msg_id);
+                    // Session raced away: requeue on the validated queue.
+                    self.settlements.push(Box::pin(async move {
+                        (queue_tx, sub, msg_id, SettleOutcome::Requeue)
+                    }));
                     return;
                 };
-                let Some(Binding::Consumer { queue, sub }) = self.bindings.get(&(channel, handle))
-                else {
-                    return; // link gone; unsubscribe already requeued it
-                };
                 let (reply_tx, reply_rx) = oneshot::channel();
-                let (queue_tx, sub) = (queue.tx.clone(), *sub);
                 session.send_transfer(
                     handle,
                     body,
@@ -388,9 +415,19 @@ impl<S: IoStream> BrokerConnection<S> {
             ConnCmd::SettleIncoming {
                 channel,
                 handle,
+                binding_gen,
                 delivery_id,
                 accepted,
             } => {
+                // Drop a stale ack for a since-reused producer handle (else it
+                // would settle an unrelated delivery-id on the new link).
+                let live = matches!(
+                    self.bindings.get(&(channel, handle)),
+                    Some(Binding::Producer { epoch, .. }) if *epoch == binding_gen
+                );
+                if !live {
+                    return;
+                }
                 if let Some(session) = self.sessions.get_mut(&channel) {
                     let state = if accepted {
                         DeliveryState::Accepted(Accepted::default())
@@ -411,17 +448,36 @@ impl<S: IoStream> BrokerConnection<S> {
                         &mut self.transport,
                     );
                 }
+                // Replenish producer credit from the ack path — this bounds the
+                // in-flight publish window and the queue→connection backlog.
+                self.replenish_producer_credit(channel, handle);
             }
         }
     }
 
-    /// Queue a requeue-settlement for a delivery we can no longer dispatch.
-    fn settle_later_requeue(&mut self, channel: u16, handle: u32, msg_id: u64) {
-        if let Some(Binding::Consumer { queue, sub }) = self.bindings.get(&(channel, handle)) {
-            let (queue_tx, sub) = (queue.tx.clone(), *sub);
-            self.settlements.push(Box::pin(async move {
-                (queue_tx, sub, msg_id, SettleOutcome::Requeue)
-            }));
+    /// Batched producer-credit replenishment: count one consumed credit against
+    /// the producer link and, once half the window is consumed, grant that much
+    /// back via a `flow`. Called once per settled/acked publish so credit tracks
+    /// throughput without a flow per message.
+    fn replenish_producer_credit(&mut self, channel: u16, handle: u32) {
+        let threshold = (self.config.initial_credit / 2).max(1);
+        let grant = match self.bindings.get_mut(&(channel, handle)) {
+            Some(Binding::Producer {
+                acked_since_grant, ..
+            }) => {
+                *acked_since_grant += 1;
+                if *acked_since_grant >= threshold {
+                    std::mem::take(acked_since_grant)
+                } else {
+                    0
+                }
+            }
+            _ => 0,
+        };
+        if grant > 0 {
+            if let Some(session) = self.sessions.get_mut(&channel) {
+                session.grant_credit(handle, grant, &mut self.transport);
+            }
         }
     }
 
@@ -561,10 +617,13 @@ impl<S: IoStream> BrokerConnection<S> {
             }
         };
 
+        let epoch = self.next_gen;
+        self.next_gen += 1;
         let binding = match peer_role {
             Role::Sender => Binding::Producer {
                 queue,
-                received_since_grant: 0,
+                epoch,
+                acked_since_grant: 0,
             },
             Role::Receiver => {
                 let (reply_tx, reply_rx) = oneshot::channel();
@@ -574,6 +633,7 @@ impl<S: IoStream> BrokerConnection<S> {
                         conn: self.cmd_tx.clone(),
                         channel: local,
                         handle: accepted.handle.0,
+                        binding_gen: epoch,
                         reply: reply_tx,
                     })
                     .await
@@ -583,7 +643,7 @@ impl<S: IoStream> BrokerConnection<S> {
                     tracing::warn!(queue = %queue.name, "queue actor unavailable");
                     return;
                 };
-                Binding::Consumer { queue, sub }
+                Binding::Consumer { queue, sub, epoch }
             }
         };
         self.bindings.insert((local, accepted.handle.0), binding);
@@ -597,23 +657,23 @@ impl<S: IoStream> BrokerConnection<S> {
             match event {
                 LinkEvent::Delivery(d) => {
                     let handle = d.handle.0;
-                    let Some(Binding::Producer {
-                        queue,
-                        received_since_grant,
-                    }) = self.bindings.get_mut(&(channel, handle))
-                    else {
-                        continue; // link vanished mid-flight
+                    // Clone the sender + epoch out so the bindings borrow is
+                    // released before the await / the credit replenishment.
+                    let (queue_tx, epoch) = match self.bindings.get(&(channel, handle)) {
+                        Some(Binding::Producer { queue, epoch, .. }) => (queue.tx.clone(), *epoch),
+                        _ => continue, // link vanished mid-flight
                     };
-                    let ack = (!d.settled).then(|| PublishAck {
+                    let settled = d.settled;
+                    let ack = (!settled).then(|| PublishAck {
                         conn: self.cmd_tx.clone(),
                         channel,
                         handle,
+                        binding_gen: epoch,
                         delivery_id: d.delivery_id.value(),
                     });
                     // Bounded queue mailbox: a full queue back-pressures this
                     // connection (and thus the producer) — never unbounded.
-                    if queue
-                        .tx
+                    if queue_tx
                         .send(QueueMsg::Publish {
                             body: d.message,
                             ack,
@@ -621,19 +681,15 @@ impl<S: IoStream> BrokerConnection<S> {
                         .await
                         .is_err()
                     {
-                        tracing::warn!(queue = %queue.name, "publish to dead queue actor");
+                        tracing::warn!(channel, handle, "publish to dead queue actor");
                         continue;
                     }
-                    // Batched credit replenishment: top the producer back up
-                    // once it has consumed half its window.
-                    *received_since_grant += 1;
-                    let threshold = (self.config.initial_credit / 2).max(1);
-                    if *received_since_grant >= threshold {
-                        let grant = *received_since_grant;
-                        *received_since_grant = 0;
-                        if let Some(session) = self.sessions.get_mut(&channel) {
-                            session.grant_credit(handle, grant, &mut self.transport);
-                        }
+                    // A pre-settled publish gets NO ack (no SettleIncoming), so
+                    // its credit is replenished here. Unsettled publishes are
+                    // replenished on the ack path (handle_cmd), which is what
+                    // bounds their in-flight window / command backlog.
+                    if settled {
+                        self.replenish_producer_credit(channel, handle);
                     }
                 }
                 LinkEvent::Credit {
@@ -641,14 +697,14 @@ impl<S: IoStream> BrokerConnection<S> {
                     credit,
                     drain: _,
                 } => {
-                    if let Some(Binding::Consumer { queue, sub }) =
+                    if let Some(Binding::Consumer { queue, sub, .. }) =
                         self.bindings.get(&(channel, handle.0))
                     {
                         let _ = queue.tx.send(QueueMsg::Demand { sub: *sub, credit }).await;
                     }
                 }
                 LinkEvent::Detached { handle, .. } => {
-                    if let Some(Binding::Consumer { queue, sub }) =
+                    if let Some(Binding::Consumer { queue, sub, .. }) =
                         self.bindings.remove(&(channel, handle.0))
                     {
                         let _ = queue.tx.send(QueueMsg::Unsubscribe { sub }).await;
@@ -735,7 +791,7 @@ impl<S: IoStream> BrokerConnection<S> {
             .copied()
             .collect();
         for key in keys {
-            if let Some(Binding::Consumer { queue, sub }) = self.bindings.remove(&key) {
+            if let Some(Binding::Consumer { queue, sub, .. }) = self.bindings.remove(&key) {
                 let _ = queue.tx.send(QueueMsg::Unsubscribe { sub }).await;
             }
         }

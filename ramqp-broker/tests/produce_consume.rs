@@ -35,6 +35,72 @@ fn text_of(delivery: &ramqp::Delivery) -> String {
     }
 }
 
+/// Detaching a consumer and attaching another on the same session reuses the
+/// link handle (client allocates LIFO). The broker must rebind that reused
+/// (channel, handle) to the new queue and route only that queue's messages to
+/// it — the binding-generation guarantee (H1): a stale command for the old
+/// binding must never be misrouted to the link that now occupies the handle.
+///
+/// Asserts the *routing* property (a queue-A message never reaches a queue-B
+/// consumer and vice-versa) under repeated handle-reuse churn; it tolerates
+/// at-least-once redelivery within a queue.
+#[tokio::test]
+async fn consumer_handle_reuse_across_queues_never_cross_delivers() {
+    let (addr, shutdown) = start().await;
+    let conn = connect(addr).await;
+    let session = conn.begin_session().await.expect("session");
+
+    let pa = session
+        .create_producer("/queues/reuse-a")
+        .await
+        .expect("pa");
+    let pb = session
+        .create_producer("/queues/reuse-b")
+        .await
+        .expect("pb");
+
+    for round in 0..8 {
+        pa.send(Message::text(format!("a{round}")))
+            .await
+            .expect("send a");
+        pb.send(Message::text(format!("b{round}")))
+            .await
+            .expect("send b");
+
+        // Consume from A on a fresh consumer, then detach it (frees the handle).
+        let mut ca = session
+            .create_consumer("/queues/reuse-a")
+            .await
+            .expect("ca");
+        let da = ca.recv().await.expect("recv a");
+        assert!(
+            text_of(&da).starts_with('a'),
+            "queue-A consumer received a non-A message: {:?}",
+            text_of(&da)
+        );
+        ca.accept(&da).await.expect("accept a");
+        ca.detach().await.expect("detach a");
+
+        // A new consumer on B reuses A's just-freed handle. It must only ever
+        // receive B's messages — never one of A's (the misrouting bug).
+        let mut cb = session
+            .create_consumer("/queues/reuse-b")
+            .await
+            .expect("cb");
+        let db = cb.recv().await.expect("recv b");
+        assert!(
+            text_of(&db).starts_with('b'),
+            "reused handle received the wrong queue's message: {:?}",
+            text_of(&db)
+        );
+        cb.accept(&db).await.expect("accept b");
+        cb.detach().await.expect("detach b");
+    }
+
+    conn.close().await.expect("close");
+    shutdown.shutdown();
+}
+
 #[tokio::test]
 async fn store_and_forward_produce_then_consume() {
     let (addr, shutdown) = start().await;

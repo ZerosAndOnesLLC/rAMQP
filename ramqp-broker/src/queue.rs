@@ -72,6 +72,9 @@ pub(crate) enum QueueMsg {
         channel: u16,
         /// Link handle on that channel.
         handle: u32,
+        /// The connection's binding generation for this link, echoed into every
+        /// `Deliver` so a stale delivery to a reused handle is dropped.
+        binding_gen: u64,
         /// Replies with the assigned subscriber id.
         reply: tokio::sync::oneshot::Sender<SubId>,
     },
@@ -107,6 +110,9 @@ pub(crate) struct PublishAck {
     pub channel: u16,
     /// The producer link handle.
     pub handle: u32,
+    /// The connection's binding generation for this producer link, echoed back
+    /// so a stale settlement to a reused handle is dropped.
+    pub binding_gen: u64,
     /// The peer's delivery id to settle.
     pub delivery_id: u32,
 }
@@ -120,6 +126,12 @@ pub(crate) enum ConnCmd {
         channel: u16,
         /// The consumer link handle.
         handle: u32,
+        /// The binding generation this command was issued for. `(channel,
+        /// handle)` are reused after detach/end, so the connection drops a
+        /// command whose generation no longer matches the live binding (else a
+        /// stale delivery would be misrouted to a reused link — cross-queue
+        /// delivery and wrong-message settlement).
+        binding_gen: u64,
         /// The queue-assigned message id (echo back in `Settle`).
         msg_id: u64,
         /// The message bytes.
@@ -131,6 +143,9 @@ pub(crate) enum ConnCmd {
         channel: u16,
         /// The producer link handle.
         handle: u32,
+        /// The binding generation this settlement was issued for (see
+        /// [`ConnCmd::Deliver::binding_gen`]).
+        binding_gen: u64,
         /// The peer's delivery id.
         delivery_id: u32,
         /// `true` → accepted; `false` → rejected (e.g. queue full).
@@ -153,6 +168,7 @@ struct Subscriber {
     conn: mpsc::UnboundedSender<ConnCmd>,
     channel: u16,
     handle: u32,
+    binding_gen: u64,
     demand: u32,
 }
 
@@ -184,6 +200,7 @@ async fn run(name: String, mut rx: mpsc::Receiver<QueueMsg>, max_depth: usize) {
                         let _ = ack.conn.send(ConnCmd::SettleIncoming {
                             channel: ack.channel,
                             handle: ack.handle,
+                            binding_gen: ack.binding_gen,
                             delivery_id: ack.delivery_id,
                             accepted: false,
                         });
@@ -204,6 +221,7 @@ async fn run(name: String, mut rx: mpsc::Receiver<QueueMsg>, max_depth: usize) {
                     let _ = ack.conn.send(ConnCmd::SettleIncoming {
                         channel: ack.channel,
                         handle: ack.handle,
+                        binding_gen: ack.binding_gen,
                         delivery_id: ack.delivery_id,
                         accepted: true,
                     });
@@ -213,6 +231,7 @@ async fn run(name: String, mut rx: mpsc::Receiver<QueueMsg>, max_depth: usize) {
                 conn,
                 channel,
                 handle,
+                binding_gen,
                 reply,
             } => {
                 next_sub_id += 1;
@@ -221,6 +240,7 @@ async fn run(name: String, mut rx: mpsc::Receiver<QueueMsg>, max_depth: usize) {
                     conn,
                     channel,
                     handle,
+                    binding_gen,
                     demand: 0,
                 });
                 let _ = reply.send(next_sub_id);
@@ -305,6 +325,7 @@ async fn dispatch(
         let cmd = ConnCmd::Deliver {
             channel: sub.channel,
             handle: sub.handle,
+            binding_gen: sub.binding_gen,
             msg_id: msg.id,
             body: msg.body.clone(),
         };
@@ -334,6 +355,7 @@ mod tests {
             conn: conn.clone(),
             channel: 0,
             handle,
+            binding_gen: 0,
             reply: tx,
         })
         .await
@@ -511,6 +533,7 @@ mod tests {
                 conn: conn_tx.clone(),
                 channel: 3,
                 handle: 9,
+                binding_gen: 0,
                 delivery_id: 42,
             }),
         })
