@@ -447,6 +447,53 @@ impl Session {
         })
     }
 
+    /// Refuse a peer-initiated attach we cannot honor (e.g. an unresolvable
+    /// address), scoped to just that link. Per AMQP 1.0 §2.6.3 the responder
+    /// completes the attach with the offending terminus set to null, then
+    /// immediately detaches (closed) with the error. No link state is retained,
+    /// and the session and its sibling links stay up — a bad address on one
+    /// link must not tear the whole session down.
+    pub fn refuse_peer_attach<S: IoStream>(
+        &mut self,
+        attach: &Attach,
+        error: AmqpError,
+        transport: &mut FramedTransport<S>,
+    ) {
+        let our_role = match attach.role {
+            Role::Sender => Role::Receiver,
+            Role::Receiver => Role::Sender,
+        };
+        // Name the link with a throwaway handle so the attach/detach pair is
+        // well-formed; release it right back since we retain no link.
+        let handle = self.handles.allocate();
+        let local = handle.unwrap_or(0);
+        // Null source AND target: the unambiguous "terminus refused" signal
+        // regardless of which side the peer asked us to resolve.
+        let response = Attach {
+            name: attach.name.clone(),
+            handle: local,
+            role: our_role,
+            snd_settle_mode: attach.snd_settle_mode,
+            rcv_settle_mode: attach.rcv_settle_mode,
+            source: None,
+            target: None,
+            ..Default::default()
+        };
+        transport.queue_amqp(self.local_channel, &Performative::Attach(response), None);
+        transport.queue_amqp(
+            self.local_channel,
+            &Performative::Detach(Detach {
+                handle: local,
+                closed: true,
+                error: Some(error),
+            }),
+            None,
+        );
+        if handle.is_some() {
+            self.handles.release(local);
+        }
+    }
+
     /// Enqueue an outbound message on a sender link and try to flush it.
     #[allow(clippy::too_many_arguments)]
     pub fn send_transfer<S: IoStream>(
@@ -1281,6 +1328,48 @@ mod tests {
             }
             other => panic!("expected delivery, got {other:?}"),
         }
+    }
+
+    /// Refusing an attach (unresolvable address) completes the attach with a
+    /// null source/target then immediately detaches (closed) with the error —
+    /// a link-scoped refusal that leaves the session and its handles intact.
+    #[tokio::test]
+    async fn refuse_peer_attach_responds_null_terminus_then_detaches() {
+        let (mut session, _resp, _evt, mut transport, mut far) = server_session(&peer_begin());
+        let attach = Attach {
+            name: "bad".into(),
+            handle: 4,
+            role: Role::Receiver, // peer wants to consume from an address we can't resolve
+            source: Some(crate::types::messaging::Source::new("/nope")),
+            ..Default::default()
+        };
+        let err = AmqpError::new(
+            crate::types::definitions::AmqpError::NotFound,
+            Some("no queue".into()),
+        );
+        session.refuse_peer_attach(&attach, err, &mut transport);
+        transport.flush().await.unwrap();
+
+        // Attach response first: our (mirror) role, null source AND target.
+        match far.read_frame().await.unwrap().body {
+            FrameBody::Amqp(Performative::Attach(a), _) => {
+                assert_eq!(a.name, "bad");
+                assert_eq!(a.role, Role::Sender);
+                assert!(a.source.is_none(), "refused source must be null");
+                assert!(a.target.is_none(), "refused target must be null");
+            }
+            other => panic!("expected attach, got {other:?}"),
+        }
+        // ...then a closed detach carrying the error.
+        match far.read_frame().await.unwrap().body {
+            FrameBody::Amqp(Performative::Detach(d), _) => {
+                assert!(d.closed);
+                assert!(d.error.is_some(), "detach carries the refusal error");
+            }
+            other => panic!("expected detach, got {other:?}"),
+        }
+        // The throwaway handle was released: the session can still attach links.
+        assert!(!session.knows_link("bad"));
     }
 
     #[tokio::test]

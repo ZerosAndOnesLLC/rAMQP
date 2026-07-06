@@ -133,6 +133,7 @@ async fn handshake<S: IoStream>(
         channels: ChannelAllocator::new(negotiated.channel_max),
         remote_channels: RemoteChannelMap::default(),
         sessions: HashMap::new(),
+        discarding: std::collections::HashSet::new(),
         bindings: HashMap::new(),
         next_gen: 0,
         settlements: FuturesUnordered::new(),
@@ -224,6 +225,11 @@ enum Binding {
         sub: SubId,
         /// This binding's generation.
         epoch: u64,
+        /// Demand already handed to the queue that has not yet produced a
+        /// `Deliver` back (queue-side demand plus dispatches still in `cmd_rx`).
+        /// Credit grants forward only the delta above this, so a restated flow
+        /// cannot re-arm demand that in-flight deliveries already cover.
+        granted: u32,
     },
 }
 
@@ -242,6 +248,11 @@ struct BrokerConnection<S: IoStream> {
     remote_channels: RemoteChannelMap,
     /// Sessions keyed by OUR channel.
     sessions: HashMap<u16, Session>,
+    /// Remote channels whose session we ended locally (e.g. a rejected attach)
+    /// but whose peer `End` we have not yet seen. Frames pipelined behind our
+    /// `End` land here and are silently discarded rather than treated as
+    /// frames on an unknown channel (which would kill the whole connection).
+    discarding: std::collections::HashSet<u16>,
     /// Link → queue bindings, keyed by (our channel, our link handle).
     bindings: HashMap<(u16, u32), Binding>,
     /// Monotonic binding-generation counter (never reused within a connection),
@@ -375,9 +386,16 @@ impl<S: IoStream> BrokerConnection<S> {
                 msg_id,
                 body,
             } => {
-                // Validate against the live binding; capture its queue+sub.
-                let (queue_tx, sub) = match self.bindings.get(&(channel, handle)) {
-                    Some(Binding::Consumer { queue, sub, epoch }) if *epoch == binding_gen => {
+                // Validate against the live binding; capture its queue+sub and
+                // account this delivery against the demand we handed the queue.
+                let (queue_tx, sub) = match self.bindings.get_mut(&(channel, handle)) {
+                    Some(Binding::Consumer {
+                        queue,
+                        sub,
+                        epoch,
+                        granted,
+                    }) if *epoch == binding_gen => {
+                        *granted = granted.saturating_sub(1);
                         (queue.tx.clone(), *sub)
                     }
                     // Link detached / reused / gone: the old subscriber's
@@ -481,6 +499,18 @@ impl<S: IoStream> BrokerConnection<S> {
         }
     }
 
+    /// Resolve a peer channel to our local channel for an inbound link frame.
+    /// `Ok(Some(local))` — process it; `Ok(None)` — silently ignore (a frame
+    /// pipelined behind an `End` we already sent for a session we ended);
+    /// `Err` — fail the connection (a frame on a channel we never mapped).
+    fn resolve_active(&self, remote_channel: u16) -> Result<Option<u16>, ConnectError> {
+        match self.remote_channels.resolve(remote_channel) {
+            Some(local) => Ok(Some(local)),
+            None if self.discarding.contains(&remote_channel) => Ok(None),
+            None => Err(unknown_channel(remote_channel)),
+        }
+    }
+
     /// Route one inbound frame. Returns `Ok(true)` when the connection is done.
     async fn handle_frame(&mut self, frame: Frame) -> Result<bool, ConnectError> {
         let channel = frame.channel;
@@ -517,8 +547,8 @@ impl<S: IoStream> BrokerConnection<S> {
                 Ok(false)
             }
             Performative::Attach(attach) => {
-                let Some(local) = self.remote_channels.resolve(channel) else {
-                    return Err(unknown_channel(channel));
+                let Some(local) = self.resolve_active(channel)? else {
+                    return Ok(false); // pipelined behind our End — ignore
                 };
                 if self
                     .sessions
@@ -546,8 +576,8 @@ impl<S: IoStream> BrokerConnection<S> {
             | Performative::Flow(_)
             | Performative::Disposition(_)
             | Performative::Detach(_)) => {
-                let Some(local) = self.remote_channels.resolve(channel) else {
-                    return Err(unknown_channel(channel));
+                let Some(local) = self.resolve_active(channel)? else {
+                    return Ok(false); // pipelined behind our End — ignore
                 };
                 let session = self.sessions.get_mut(&local).expect("bound channel");
                 session
@@ -577,15 +607,17 @@ impl<S: IoStream> BrokerConnection<S> {
         };
         let Some(queue) = queue else {
             tracing::debug!(name = %attach.name, ?address, "attach to unresolvable address");
-            self.end_session_with_error(
-                local,
-                remote_channel,
+            // Refuse just this link (attach null-terminus + detach not-found);
+            // sibling links and the session stay up.
+            let session = self.sessions.get_mut(&local).expect("bound channel");
+            session.refuse_peer_attach(
+                &attach,
                 AmqpError::new(
                     AmqpCondition::NotFound,
                     Some(format!("no queue for address {address:?}")),
                 ),
-            )
-            .await;
+                &mut self.transport,
+            );
             return;
         };
 
@@ -643,7 +675,12 @@ impl<S: IoStream> BrokerConnection<S> {
                     tracing::warn!(queue = %queue.name, "queue actor unavailable");
                     return;
                 };
-                Binding::Consumer { queue, sub, epoch }
+                Binding::Consumer {
+                    queue,
+                    sub,
+                    epoch,
+                    granted: 0,
+                }
             }
         };
         self.bindings.insert((local, accepted.handle.0), binding);
@@ -695,12 +732,37 @@ impl<S: IoStream> BrokerConnection<S> {
                 LinkEvent::Credit {
                     handle,
                     credit,
-                    drain: _,
+                    drain,
                 } => {
-                    if let Some(Binding::Consumer { queue, sub, .. }) =
-                        self.bindings.get(&(channel, handle.0))
-                    {
-                        let _ = queue.tx.send(QueueMsg::Demand { sub: *sub, credit }).await;
+                    // `credit` is the session's absolute remaining link-credit,
+                    // which cannot see Delivers still in `cmd_rx` or parked in the
+                    // sender outbox. Grant the queue only the delta above what we
+                    // have already handed out (`granted`); a restated flow then
+                    // adds nothing, so those in-flight deliveries aren't
+                    // double-counted into an over-dispatch that strands messages.
+                    let forward = match self.bindings.get_mut(&(channel, handle.0)) {
+                        Some(Binding::Consumer {
+                            queue,
+                            sub,
+                            granted,
+                            ..
+                        }) => {
+                            let delta = credit.saturating_sub(*granted);
+                            // On drain, core has consumed the link-credit; reset
+                            // our view so the post-drain grant re-arms cleanly.
+                            *granted = if drain { 0 } else { credit.max(*granted) };
+                            (delta > 0 || drain).then(|| (queue.tx.clone(), *sub, delta))
+                        }
+                        _ => None,
+                    };
+                    if let Some((tx, sub, delta)) = forward {
+                        let _ = tx
+                            .send(QueueMsg::Demand {
+                                sub,
+                                credit: delta,
+                                drain,
+                            })
+                            .await;
                     }
                 }
                 LinkEvent::Detached { handle, .. } => {
@@ -732,6 +794,10 @@ impl<S: IoStream> BrokerConnection<S> {
                 format!("duplicate begin on channel {remote_channel}"),
             ));
         }
+        // The peer is reusing this channel for a fresh session; drop any stale
+        // discarding marker so its later `End` tears down the *new* session
+        // rather than being swallowed as an echo of the old one.
+        self.discarding.remove(&remote_channel);
         let Some(local) = self.channels.allocate() else {
             return Err(ConnectError::msg(
                 ErrorKind::Capacity,
@@ -758,6 +824,12 @@ impl<S: IoStream> BrokerConnection<S> {
 
     /// Handle a peer `end`: acknowledge and tear the session down.
     async fn handle_end(&mut self, remote_channel: u16, end: End) {
+        if self.discarding.remove(&remote_channel) {
+            // The peer's echo of an `End` we already sent (e.g. after we
+            // refused an attach by ending the session). Teardown is complete;
+            // just drop the discarding marker — do not re-send `End`.
+            return;
+        }
         let Some(local) = self.remote_channels.resolve(remote_channel) else {
             return; // already gone — end/end race, ignore
         };
@@ -772,13 +844,17 @@ impl<S: IoStream> BrokerConnection<S> {
         tracing::debug!(remote_channel, local_channel = local, "session ended");
     }
 
-    /// End a session server-side with an error (e.g. a rejected attach).
+    /// End a session server-side with an error (e.g. a rejected attach). We are
+    /// the initiator here, so the peer has not yet seen our `End`: mark the
+    /// remote channel `discarding` so frames it already pipelined behind the
+    /// rejected attach are ignored (not treated as fatal) until its `End` echo.
     async fn end_session_with_error(&mut self, local: u16, remote_channel: u16, error: AmqpError) {
         self.sessions.remove(&local);
         self.transport
             .queue_amqp(local, &Performative::End(End { error: Some(error) }), None);
         self.remote_channels.unbind(remote_channel);
         self.channels.release(local);
+        self.discarding.insert(remote_channel);
         self.release_session_bindings(local).await;
     }
 

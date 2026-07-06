@@ -41,6 +41,8 @@ struct Subscriber {
     handle: u32,
     binding_gen: u64,
     demand: u32,
+    /// A drain is in progress: zero any leftover demand after the next dispatch.
+    drain_pending: bool,
 }
 
 /// The resolution of a pipelined commit.
@@ -212,12 +214,14 @@ fn handle_msg(
                 handle,
                 binding_gen,
                 demand: 0,
+                drain_pending: false,
             });
             let _ = reply.send(*next_sub_id);
         }
-        QueueMsg::Demand { sub, credit } => {
+        QueueMsg::Demand { sub, credit, drain } => {
             if let Some(s) = subs.iter_mut().find(|s| s.id == sub) {
-                s.demand = credit;
+                s.demand = s.demand.saturating_add(credit);
+                s.drain_pending = drain;
             }
         }
         QueueMsg::Settle {
@@ -348,6 +352,15 @@ fn dispatch(
             tracing::debug!(queue = %name, sub = sub_id, "subscriber connection closed");
             ready.insert(msg_id);
             subs.retain(|s| s.id != sub_id);
+        }
+    }
+
+    // Drain completion: a draining subscriber keeps only the demand it could
+    // satisfy this cycle; the rest is dropped so it isn't re-armed later.
+    for s in subs.iter_mut() {
+        if s.drain_pending {
+            s.demand = 0;
+            s.drain_pending = false;
         }
     }
 }

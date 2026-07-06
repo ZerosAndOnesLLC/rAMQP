@@ -78,12 +78,18 @@ pub(crate) enum QueueMsg {
         /// Replies with the assigned subscriber id.
         reply: tokio::sync::oneshot::Sender<SubId>,
     },
-    /// Set a subscriber's demand (its current link credit).
+    /// Grant a subscriber additional demand (an *increment*, not an absolute
+    /// set-point). The connection computes this delta from the peer's flow
+    /// reconciled against dispatches still in flight, so a restated flow never
+    /// re-arms demand that in-flight `Deliver`s already account for.
     Demand {
         /// Which subscriber.
         sub: SubId,
-        /// Messages it may be sent (absolute, from the peer's flow).
+        /// Additional messages it may be sent (added to current demand).
         credit: u32,
+        /// The peer set `drain`: after dispatching what is available now, drop
+        /// any unmet demand rather than holding it (a poll-to-empty).
+        drain: bool,
     },
     /// A consumer settled a dispatched message.
     Settle {
@@ -170,6 +176,8 @@ struct Subscriber {
     handle: u32,
     binding_gen: u64,
     demand: u32,
+    /// A drain is in progress: zero any leftover demand after the next dispatch.
+    drain_pending: bool,
 }
 
 /// Spawn a queue actor; the returned handle is its only address.
@@ -242,12 +250,17 @@ async fn run(name: String, mut rx: mpsc::Receiver<QueueMsg>, max_depth: usize) {
                     handle,
                     binding_gen,
                     demand: 0,
+                    drain_pending: false,
                 });
                 let _ = reply.send(next_sub_id);
             }
-            QueueMsg::Demand { sub, credit } => {
+            QueueMsg::Demand { sub, credit, drain } => {
                 if let Some(s) = subs.iter_mut().find(|s| s.id == sub) {
-                    s.demand = credit;
+                    s.demand = s.demand.saturating_add(credit);
+                    // A drain zeros whatever is left *after* this cycle's
+                    // dispatch, so the consumer's "then stop" is honored without
+                    // stranding messages that are available right now.
+                    s.drain_pending = drain;
                 }
             }
             QueueMsg::Settle {
@@ -339,6 +352,16 @@ async fn dispatch(
             subs.retain(|s| s.id != sub_id);
         }
     }
+
+    // Drain completion: a subscriber that asked to drain keeps only the demand
+    // it could satisfy from `ready` this cycle; the rest is dropped so it isn't
+    // re-armed against messages that arrive later (the consumer said "stop").
+    for s in subs.iter_mut() {
+        if s.drain_pending {
+            s.demand = 0;
+            s.drain_pending = false;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -369,9 +392,13 @@ mod tests {
         let (conn_tx, mut conn_rx) = mpsc::unbounded_channel();
 
         let sub = subscribe(&q, &conn_tx, 7).await;
-        q.tx.send(QueueMsg::Demand { sub, credit: 10 })
-            .await
-            .unwrap();
+        q.tx.send(QueueMsg::Demand {
+            sub,
+            credit: 10,
+            drain: false,
+        })
+        .await
+        .unwrap();
         q.tx.send(QueueMsg::Publish {
             body: Bytes::from_static(b"m1"),
             ack: None,
@@ -405,9 +432,13 @@ mod tests {
         let q = spawn("t".into(), 100);
         let (conn_tx, mut conn_rx) = mpsc::unbounded_channel();
         let sub = subscribe(&q, &conn_tx, 1).await;
-        q.tx.send(QueueMsg::Demand { sub, credit: 10 })
-            .await
-            .unwrap();
+        q.tx.send(QueueMsg::Demand {
+            sub,
+            credit: 10,
+            drain: false,
+        })
+        .await
+        .unwrap();
         q.tx.send(QueueMsg::Publish {
             body: Bytes::from_static(b"m"),
             ack: None,
@@ -432,6 +463,88 @@ mod tests {
         assert_eq!(again, msg_id);
     }
 
+    /// Demand is an increment, not an absolute set-point: two grants of 1 issued
+    /// before any dispatch must let two messages through (an absolute overwrite
+    /// would cap at 1 — the over/under-dispatch reconciliation the connection
+    /// relies on).
+    #[tokio::test]
+    async fn demand_grants_are_additive() {
+        let q = spawn("t".into(), 100);
+        let (conn_tx, mut conn_rx) = mpsc::unbounded_channel();
+        let sub = subscribe(&q, &conn_tx, 1).await;
+        q.tx.send(QueueMsg::Demand {
+            sub,
+            credit: 1,
+            drain: false,
+        })
+        .await
+        .unwrap();
+        q.tx.send(QueueMsg::Demand {
+            sub,
+            credit: 1,
+            drain: false,
+        })
+        .await
+        .unwrap();
+        for i in 0..2u8 {
+            q.tx.send(QueueMsg::Publish {
+                body: Bytes::copy_from_slice(&[i]),
+                ack: None,
+            })
+            .await
+            .unwrap();
+        }
+        // Both messages come through on the accumulated demand of 2.
+        for _ in 0..2 {
+            assert!(matches!(
+                conn_rx.recv().await.unwrap(),
+                ConnCmd::Deliver { .. }
+            ));
+        }
+    }
+
+    /// A drain grant delivers what is available *now*, then drops the unmet
+    /// remainder so a later publish is not dispatched against stale credit.
+    #[tokio::test]
+    async fn drain_drops_unmet_demand() {
+        let q = spawn("t".into(), 100);
+        let (conn_tx, mut conn_rx) = mpsc::unbounded_channel();
+        let sub = subscribe(&q, &conn_tx, 1).await;
+        // One message is ready; drain-grant credit for five.
+        q.tx.send(QueueMsg::Publish {
+            body: Bytes::from_static(b"now"),
+            ack: None,
+        })
+        .await
+        .unwrap();
+        q.tx.send(QueueMsg::Demand {
+            sub,
+            credit: 5,
+            drain: true,
+        })
+        .await
+        .unwrap();
+        // The available message is delivered...
+        assert!(matches!(
+            conn_rx.recv().await.unwrap(),
+            ConnCmd::Deliver { .. }
+        ));
+        // ...but the 4 units of unmet demand were dropped: a later publish is
+        // NOT dispatched (the consumer said "then stop").
+        q.tx.send(QueueMsg::Publish {
+            body: Bytes::from_static(b"later"),
+            ack: None,
+        })
+        .await
+        .unwrap();
+        let idle =
+            tokio::time::timeout(std::time::Duration::from_millis(100), conn_rx.recv()).await;
+        assert!(
+            idle.is_err(),
+            "drain must not leave demand armed for later messages"
+        );
+    }
+
     #[tokio::test]
     async fn competing_consumers_round_robin() {
         let q = spawn("t".into(), 100);
@@ -442,12 +555,14 @@ mod tests {
         q.tx.send(QueueMsg::Demand {
             sub: s1,
             credit: 10,
+            drain: false,
         })
         .await
         .unwrap();
         q.tx.send(QueueMsg::Demand {
             sub: s2,
             credit: 10,
+            drain: false,
         })
         .await
         .unwrap();
@@ -486,6 +601,7 @@ mod tests {
         q.tx.send(QueueMsg::Demand {
             sub: s1,
             credit: 10,
+            drain: false,
         })
         .await
         .unwrap();
@@ -506,6 +622,7 @@ mod tests {
         q.tx.send(QueueMsg::Demand {
             sub: s2,
             credit: 10,
+            drain: false,
         })
         .await
         .unwrap();
