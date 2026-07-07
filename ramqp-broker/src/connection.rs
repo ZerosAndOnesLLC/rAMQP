@@ -42,7 +42,9 @@ use crate::auth::{Authenticator, Credentials, Operation};
 use crate::config::BrokerConfig;
 use crate::queue::{ConnCmd, PublishAck, QueueHandle, QueueMsg, SettleOutcome, SubId};
 use crate::registry::QueueRegistry;
-use crate::txn::{StagedPublish, StagedSettle, TxnControl, TxnManager, decode_control};
+use crate::txn::{
+    DischargeOutcome, StagedPublish, StagedSettle, TxnControl, TxnManager, decode_control,
+};
 
 /// How many queue commands to coalesce under one flush (mirrors the client
 /// driver's batching; bounds per-wakeup work so reads aren't starved).
@@ -359,7 +361,7 @@ struct TxnDone {
     channel: u16,
     handle: u32,
     delivery_id: u32,
-    ok: bool,
+    outcome: DischargeOutcome,
 }
 
 /// An established broker-side connection (post-handshake).
@@ -454,15 +456,37 @@ impl<S: IoStream> BrokerConnection<S> {
 
                 Some(done) = self.txn_results.next() => {
                     if let Some(session) = self.sessions.get_mut(&done.channel) {
-                        let state = if done.ok {
-                            DeliveryState::Accepted(Accepted::default())
-                        } else {
-                            DeliveryState::Rejected(Rejected {
+                        let state = match done.outcome {
+                            DischargeOutcome::Complete => {
+                                DeliveryState::Accepted(Accepted::default())
+                            }
+                            DischargeOutcome::RolledBack => DeliveryState::Rejected(Rejected {
                                 error: Some(AmqpError::new(
                                     AmqpCondition::InternalError,
-                                    Some("transaction failed; rolled back".to_owned()),
+                                    Some("transaction failed; rolled back (nothing was applied)".to_owned()),
                                 )),
-                            })
+                            }),
+                            // Atomicity broke mid-apply (fsync/Raft/actor
+                            // failure after the reserve phase): tell the
+                            // truth — a retry may duplicate what landed.
+                            DischargeOutcome::Partial { applied, total } => {
+                                DeliveryState::Rejected(Rejected {
+                                    error: Some(AmqpError::new(
+                                        AmqpCondition::InternalError,
+                                        Some(format!(
+                                            "transaction failed after partial application: \
+                                             {applied} of {total} staged publishes were committed; \
+                                             retrying may duplicate them"
+                                        )),
+                                    )),
+                                })
+                            }
+                            DischargeOutcome::Unknown => DeliveryState::Rejected(Rejected {
+                                error: Some(AmqpError::new(
+                                    AmqpCondition::InternalError,
+                                    Some("transaction outcome unknown (coordinator failed)".to_owned()),
+                                )),
+                            }),
                         };
                         session.send_disposition(
                             done.handle,
@@ -813,80 +837,31 @@ impl<S: IoStream> BrokerConnection<S> {
                     channel,
                     handle,
                     delivery_id: delivery_id.value(),
-                    ok: true,
+                    outcome: DischargeOutcome::Complete,
                 };
-                if fail {
-                    // Roll back: staged enqueues drop; staged settlements
-                    // requeue their (still in-flight) messages.
-                    self.txn_results.push(Box::pin(async move {
-                        for settle in txn.settles {
-                            let _ = settle
-                                .queue
-                                .send(QueueMsg::Settle {
-                                    sub: settle.sub,
-                                    msg_id: settle.msg_id,
-                                    outcome: SettleOutcome::Requeue,
-                                })
-                                .await;
-                        }
-                        done
-                    }));
-                } else {
-                    // Commit: every staged enqueue must land (its queue's own
-                    // durability confirm) before the settlements apply and
-                    // the discharge is accepted.
-                    self.txn_results.push(Box::pin(async move {
-                        let mut ok = true;
-                        for publish in &txn.publishes {
-                            let (ack_tx, mut ack_rx) = mpsc::unbounded_channel::<ConnCmd>();
-                            let sent = publish
-                                .queue
-                                .send(QueueMsg::Publish {
-                                    body: publish.body.clone(),
-                                    ack: Some(PublishAck {
-                                        conn: ack_tx,
-                                        channel: 0,
-                                        handle: 0,
-                                        binding_gen: 0,
-                                        delivery_id: 0,
-                                    }),
-                                })
-                                .await
-                                .is_ok();
-                            let accepted = sent
-                                && matches!(
-                                    ack_rx.recv().await,
-                                    Some(ConnCmd::SettleIncoming { accepted: true, .. })
-                                );
-                            if !accepted {
-                                tracing::warn!(
-                                    queue = %publish.queue_name,
-                                    "transactional publish refused at commit; failing the transaction"
-                                );
-                                ok = false;
-                                break;
-                            }
-                        }
-                        // Settlements: apply on success; requeue on failure
-                        // (the consumer's work is undone with the txn).
-                        for settle in txn.settles {
-                            let outcome = if ok {
-                                settle.outcome
-                            } else {
-                                SettleOutcome::Requeue
-                            };
-                            let _ = settle
-                                .queue
-                                .send(QueueMsg::Settle {
-                                    sub: settle.sub,
-                                    msg_id: settle.msg_id,
-                                    outcome,
-                                })
-                                .await;
-                        }
-                        TxnDone { ok, ..done }
-                    }));
-                }
+                // Detached execution: the commit/rollback runs to completion
+                // even if this connection dies mid-way — dropping it with the
+                // connection would strand a half-applied transaction (some
+                // enqueues landed, settlements never processed, no outcome).
+                let (done_tx, done_rx) = oneshot::channel();
+                tokio::spawn(async move {
+                    let outcome = if fail {
+                        // Roll back: staged enqueues drop; staged settlements
+                        // requeue their (still in-flight) messages.
+                        crate::txn::execute_rollback(txn).await;
+                        DischargeOutcome::Complete
+                    } else {
+                        // Commit: reserve on every queue, then land every
+                        // staged enqueue (its queue's own durability confirm)
+                        // before the settlements apply (see txn.rs).
+                        crate::txn::execute_commit(txn).await
+                    };
+                    let _ = done_tx.send(outcome);
+                });
+                self.txn_results.push(Box::pin(async move {
+                    let outcome = done_rx.await.unwrap_or(DischargeOutcome::Unknown);
+                    TxnDone { outcome, ..done }
+                }));
                 if let Some(session) = self.sessions.get_mut(&channel) {
                     session.grant_credit(handle, 1, &mut self.transport);
                 }

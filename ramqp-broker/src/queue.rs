@@ -66,6 +66,31 @@ pub(crate) enum QueueMsg {
         /// Where to confirm (unsettled publishes); `None` for pre-settled.
         ack: Option<PublishAck>,
     },
+    /// Store a message into a slot previously held by [`QueueMsg::Reserve`]
+    /// (the transaction-commit path): consumes one reserved slot and is never
+    /// refused for capacity — admission was decided at reserve time.
+    PublishReserved {
+        /// The raw message bytes as received (all sections).
+        body: Bytes,
+        /// Where to confirm; `None` for pre-settled.
+        ack: Option<PublishAck>,
+    },
+    /// Atomically reserve `count` capacity slots (transaction commit phase 1).
+    /// Reserved slots count against the depth bound for ordinary publishes and
+    /// are consumed by [`QueueMsg::PublishReserved`] or released by
+    /// [`QueueMsg::Unreserve`]. Replies `false` when the queue cannot hold
+    /// `count` more messages (drop-head queues always accept — they make room).
+    Reserve {
+        /// Slots requested.
+        count: u32,
+        /// `true` — reserved; `false` — refused (commit must roll back).
+        reply: tokio::sync::oneshot::Sender<bool>,
+    },
+    /// Release reserved slots that will not be published (commit abort).
+    Unreserve {
+        /// Slots to release.
+        count: u32,
+    },
     /// Add a consumer. Deliveries flow to `conn` as [`ConnCmd::Deliver`].
     Subscribe {
         /// The subscriber's connection command mailbox.
@@ -204,20 +229,31 @@ async fn run(name: String, mut rx: mpsc::Receiver<QueueMsg>, policy: EffectivePo
     let mut ready: VecDeque<Stored> = VecDeque::new();
     let mut unacked: HashMap<u64, (Stored, SubId)> = HashMap::new();
     let mut subs: Vec<Subscriber> = Vec::new();
+    // Capacity slots held for transaction commits (counted against the depth
+    // bound; consumed by PublishReserved, released by Unreserve).
+    let mut reserved: usize = 0;
     let mut next_msg_id: u64 = 0;
     let mut next_sub_id: SubId = 0;
     let mut rr: usize = 0;
 
     while let Some(msg) = rx.recv().await {
+        let from_reserved = matches!(msg, QueueMsg::PublishReserved { .. });
         match msg {
-            QueueMsg::Publish { body, ack } => {
-                if ready.len() + unacked.len() >= policy.max_len {
+            QueueMsg::Publish { body, ack } | QueueMsg::PublishReserved { body, ack } => {
+                if from_reserved {
+                    reserved = reserved.saturating_sub(1);
+                }
+                if ready.len() + unacked.len() + reserved >= policy.max_len {
                     // At the bound: drop-head makes room (dead-lettering the
                     // displaced message); otherwise refuse — never grow
                     // without bound (broker.md §3.2).
                     let dropped = policy.drop_head.then(|| ready.pop_front()).flatten();
                     match dropped {
                         Some(old) => policy.dead_letter(&name, "maxlen", old.body),
+                        // A reserved publish is never refused: its slot was
+                        // admitted at Reserve time (the check above can only
+                        // trip here if the reservation was lost to a failover).
+                        None if from_reserved => {}
                         None => {
                             refuse_publish(&name, ack);
                             continue;
@@ -234,6 +270,19 @@ async fn run(name: String, mut rx: mpsc::Receiver<QueueMsg>, policy: EffectivePo
                 // In-memory transient queue: stored == settled. (A durable /
                 // quorum queue confirms here only after fsync / Raft commit.)
                 confirm_publish(ack);
+            }
+            QueueMsg::Reserve { count, reply } => {
+                // Drop-head queues always accept (a publish makes its own
+                // room), so their slots are never actually held.
+                let ok = policy.drop_head
+                    || ready.len() + unacked.len() + reserved + count as usize <= policy.max_len;
+                if ok && !policy.drop_head {
+                    reserved += count as usize;
+                }
+                let _ = reply.send(ok);
+            }
+            QueueMsg::Unreserve { count } => {
+                reserved = reserved.saturating_sub(count as usize);
             }
             QueueMsg::Subscribe {
                 conn,
@@ -701,6 +750,94 @@ mod tests {
             panic!("message was lost to the stale ack");
         };
         assert_eq!(m3, msg_id, "message survived the stale former-owner ack");
+    }
+
+    async fn reserve(q: &QueueHandle, count: u32) -> bool {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        q.tx.send(QueueMsg::Reserve { count, reply: tx })
+            .await
+            .unwrap();
+        rx.await.unwrap()
+    }
+
+    /// Reserved slots are held against ordinary publishes and consumed by
+    /// `PublishReserved` (the transaction-commit two-phase protocol).
+    #[tokio::test]
+    async fn reserve_holds_capacity_and_publish_reserved_consumes_it() {
+        let q = spawn("t".into(), EffectivePolicy::depth_only(2));
+        let (conn_tx, mut conn_rx) = mpsc::unbounded_channel();
+
+        assert!(reserve(&q, 1).await, "one of two slots reserved");
+        // First ordinary publish takes the remaining free slot...
+        q.tx.send(QueueMsg::Publish {
+            body: Bytes::from_static(b"a"),
+            ack: None,
+        })
+        .await
+        .unwrap();
+        // ...the second must be refused: the reserved slot is not available.
+        q.tx.send(QueueMsg::Publish {
+            body: Bytes::from_static(b"b"),
+            ack: Some(PublishAck {
+                conn: conn_tx.clone(),
+                channel: 0,
+                handle: 0,
+                binding_gen: 0,
+                delivery_id: 1,
+            }),
+        })
+        .await
+        .unwrap();
+        match conn_rx.recv().await.unwrap() {
+            ConnCmd::SettleIncoming { accepted, .. } => assert!(!accepted, "slot was reserved"),
+            other => panic!("expected refusal, got {other:?}"),
+        }
+        // The reserved publish lands in its held slot.
+        q.tx.send(QueueMsg::PublishReserved {
+            body: Bytes::from_static(b"c"),
+            ack: Some(PublishAck {
+                conn: conn_tx.clone(),
+                channel: 0,
+                handle: 0,
+                binding_gen: 0,
+                delivery_id: 2,
+            }),
+        })
+        .await
+        .unwrap();
+        match conn_rx.recv().await.unwrap() {
+            ConnCmd::SettleIncoming { accepted, .. } => assert!(accepted, "reserved slot consumed"),
+            other => panic!("expected confirm, got {other:?}"),
+        }
+    }
+
+    /// A reservation beyond capacity is refused; releasing one restores the
+    /// slot to ordinary publishes.
+    #[tokio::test]
+    async fn reserve_refuses_beyond_capacity_and_unreserve_releases() {
+        let q = spawn("t".into(), EffectivePolicy::depth_only(1));
+        let (conn_tx, mut conn_rx) = mpsc::unbounded_channel();
+
+        assert!(reserve(&q, 1).await, "empty queue reserves one");
+        assert!(!reserve(&q, 1).await, "second reservation exceeds capacity");
+        q.tx.send(QueueMsg::Unreserve { count: 1 }).await.unwrap();
+        // The released slot admits an ordinary publish again.
+        q.tx.send(QueueMsg::Publish {
+            body: Bytes::from_static(b"a"),
+            ack: Some(PublishAck {
+                conn: conn_tx.clone(),
+                channel: 0,
+                handle: 0,
+                binding_gen: 0,
+                delivery_id: 7,
+            }),
+        })
+        .await
+        .unwrap();
+        match conn_rx.recv().await.unwrap() {
+            ConnCmd::SettleIncoming { accepted, .. } => assert!(accepted),
+            other => panic!("expected confirm, got {other:?}"),
+        }
     }
 
     #[tokio::test]

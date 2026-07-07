@@ -110,6 +110,8 @@ async fn run(
     // In-flight commit proposals (publishes + settles), pipelined.
     let mut commits: FuturesUnordered<CommitFuture> = FuturesUnordered::new();
     let mut publishes_pending: usize = 0;
+    // Capacity slots held for transaction commits.
+    let mut reserved: usize = 0;
     let mut next_sub_id: SubId = 0;
     let mut rr: usize = 0;
     let mut mailbox_open = true;
@@ -147,6 +149,7 @@ async fn run(
                     &mut ready,
                     &mut commits,
                     &mut publishes_pending,
+                    &mut reserved,
                     &mut next_sub_id,
                 );
             }
@@ -201,12 +204,17 @@ fn handle_msg(
     ready: &mut BTreeSet<u64>,
     commits: &mut FuturesUnordered<CommitFuture>,
     publishes_pending: &mut usize,
+    reserved: &mut usize,
     next_sub_id: &mut SubId,
 ) {
+    let from_reserved = matches!(msg, QueueMsg::PublishReserved { .. });
     match msg {
-        QueueMsg::Publish { body, ack } => {
+        QueueMsg::Publish { body, ack } | QueueMsg::PublishReserved { body, ack } => {
+            if from_reserved {
+                *reserved = reserved.saturating_sub(1);
+            }
             // Depth bound counts everything stored or about to be.
-            if ready.len() + inflight.len() + *publishes_pending >= policy.max_len {
+            if ready.len() + inflight.len() + *publishes_pending + *reserved >= policy.max_len {
                 // Drop-head makes room (dead-lettering the displaced
                 // message); otherwise refuse.
                 let dropped = policy.drop_head.then(|| ready.pop_first()).flatten();
@@ -215,6 +223,9 @@ fn handle_msg(
                         dead_letter_stored(name, policy, store, old_id, "maxlen");
                         push_remove(commits, raft, old_id);
                     }
+                    // A reserved publish is never refused: its slot was
+                    // admitted at Reserve time.
+                    None if from_reserved => {}
                     None => {
                         refuse_publish(name, ack);
                         return;
@@ -237,6 +248,18 @@ fn handle_msg(
                 };
                 Committed::Publish { ack, result }
             }));
+        }
+        QueueMsg::Reserve { count, reply } => {
+            let ok = policy.drop_head
+                || ready.len() + inflight.len() + *publishes_pending + *reserved + count as usize
+                    <= policy.max_len;
+            if ok && !policy.drop_head {
+                *reserved += count as usize;
+            }
+            let _ = reply.send(ok);
+        }
+        QueueMsg::Unreserve { count } => {
+            *reserved = reserved.saturating_sub(count as usize);
         }
         QueueMsg::Subscribe {
             conn,

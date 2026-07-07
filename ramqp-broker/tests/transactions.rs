@@ -243,6 +243,97 @@ async fn transactions_commit_into_quorum_queues() {
     shutdown.shutdown();
 }
 
+/// A commit spanning multiple queues where one refuses (full, no drop-head)
+/// must apply NOTHING — the healthy queue stays empty and the discharge is
+/// rejected (the CRIT-1 atomicity regression from issue #19).
+#[tokio::test]
+async fn commit_with_a_full_queue_applies_nothing() {
+    let mut config = BrokerConfig::default();
+    config.policies.push((
+        "txn-full".to_owned(),
+        ramqp_broker::QueuePolicy {
+            max_length: Some(1),
+            ..Default::default()
+        },
+    ));
+    let bound = Broker::new(config).bind("127.0.0.1:0").await.expect("bind");
+    let addr = bound.local_addr();
+    let shutdown = bound.shutdown_handle();
+    tokio::spawn(bound.run());
+
+    let conn = ConnectionBuilder::new(format!("amqp://{addr}"))
+        .connect()
+        .await
+        .expect("connect");
+    let session = conn.begin_session().await.expect("session");
+    let ctl = session
+        .create_transaction_controller()
+        .await
+        .expect("controller");
+    let full_producer = session
+        .create_producer("/queues/txn-full")
+        .await
+        .expect("producer (bounded queue)");
+    let ok_producer = session
+        .create_producer("/queues/txn-ok")
+        .await
+        .expect("producer (healthy queue)");
+
+    // Fill the bounded queue outside the transaction.
+    full_producer
+        .send(Message::text("occupier"))
+        .await
+        .expect("fill the bounded queue");
+
+    // Stage into the healthy queue FIRST (the old sequential commit would
+    // land this before discovering the full queue), then into the full one.
+    let txn_id = ctl.declare().await.expect("declare");
+    ok_producer
+        .send_with_state(
+            Message::text("must-not-land"),
+            txn::transactional_state(txn_id.clone(), None),
+        )
+        .await
+        .expect("staged send (healthy)");
+    full_producer
+        .send_with_state(
+            Message::text("refused"),
+            txn::transactional_state(txn_id.clone(), None),
+        )
+        .await
+        .expect("staged send (full)");
+    let err = ctl
+        .commit(txn_id)
+        .await
+        .expect_err("commit must fail: one target queue is full");
+    assert!(
+        err.to_string().contains("rejected"),
+        "expected a rejected discharge, got: {err}"
+    );
+
+    // Atomicity: the healthy queue saw nothing from the failed transaction.
+    ok_producer
+        .send(Message::text("marker"))
+        .await
+        .expect("plain send");
+    let mut consumer = session
+        .create_consumer("/queues/txn-ok")
+        .await
+        .expect("consumer");
+    let d = consumer.recv().await.expect("delivery");
+    assert_eq!(
+        text_of(&d),
+        "marker",
+        "a staged publish from the failed transaction leaked"
+    );
+    consumer.accept(&d).await.expect("accept");
+    let extra = tokio::time::timeout(Duration::from_millis(300), consumer.recv()).await;
+    assert!(extra.is_err(), "no further messages expected");
+
+    conn.close().await.expect("close");
+    shutdown.shutdown();
+}
+
 /// Discharging an unknown transaction is rejected, not silently accepted.
 #[tokio::test]
 async fn unknown_transaction_discharge_is_rejected() {

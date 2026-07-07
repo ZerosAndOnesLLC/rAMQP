@@ -894,10 +894,13 @@ async fn serve_fabric(
 /// reader, and per-producer FIFO is preserved).
 enum QueueBound {
     /// An ordered publish; the reply is sent when the actor settles it.
+    /// `reserved` marks a transaction-commit publish consuming a slot held
+    /// by a prior [`RequestKind::Reserve`].
     Publish {
         corr: u64,
         queue: String,
         body: Bytes,
+        reserved: bool,
     },
     /// A direct actor command (demand/settle/unsubscribe).
     Cmd(mpsc::Sender<QueueMsg>, QueueMsg),
@@ -1055,7 +1058,56 @@ async fn handle_request(
         }
         RequestKind::Publish { queue } => {
             // Ordered: rides the forwarder so per-producer FIFO holds.
-            let _ = fw_tx.send(QueueBound::Publish { corr, queue, body });
+            let _ = fw_tx.send(QueueBound::Publish {
+                corr,
+                queue,
+                body,
+                reserved: false,
+            });
+        }
+        RequestKind::PublishReserved { queue } => {
+            let _ = fw_tx.send(QueueBound::Publish {
+                corr,
+                queue,
+                body,
+                reserved: true,
+            });
+        }
+        RequestKind::Reserve { queue, count } => {
+            let node = node.clone();
+            let writer = writer.clone();
+            tokio::spawn(async move {
+                let ok = match node.leader_actor(&queue).await {
+                    Ok(handle) => {
+                        let (reply_tx, reply_rx) = oneshot::channel();
+                        handle
+                            .tx
+                            .send(QueueMsg::Reserve {
+                                count,
+                                reply: reply_tx,
+                            })
+                            .await
+                            .is_ok()
+                            && reply_rx.await.unwrap_or(false)
+                    }
+                    Err(_) => false,
+                };
+                send_reply(
+                    &writer,
+                    corr,
+                    bincode::serialize(&ok).map_err(|e| e.to_string()),
+                );
+            });
+        }
+        RequestKind::Unreserve { queue, count } => {
+            let node = node.clone();
+            let writer = writer.clone();
+            tokio::spawn(async move {
+                if let Ok(handle) = node.leader_actor(&queue).await {
+                    let _ = handle.tx.send(QueueMsg::Unreserve { count }).await;
+                }
+                send_reply(&writer, corr, Ok(Vec::new()));
+            });
         }
         RequestKind::OpenSub { queue, sub_chan } => {
             let node = node.clone();
@@ -1206,7 +1258,12 @@ async fn queue_forwarder(
     let mut cache: HashMap<String, QueueHandle> = HashMap::new();
     while let Some(cmd) = rx.recv().await {
         match cmd {
-            QueueBound::Publish { corr, queue, body } => {
+            QueueBound::Publish {
+                corr,
+                queue,
+                body,
+                reserved,
+            } => {
                 // Resolve (or re-resolve) the leader-local actor.
                 let mut handle = match cache.get(&queue) {
                     Some(h) if !h.tx.is_closed() => Some(h.clone()),
@@ -1227,20 +1284,19 @@ async fn queue_forwarder(
                 let handle = handle.expect("resolved above");
                 // A per-publish ack channel: the actor confirms on commit.
                 let (ack_tx, mut ack_rx) = mpsc::unbounded_channel::<ConnCmd>();
-                let sent = handle
-                    .tx
-                    .send(QueueMsg::Publish {
-                        body,
-                        ack: Some(PublishAck {
-                            conn: ack_tx,
-                            channel: 0,
-                            handle: 0,
-                            binding_gen: 0,
-                            delivery_id: 0,
-                        }),
-                    })
-                    .await
-                    .is_ok();
+                let ack = Some(PublishAck {
+                    conn: ack_tx,
+                    channel: 0,
+                    handle: 0,
+                    binding_gen: 0,
+                    delivery_id: 0,
+                });
+                let msg = if reserved {
+                    QueueMsg::PublishReserved { body, ack }
+                } else {
+                    QueueMsg::Publish { body, ack }
+                };
+                let sent = handle.tx.send(msg).await.is_ok();
                 if !sent {
                     // Actor died (leadership moved between resolve and send).
                     cache.remove(&queue);

@@ -104,6 +104,29 @@ pub enum RequestKind {
         /// connection).
         sub_chan: u64,
     },
+    /// Publish into a slot previously reserved via [`RequestKind::Reserve`]
+    /// (transaction commit). Body: the raw message. Reply body: bincode
+    /// [`PublishStatus`].
+    PublishReserved {
+        /// The queue name.
+        queue: String,
+    },
+    /// Reserve `count` capacity slots on a queue this node leads
+    /// (transaction commit phase 1). Reply body: bincode `bool`.
+    Reserve {
+        /// The queue name.
+        queue: String,
+        /// Slots requested.
+        count: u32,
+    },
+    /// Release reserved slots that will not be published (commit abort).
+    /// Empty reply body.
+    Unreserve {
+        /// The queue name.
+        queue: String,
+        /// Slots to release.
+        count: u32,
+    },
 }
 
 /// One fabric frame's header. `corr`-carrying variants are request/reply

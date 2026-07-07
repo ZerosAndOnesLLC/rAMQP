@@ -88,6 +88,9 @@ struct PubDone {
     /// when the failed binding is still the current one (so a burst of
     /// failures triggers one rebind, not one per publish).
     epoch: u64,
+    /// A transaction-commit publish consuming a reserved slot (retries keep
+    /// the flag; a post-failover leader simply admits it — bounded overshoot).
+    reserved: bool,
     outcome: PubOutcome,
 }
 
@@ -303,8 +306,56 @@ impl Proxy {
     async fn handle_msg(&mut self, msg: QueueMsg) {
         match msg {
             QueueMsg::Publish { body, ack } => {
-                self.publish(body, ack, 0).await;
+                self.publish(body, ack, false, 0).await;
             }
+            QueueMsg::PublishReserved { body, ack } => {
+                self.publish(body, ack, true, 0).await;
+            }
+            QueueMsg::Reserve { count, reply } => match &self.downstream {
+                Some(Downstream::Local { queue }) => {
+                    // Pass through; the leader-local actor replies directly.
+                    if let Err(mpsc::error::SendError(QueueMsg::Reserve { reply, .. })) = queue
+                        .tx
+                        .send(QueueMsg::Reserve { count, reply })
+                        .await
+                    {
+                        let _ = reply.send(false);
+                    }
+                }
+                Some(Downstream::Remote { conn }) => {
+                    // Spawned: a fabric round trip must not stall deliveries.
+                    let conn = conn.clone();
+                    let queue = self.name.clone();
+                    tokio::spawn(async move {
+                        let ok = match conn
+                            .call(RequestKind::Reserve { queue, count }, Bytes::new())
+                            .await
+                        {
+                            Ok(body) => bincode::deserialize::<bool>(&body).unwrap_or(false),
+                            Err(_) => false,
+                        };
+                        let _ = reply.send(ok);
+                    });
+                }
+                None => {
+                    let _ = reply.send(false);
+                }
+            },
+            QueueMsg::Unreserve { count } => match &self.downstream {
+                Some(Downstream::Local { queue }) => {
+                    let _ = queue.tx.send(QueueMsg::Unreserve { count }).await;
+                }
+                Some(Downstream::Remote { conn }) => {
+                    let conn = conn.clone();
+                    let queue = self.name.clone();
+                    tokio::spawn(async move {
+                        let _ = conn
+                            .call(RequestKind::Unreserve { queue, count }, Bytes::new())
+                            .await;
+                    });
+                }
+                None => {}
+            },
             QueueMsg::Subscribe {
                 conn,
                 channel,
@@ -462,28 +513,33 @@ impl Proxy {
         }
     }
 
-    /// Forward one publish downstream (attempt `attempt`).
-    async fn publish(&mut self, body: Bytes, ack: Option<PublishAck>, attempt: u32) {
+    /// Forward one publish downstream (attempt `attempt`). `reserved` marks a
+    /// transaction-commit publish consuming a pre-reserved slot.
+    async fn publish(&mut self, body: Bytes, ack: Option<PublishAck>, reserved: bool, attempt: u32) {
         match &self.downstream {
             Some(Downstream::Local { queue }) => {
                 // Wrap the ack so we observe the outcome (for retries) before
                 // forwarding it to the real producer.
                 let (ack_tx, mut ack_rx) = mpsc::unbounded_channel::<ConnCmd>();
-                let wrapped = PublishAck {
+                let wrapped = Some(PublishAck {
                     conn: ack_tx,
                     channel: 0,
                     handle: 0,
                     binding_gen: self.binding_epoch,
                     delivery_id: 0,
-                };
-                let sent = queue
-                    .tx
-                    .send(QueueMsg::Publish {
+                });
+                let msg = if reserved {
+                    QueueMsg::PublishReserved {
                         body: body.clone(),
-                        ack: Some(wrapped),
-                    })
-                    .await
-                    .is_ok();
+                        ack: wrapped,
+                    }
+                } else {
+                    QueueMsg::Publish {
+                        body: body.clone(),
+                        ack: wrapped,
+                    }
+                };
+                let sent = queue.tx.send(msg).await.is_ok();
                 let epoch = self.binding_epoch;
                 if !sent {
                     self.pubs.push(Box::pin(async move {
@@ -492,6 +548,7 @@ impl Proxy {
                             body,
                             attempt,
                             epoch,
+                            reserved,
                             outcome: PubOutcome::Retry,
                         }
                     }));
@@ -513,6 +570,7 @@ impl Proxy {
                         body,
                         attempt,
                         epoch,
+                        reserved,
                         outcome,
                     }
                 }));
@@ -522,9 +580,12 @@ impl Proxy {
                 let queue = self.name.clone();
                 let epoch = self.binding_epoch;
                 self.pubs.push(Box::pin(async move {
-                    let reply = conn
-                        .call(RequestKind::Publish { queue }, body.clone())
-                        .await;
+                    let req = if reserved {
+                        RequestKind::PublishReserved { queue }
+                    } else {
+                        RequestKind::Publish { queue }
+                    };
+                    let reply = conn.call(req, body.clone()).await;
                     let outcome = match reply.and_then(|b| {
                         bincode::deserialize::<PublishStatus>(&b).map_err(|e| e.to_string())
                     }) {
@@ -537,6 +598,7 @@ impl Proxy {
                         body,
                         attempt,
                         epoch,
+                        reserved,
                         outcome,
                     }
                 }));
@@ -564,7 +626,7 @@ impl Proxy {
                     refuse_publish(&self.name, done.ack);
                     return;
                 }
-                Box::pin(self.publish(done.body, done.ack, done.attempt + 1)).await;
+                Box::pin(self.publish(done.body, done.ack, done.reserved, done.attempt + 1)).await;
             }
         }
     }
