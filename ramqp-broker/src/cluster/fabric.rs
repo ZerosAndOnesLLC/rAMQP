@@ -563,16 +563,26 @@ impl PeerClient {
         &self.addr
     }
 
-    /// The live connection, dialing if needed. Concurrent callers share one
-    /// dial (the mutex serializes only [re]connection, never frame traffic).
+    /// How long a fabric dial may take before failing. A blackholed peer
+    /// (SYN drop — the classic failover mode) would otherwise hang for the
+    /// kernel's ~2-minute TCP timeout.
+    const DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// The live connection, dialing if needed. The dial happens OUTSIDE the
+    /// mutex: holding it across a hung connect would stall every caller
+    /// behind the same lock — leader resolution sweeps, proxy binds,
+    /// meta-write forwards — for the whole timeout.
     pub async fn conn(&self) -> std::io::Result<Arc<ConnState>> {
-        let mut guard = self.conn.lock().await;
-        if let Some(conn) = guard.as_ref()
+        if let Some(conn) = self.conn.lock().await.as_ref()
             && conn.is_open()
         {
             return Ok(conn.clone());
         }
-        let stream = TcpStream::connect(&self.addr).await?;
+        let stream = tokio::time::timeout(Self::DIAL_TIMEOUT, TcpStream::connect(&self.addr))
+            .await
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "fabric dial timed out")
+            })??;
         let _ = stream.set_nodelay(true);
         let (mut reader, writer) = stream.into_split();
         let writer = spawn_writer(writer);
@@ -592,6 +602,14 @@ impl PeerClient {
             }
             reader_conn.shatter();
         });
+        let mut guard = self.conn.lock().await;
+        if let Some(existing) = guard.as_ref()
+            && existing.is_open()
+        {
+            // Raced another dialer: use the winner; ours tears down when
+            // dropped (the peer sees the FIN and closes its side).
+            return Ok(existing.clone());
+        }
         *guard = Some(conn.clone());
         Ok(conn)
     }

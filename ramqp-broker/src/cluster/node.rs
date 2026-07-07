@@ -462,11 +462,24 @@ impl ClusterNode {
         )
         .await
         .map_err(|e| e.to_string())?;
-        let raced = {
+        enum Insert {
+            Inserted,
+            Raced,
+            Stopping,
+        }
+        let outcome = {
             let mut groups = self.groups.lock().expect("groups lock");
-            // Raced another creator: keep the first, drop ours.
-            if groups.contains_key(name) {
-                true
+            // Re-check `stopping` under the SAME lock stop() drains under:
+            // the entry check races a concurrent stop(), and inserting a
+            // fresh EMPTY member after the drain resurrects it on a dying
+            // node — whose conflict replies below its previously-acked
+            // matched index panic the leader ("follower log reversion", the
+            // exact failure the flag exists to prevent).
+            if self.stopping.load(std::sync::atomic::Ordering::Acquire) {
+                Insert::Stopping
+            } else if groups.contains_key(name) {
+                // Raced another creator: keep the first, drop ours.
+                Insert::Raced
             } else {
                 groups.insert(
                     name.to_owned(),
@@ -475,12 +488,19 @@ impl ClusterNode {
                         store,
                     }),
                 );
-                false
+                Insert::Inserted
             }
         };
-        if raced {
-            let _ = raft.shutdown().await;
-            return Ok(());
+        match outcome {
+            Insert::Inserted => {}
+            Insert::Raced => {
+                let _ = raft.shutdown().await;
+                return Ok(());
+            }
+            Insert::Stopping => {
+                let _ = raft.shutdown().await;
+                return Err("node is stopping".to_owned());
+            }
         }
 
         let is_bootstrapper = members
