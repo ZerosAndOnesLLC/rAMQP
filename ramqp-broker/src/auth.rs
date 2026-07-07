@@ -114,6 +114,14 @@ impl Authenticator for AllowAll {
 }
 
 /// PLAIN authentication against a static in-memory user table.
+///
+/// **Development / testing helper only.** Passwords are held in plaintext in
+/// memory, and while [`verify`](StaticPlain::verify) normalizes the
+/// present-vs-absent user timing, the constant-time compare short-circuits
+/// on a length mismatch, so it can still leak the password *length* via
+/// timing (LOW-17). For production, use an authenticator that verifies
+/// against salted, iterated hashes — [`StaticScram`] (no plaintext at rest)
+/// or a custom [`Authenticator`] backed by your credential store.
 #[derive(Debug, Default)]
 pub struct StaticPlain {
     users: HashMap<String, String>,

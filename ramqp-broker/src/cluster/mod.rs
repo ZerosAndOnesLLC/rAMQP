@@ -46,17 +46,33 @@ pub(crate) fn fnv1a(bytes: impl IntoIterator<Item = u8>) -> u64 {
 }
 
 /// The per-queue on-disk layout under a broker `data_dir`:
-/// `(spill dir, snapshot dir)`. Hash-named so any queue name is filesystem-
-/// safe.
+/// `(spill dir, snapshot dir)`. The tag is a **SHA-256** of the queue name,
+/// not FNV-1a: a 64-bit non-cryptographic tag lets a client that can declare
+/// queues construct a name colliding with an existing durable queue's tag,
+/// and `Spill::open`'s `remove_dir_all` then destroys the victim's segments
+/// (LOW-9). A 256-bit cryptographic digest makes a chosen collision
+/// infeasible.
 pub(crate) fn queue_dirs(
     data_dir: &std::path::Path,
     queue: &str,
 ) -> (std::path::PathBuf, std::path::PathBuf) {
-    let tag = format!("{:016x}", fnv1a(queue.bytes()));
+    let tag = queue_tag(queue);
     (
         data_dir.join("spill").join(&tag),
         data_dir.join("snapshots").join(&tag),
     )
+}
+
+/// A collision-resistant, filesystem-safe directory tag for a queue name.
+pub(crate) fn queue_tag(queue: &str) -> String {
+    use ramqp_core::sasl::scram::ScramMechanism;
+    let digest = ScramMechanism::Sha256.h(queue.as_bytes());
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for b in digest {
+        use std::fmt::Write;
+        let _ = write!(hex, "{b:02x}");
+    }
+    hex
 }
 
 openraft::declare_raft_types!(

@@ -404,6 +404,23 @@ fn writer_loop(db: Arc<Database>, mut rx: mpsc::Receiver<StoreOp>) {
             }
         }
         let committed = apply_batch(&db, &batch).is_ok();
+        // Remove/Fail carry no completion channel (their actors don't await
+        // them), so a batch abort silently un-persists a settle → the
+        // message redelivers after restart (at-least-once) with no trace.
+        // Log it so the duplicate is diagnosable (LOW-11).
+        if !committed {
+            let unsignalled = batch
+                .iter()
+                .filter(|op| matches!(op, StoreOp::Remove { .. } | StoreOp::Fail { .. }))
+                .count();
+            if unsignalled > 0 {
+                tracing::warn!(
+                    count = unsignalled,
+                    "durable store batch commit failed: settle removals/fails were not \
+                     persisted; affected messages will redeliver after restart"
+                );
+            }
+        }
         for op in batch {
             if let Some(done) = op.take_done() {
                 let _ = done.send(committed);
