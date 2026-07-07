@@ -174,16 +174,34 @@ impl QueueRegistry {
         (!name.is_empty()).then_some((QueueKind::Transient, name))
     }
 
-    /// Resolve an address in the default vhost.
+    /// Resolve an address in the default namespace — broker-INTERNAL callers
+    /// only (the dead-letter router, management). Unlike client resolution,
+    /// this accepts qualified names containing `/`: a per-vhost policy
+    /// addresses `/queues/<vhost>/dead`, which lands on that vhost's key
+    /// (the documented dead-letter composition).
     pub async fn resolve(&self, address: &str) -> Option<QueueHandle> {
-        self.resolve_in("", address).await
+        let (kind, name) = Self::parse_address(address)?;
+        self.resolve_name(kind, name).await
     }
 
-    /// Resolve an address within a vhost, declaring the queue if it doesn't
-    /// exist. A non-empty vhost namespaces the queue (name, policies,
-    /// storage, catalog) as `<vhost>/<name>`.
+    /// Resolve a CLIENT address within a vhost, declaring the queue if it
+    /// doesn't exist. A non-empty vhost namespaces the queue (name,
+    /// policies, storage, catalog) as `<vhost>/<name>` — so neither
+    /// component may contain the `/` separator: a client-chosen name
+    /// crossing it (`tenantA/secret` from the default vhost) would land on
+    /// another tenant's storage key, below the authz layer. Control
+    /// characters are refused for log/metrics hygiene.
     pub async fn resolve_in(&self, vhost: &str, address: &str) -> Option<QueueHandle> {
         let (kind, bare) = Self::parse_address(address)?;
+        let valid = |s: &str| !s.contains('/') && !s.chars().any(char::is_control);
+        if !valid(bare) || !valid(vhost) {
+            tracing::debug!(
+                vhost,
+                address,
+                "address refused: reserved separator or control character"
+            );
+            return None;
+        }
         let qualified;
         let name: &str = if vhost.is_empty() {
             bare
@@ -191,6 +209,12 @@ impl QueueRegistry {
             qualified = format!("{vhost}/{bare}");
             &qualified
         };
+        self.resolve_name(kind, name).await
+    }
+
+    /// Get-or-declare the queue actor for a normalized, namespace-qualified
+    /// name.
+    async fn resolve_name(&self, kind: QueueKind, name: &str) -> Option<QueueHandle> {
         // Kind-qualified key: `/queues/foo`, `/quorum/foo`, and
         // `/durable/foo` are distinct queues.
         let key = match kind {
@@ -441,6 +465,33 @@ mod tests {
         );
         let quorum2 = r.resolve("/quorum/q1").await.unwrap();
         assert!(quorum.tx.same_channel(&quorum2.tx));
+    }
+
+    /// HIGH-6 (issue #19): client addresses may not cross the
+    /// `<vhost>/<name>` key separator or carry control characters; the
+    /// broker-internal path (dead-letter routing) still composes qualified
+    /// names.
+    #[tokio::test]
+    async fn client_addresses_cannot_cross_tenant_keys() {
+        let r = QueueRegistry::new(&BrokerConfig::default());
+        let secret = r
+            .resolve_in("tenant-a", "/queues/secret")
+            .await
+            .expect("tenant queue declares");
+        // Crossing the separator from the default vhost is refused...
+        assert!(r.resolve_in("", "/queues/tenant-a/secret").await.is_none());
+        // ...as are control characters and separator-bearing vhosts.
+        assert!(r.resolve_in("", "/queues/bad\nname").await.is_none());
+        assert!(r.resolve_in("bad/host", "/queues/x").await.is_none());
+        // The INTERNAL path still composes per-vhost targets (DLX routing).
+        let dlx = r
+            .resolve("/queues/tenant-a/secret")
+            .await
+            .expect("internal qualified resolve");
+        assert!(
+            secret.tx.same_channel(&dlx.tx),
+            "internal qualified resolution reaches the tenant's queue"
+        );
     }
 
     #[tokio::test]

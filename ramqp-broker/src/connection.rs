@@ -127,6 +127,25 @@ async fn handshake<S: IoStream>(
             ),
         ));
     }
+    // Tenant namespace: a hostname of `vhost:<name>` scopes every queue this
+    // connection touches (queues, policies, permissions) to that vhost. A
+    // vhost is one component of the storage key (`<vhost>/<name>`): a
+    // separator inside it would let `vhost:a` + queue `b/c` collide with
+    // `vhost:a/b` + queue `c` — cross-tenant reads/writes below the authz
+    // layer. Control characters are refused for log/metrics hygiene.
+    // Validated BEFORE our own `open` goes out, so the peer's connect fails.
+    let vhost = peer_open
+        .hostname
+        .as_deref()
+        .and_then(|h| h.strip_prefix("vhost:"))
+        .unwrap_or("")
+        .to_owned();
+    if vhost.contains('/') || vhost.chars().any(char::is_control) {
+        return Err(ConnectError::msg(
+            ErrorKind::ProtocolViolation,
+            format!("invalid vhost {vhost:?}: '/' and control characters are not allowed"),
+        ));
+    }
     let local_open = build_open(&config.connection);
     let negotiated = reconcile(&local_open, &peer_open);
     // max-frame-size is DIRECTIONAL (spec §2.7.1): our advertised value bounds
@@ -145,15 +164,6 @@ async fn handshake<S: IoStream>(
     let (link_events_tx, link_events_rx) = mpsc::channel(1024);
     let (session_events_tx, session_events_rx) = mpsc::unbounded_channel();
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-
-    // Tenant namespace: a hostname of `vhost:<name>` scopes every queue this
-    // connection touches (queues, policies, permissions) to that vhost.
-    let vhost = peer_open
-        .hostname
-        .as_deref()
-        .and_then(|h| h.strip_prefix("vhost:"))
-        .unwrap_or("")
-        .to_owned();
 
     tracing::debug!(container = %peer_open.container_id, identity = ?identity, vhost = %vhost, "connection open");
     Ok(BrokerConnection {

@@ -162,6 +162,61 @@ async fn producer_send(session: &ramqp::Session, address: &str, text: &str) {
     p.send(Message::text(text)).await.expect("send");
 }
 
+/// HIGH-6 (issue #19): the storage key is `<vhost>/<name>`, so a client
+/// must not be able to cross the separator — a default-vhost attach to
+/// `/queues/tenant-a/secret` would otherwise land on tenant-a's `secret`
+/// key, below the authz layer. Vhosts containing `/` are refused at open.
+#[tokio::test]
+async fn cross_tenant_addressing_is_refused() {
+    let (addr, shutdown) = start_with(Arc::new(ramqp_broker::AllowAll)).await;
+    let connect_vhost = |vhost: &str| {
+        let mut config = ramqp::Config::default();
+        config.connection.hostname = Some(format!("vhost:{vhost}"));
+        ConnectionBuilder::new(format!("amqp://{addr}")).config(config)
+    };
+
+    // Tenant A owns /queues/secret and has a message in it.
+    let conn_a = connect_vhost("tenant-a").connect().await.expect("a");
+    let sess_a = conn_a.begin_session().await.expect("sess a");
+    producer_send(&sess_a, "/queues/secret", "private").await;
+
+    // A default-vhost client addressing across the separator is refused:
+    // the attach completes with a null terminus + detach, so the refusal
+    // surfaces on the first receive/send.
+    let conn = ConnectionBuilder::new(format!("amqp://{addr}"))
+        .connect()
+        .await
+        .expect("default vhost connect");
+    let sess = conn.begin_session().await.expect("sess");
+    let mut crosser = sess
+        .create_consumer("/queues/tenant-a/secret")
+        .await
+        .expect("attach completes");
+    let denied = tokio::time::timeout(Duration::from_secs(5), crosser.recv())
+        .await
+        .expect("refusal arrives");
+    assert!(
+        denied.is_err(),
+        "cross-tenant consumer must be refused: {denied:?}"
+    );
+
+    // A vhost containing '/' is refused at the open.
+    assert!(
+        connect_vhost("tenant/a").connect().await.is_err(),
+        "vhost with '/' must fail the open"
+    );
+
+    // Tenant A's message is untouched and still its own.
+    let mut cons = sess_a.create_consumer("/queues/secret").await.expect("ca");
+    let d = cons.recv().await.expect("delivery");
+    assert_eq!(text_of(&d), "private");
+    cons.accept(&d).await.expect("accept");
+
+    conn.close().await.expect("close");
+    conn_a.close().await.expect("close a");
+    shutdown.shutdown();
+}
+
 /// Vhosts: a hostname of `vhost:<name>` namespaces every queue — the same
 /// address in two vhosts is two queues.
 #[tokio::test]
