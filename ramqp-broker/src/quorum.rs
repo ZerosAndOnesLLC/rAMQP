@@ -13,7 +13,13 @@
 //! - **Pipelined commits** — publishes and settles are proposed concurrently
 //!   (`FuturesUnordered`), never serializing the actor on a commit round
 //!   trip; Raft applies them in proposal order, and the dispatch ready-set is
-//!   ordered by message id, so FIFO holds.
+//!   ordered by message id, so FIFO holds. FIFO here leans on
+//!   `FuturesUnordered` first-polling pushed futures in insertion order so
+//!   `client_write` submits in enqueue order (LOW-2): under openraft
+//!   core-channel backpressure two proposals could in principle resolve out
+//!   of order and assign message ids out of publish order. This is a
+//!   fragility, not a contractual guarantee — the durable actor avoids it by
+//!   submitting inline; incremental hardening tracks it.
 //! - **Ready-set dispatch** — an ordered set of dispatchable ids maintained
 //!   incrementally (O(log n)), rebuilt from applied state only at actor
 //!   start; no per-dispatch scan of the store.
@@ -45,10 +51,17 @@ enum Committed {
         /// budget on resolution).
         len: usize,
     },
-    /// An ack/drop removal proposal finished.
+    /// An ack/drop/dead-letter removal proposal finished.
     Remove {
         msg_id: u64,
         result: Result<(), String>,
+        /// Re-ready the message if the remove fails to commit. True for a
+        /// consumer ack (the message is still replicated → redeliver,
+        /// at-least-once); FALSE for a dead-letter removal (the body already
+        /// went to the DLX — re-readying would deliver it AND dead-letter
+        /// it, LOW-1). Matches the durable actor, which never reinserts
+        /// after dead-lettering.
+        readd_on_failure: bool,
     },
     /// A failure-count proposal finished (best-effort).
     CountFailure { result: Result<(), String> },
@@ -203,12 +216,17 @@ async fn run(
                             }
                         }
                     }
-                    Committed::Remove { msg_id, result } => {
+                    Committed::Remove { msg_id, result, readd_on_failure } => {
                         if let Err(e) = result {
-                            // The message is still replicated: make it
-                            // dispatchable again (at-least-once).
-                            tracing::warn!(queue = %name, error = %e, "settle not committed");
-                            ready.insert(msg_id);
+                            tracing::warn!(queue = %name, error = %e, "remove not committed");
+                            // Only re-ready an ACK removal: a dead-letter
+                            // removal's body is already at the DLX, so
+                            // re-readying would double it (LOW-1). It stays in
+                            // replicated state and redelivers on the next
+                            // failover instead.
+                            if readd_on_failure {
+                                ready.insert(msg_id);
+                            }
                         }
                     }
                     Committed::CountFailure { result } => {
@@ -361,7 +379,7 @@ fn handle_msg(
                             .await
                             .map(|_| ())
                             .map_err(|e| e.to_string());
-                        Committed::Remove { msg_id, result }
+                        Committed::Remove { msg_id, result, readd_on_failure: true }
                     }));
                 }
                 SettleOutcome::Requeue => {
@@ -436,7 +454,8 @@ fn push_remove(commits: &mut FuturesUnordered<CommitFuture>, raft: &QueueRaft, m
             .await
             .map(|_| ())
             .map_err(|e| e.to_string());
-        Committed::Remove { msg_id, result }
+        // Dead-letter path: the body is already at the DLX; never re-ready.
+        Committed::Remove { msg_id, result, readd_on_failure: false }
     }));
 }
 

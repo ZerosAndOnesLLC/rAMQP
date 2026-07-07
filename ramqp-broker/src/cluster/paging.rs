@@ -189,6 +189,19 @@ impl Spill {
             None => true,
         };
         if roll {
+            // The outgoing current segment may already be fully settled
+            // (live == 0): `release` skips deleting the current segment, so
+            // without this check a segment that drained while still current
+            // would leak until process exit (LOW-6). Reclaim it as it rolls.
+            if let Some(old) = inner.current
+                && inner.segments.get(&old).is_some_and(|s| s.live == 0)
+            {
+                if inner.pins > 0 {
+                    inner.deferred_delete.push(old);
+                } else {
+                    delete_segment(&mut inner, old);
+                }
+            }
             let id = inner.next_segment;
             inner.next_segment += 1;
             let path = inner.dir.join(format!("{id:016}.seg"));

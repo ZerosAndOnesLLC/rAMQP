@@ -408,9 +408,17 @@ impl ConnState {
             )
             .await;
         let outcome: Result<(), Option<NodeId>> = match reply {
-            Ok(body) => {
-                bincode::deserialize(&body).map_err(|e| OpenSubError::Transport(e.to_string()))?
-            }
+            Ok(body) => match bincode::deserialize(&body) {
+                Ok(outcome) => outcome,
+                Err(e) => {
+                    // A bad reply body still leaves the sub registered locally
+                    // and a leader-side subscription open — close_sub removes
+                    // ours and tells the leader to unsubscribe so neither
+                    // leaks (LOW-3).
+                    self.close_sub(sub_chan);
+                    return Err(OpenSubError::Transport(e.to_string()));
+                }
+            },
             Err(e) => {
                 self.subs
                     .lock()
