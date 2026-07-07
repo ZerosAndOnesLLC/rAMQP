@@ -203,6 +203,15 @@ impl TxnManager {
         self.staged_bytes = self.staged_bytes.saturating_sub(bytes);
         Some(txn)
     }
+
+    /// Drain every open transaction (coordinator link detach / connection
+    /// teardown): each is returned for rollback so its staged settles
+    /// requeue and its staged publish bytes free, and the `MAX_TXNS` slots
+    /// are reclaimed.
+    pub fn take_all(&mut self) -> Vec<Txn> {
+        self.staged_bytes = 0;
+        self.txns.drain().map(|(_, txn)| txn).collect()
+    }
 }
 
 /// How [`TxnManager::stage_settle`] resolved.
@@ -521,6 +530,38 @@ mod tests {
             txns.stage_publish(&id2, mk(&big)),
             "budget freed by the previous discharge"
         );
+    }
+
+    /// MED-14 (issue #19): a coordinator link detach drains every open
+    /// transaction so its slots and staged bytes are reclaimed at once (not
+    /// held until connection close).
+    #[test]
+    fn take_all_drains_every_txn_and_frees_the_budget() {
+        let (queue_tx, _rx) = mpsc::channel(1);
+        let mut txns = TxnManager::default();
+        let a = txns.declare().expect("a");
+        let b = txns.declare().expect("b");
+        txns.stage_publish(
+            &a,
+            StagedPublish {
+                queue: queue_tx.clone(),
+                queue_name: "q".into(),
+                body: Bytes::from_static(b"x"),
+            },
+        );
+        txns.stage_publish(
+            &b,
+            StagedPublish {
+                queue: queue_tx,
+                queue_name: "q".into(),
+                body: Bytes::from_static(b"y"),
+            },
+        );
+        let drained = txns.take_all();
+        assert_eq!(drained.len(), 2, "both open transactions drained");
+        assert_eq!(txns.staged_bytes, 0, "staging budget reset");
+        // Slots reclaimed: the table is empty again.
+        assert!(txns.take(&a).is_none() && txns.take(&b).is_none());
     }
 
     /// The happy path: all enqueues land, in staging order per queue.

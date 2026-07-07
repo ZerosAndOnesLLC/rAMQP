@@ -10,8 +10,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use futures_util::StreamExt;
 use futures_util::stream::FuturesUnordered;
+use futures_util::{FutureExt, StreamExt};
 use tokio::sync::{mpsc, oneshot, watch};
 
 use ramqp_core::codec::Symbol;
@@ -24,7 +24,7 @@ use ramqp_core::ids::{DeliveryId, SessionId};
 use ramqp_core::observe::{SharedMetrics, noop_metrics};
 use ramqp_core::proto::{LinkEvent, SessionEvent};
 use ramqp_core::sasl::scram::ScramMechanism;
-use ramqp_core::sasl::server::{ScramServer, parse_plain_response};
+use ramqp_core::sasl::server::{ScramServer, ScramVerifier, parse_plain_response};
 use ramqp_core::session::state::Session;
 use ramqp_core::transport::IoStream;
 use ramqp_core::transport::frame::{Frame, FrameBody, FramedTransport};
@@ -290,9 +290,14 @@ async fn server_scram<S: IoStream>(
         return Ok(None);
     };
     let username = username.to_owned();
-    let Some(verifier) = auth.scram_verifier(mechanism, &username) else {
-        return Ok(None);
-    };
+    // Unknown user: proceed with a FAKE verifier (deterministic per
+    // username, so a repeated probe sees a stable salt) instead of failing
+    // immediately. Both the unknown-user and wrong-password paths now send a
+    // server-first challenge and fail at client-final — closing the
+    // username-enumeration oracle (RFC 5802 §7). MED-16.
+    let verifier = auth
+        .scram_verifier(mechanism, &username)
+        .unwrap_or_else(|| fake_scram_verifier(mechanism, &username));
     let challenge = server.server_first(verifier);
     transport
         .send_sasl(&SaslFrame::Challenge(SaslChallenge {
@@ -320,6 +325,44 @@ async fn server_scram<S: IoStream>(
         }
         Err(_) => Ok(None),
     }
+}
+
+/// A deterministic decoy SCRAM verifier for an unknown user: a real client
+/// proof can never match its keys (derived from a per-process secret), but
+/// the exchange is indistinguishable from a known user's until client-final
+/// fails — no username-existence oracle. The salt is stable per username so
+/// a repeated probe cannot detect a fake from a changing salt.
+fn fake_scram_verifier(mechanism: ScramMechanism, username: &str) -> ScramVerifier {
+    use std::sync::OnceLock;
+    static SECRET: OnceLock<[u8; 32]> = OnceLock::new();
+    let secret = SECRET.get_or_init(|| {
+        // Process-lifetime secret; unknowable to a client, so the derived
+        // salt/keys cannot be predicted or replayed.
+        let nonce = ramqp_core::sasl::scram::gen_nonce();
+        let mut seed = [0u8; 32];
+        let bytes = nonce.as_bytes();
+        for (i, slot) in seed.iter_mut().enumerate() {
+            *slot = bytes[i % bytes.len()] ^ (i as u8).wrapping_mul(31);
+        }
+        seed
+    });
+    let salt = mechanism.hmac(secret, format!("salt:{username}").as_bytes());
+    let fake_pw = mechanism.hmac(secret, format!("pw:{username}").as_bytes());
+    let salted = mechanism.pbkdf2(&fake_pw, &salt[..16], StaticScramIterations::VALUE);
+    let client_key = mechanism.hmac(&salted, b"Client Key");
+    ScramVerifier {
+        salt: salt[..16].to_vec(),
+        iterations: StaticScramIterations::VALUE,
+        stored_key: mechanism.h(&client_key),
+        server_key: mechanism.hmac(&salted, b"Server Key"),
+    }
+}
+
+/// The iteration count decoy verifiers advertise (matches the shipped
+/// `StaticScram` default so a decoy is indistinguishable from a real user).
+struct StaticScramIterations;
+impl StaticScramIterations {
+    const VALUE: u32 = 8192;
 }
 
 /// A link's queue binding.
@@ -471,60 +514,15 @@ impl<S: IoStream> BrokerConnection<S> {
                 }
 
                 Some(done) = self.txn_results.next() => {
-                    // Deliver the outcome only to the session the discharge
-                    // arrived on — `(channel)` may have been reused by a new
-                    // session since (see TxnDone::session_id).
-                    let session = self
-                        .sessions
-                        .get_mut(&done.channel)
-                        .filter(|s| s.session_id == done.session_id);
-                    if session.is_none() {
-                        tracing::debug!(
-                            channel = done.channel,
-                            "discharge outcome dropped: its session is gone (channel reused or ended)"
-                        );
-                    }
-                    if let Some(session) = session {
-                        let state = match done.outcome {
-                            DischargeOutcome::Complete => {
-                                DeliveryState::Accepted(Accepted::default())
-                            }
-                            DischargeOutcome::RolledBack => DeliveryState::Rejected(Rejected {
-                                error: Some(AmqpError::new(
-                                    AmqpCondition::InternalError,
-                                    Some("transaction failed; rolled back (nothing was applied)".to_owned()),
-                                )),
-                            }),
-                            // Atomicity broke mid-apply (fsync/Raft/actor
-                            // failure after the reserve phase): tell the
-                            // truth — a retry may duplicate what landed.
-                            DischargeOutcome::Partial { applied, total } => {
-                                DeliveryState::Rejected(Rejected {
-                                    error: Some(AmqpError::new(
-                                        AmqpCondition::InternalError,
-                                        Some(format!(
-                                            "transaction failed after partial application: \
-                                             {applied} of {total} staged publishes were committed; \
-                                             retrying may duplicate them"
-                                        )),
-                                    )),
-                                })
-                            }
-                            DischargeOutcome::Unknown => DeliveryState::Rejected(Rejected {
-                                error: Some(AmqpError::new(
-                                    AmqpCondition::InternalError,
-                                    Some("transaction outcome unknown (coordinator failed)".to_owned()),
-                                )),
-                            }),
-                        };
-                        session.send_disposition(
-                            done.handle,
-                            DeliveryId(done.delivery_id),
-                            None,
-                            state,
-                            true,
-                            &mut self.transport,
-                        );
+                    self.report_txn_done(done);
+                    // Drain every other already-resolved discharge outcome:
+                    // the biased, read-preferring loop would otherwise defer
+                    // them behind a saturating producer (MED-15). Commit
+                    // EXECUTION already runs on its own task (see
+                    // handle_txn_control), so only the outcome reporting
+                    // rides this arm.
+                    while let Some(Some(next)) = self.txn_results.next().now_or_never() {
+                        self.report_txn_done(next);
                     }
                     self.flush().await?;
                 }
@@ -537,7 +535,6 @@ impl<S: IoStream> BrokerConnection<S> {
                     // (biased, read-preferring) loop starve them — the queue
                     // then thinks acked messages are still in flight, and a
                     // close would requeue them all as duplicates.
-                    use futures_util::FutureExt;
                     while let Some(Some(next)) = self.settlements.next().now_or_never() {
                         self.forward_settlement(next).await;
                     }
@@ -616,6 +613,78 @@ impl<S: IoStream> BrokerConnection<S> {
                 Ok(None) | Err(_) => break,
             }
         }
+    }
+
+    /// Forward only settlements that are resolved RIGHT NOW — no wait. Used
+    /// on the coordinator control path, where the client's pipelined
+    /// transactional dispositions were already processed synchronously by
+    /// the session in an earlier frame, so their settlement futures are
+    /// ready (or never will be). `unconstrained` bypasses the tokio-coop
+    /// budget so a ready oneshot isn't misread as pending; unlike the 20 ms
+    /// cleanup drain this adds no per-control-message latency (MED-13: every
+    /// declare/discharge previously stalled the whole connection ~20 ms).
+    async fn drain_ready_settlements_now(&mut self) {
+        loop {
+            let polled =
+                tokio::task::unconstrained(self.settlements.next()).now_or_never();
+            match polled {
+                Some(Some(result)) => self.forward_settlement(result).await,
+                // Empty stream, or pending (nothing more is ready): stop.
+                Some(None) | None => break,
+            }
+        }
+    }
+
+    /// Report one discharge outcome to the coordinator link's client — only
+    /// if the session it arrived on is still the same one (channels are
+    /// reused; see [`TxnDone::session_id`]).
+    fn report_txn_done(&mut self, done: TxnDone) {
+        let Some(session) = self
+            .sessions
+            .get_mut(&done.channel)
+            .filter(|s| s.session_id == done.session_id)
+        else {
+            tracing::debug!(
+                channel = done.channel,
+                "discharge outcome dropped: its session is gone (channel reused or ended)"
+            );
+            return;
+        };
+        let state = match done.outcome {
+            DischargeOutcome::Complete => DeliveryState::Accepted(Accepted::default()),
+            DischargeOutcome::RolledBack => DeliveryState::Rejected(Rejected {
+                error: Some(AmqpError::new(
+                    AmqpCondition::InternalError,
+                    Some("transaction failed; rolled back (nothing was applied)".to_owned()),
+                )),
+            }),
+            // Atomicity broke mid-apply (fsync/Raft/actor failure after the
+            // reserve phase): tell the truth — a retry may duplicate what
+            // landed.
+            DischargeOutcome::Partial { applied, total } => DeliveryState::Rejected(Rejected {
+                error: Some(AmqpError::new(
+                    AmqpCondition::InternalError,
+                    Some(format!(
+                        "transaction failed after partial application: {applied} of {total} \
+                         staged publishes were committed; retrying may duplicate them"
+                    )),
+                )),
+            }),
+            DischargeOutcome::Unknown => DeliveryState::Rejected(Rejected {
+                error: Some(AmqpError::new(
+                    AmqpCondition::InternalError,
+                    Some("transaction outcome unknown (coordinator failed)".to_owned()),
+                )),
+            }),
+        };
+        session.send_disposition(
+            done.handle,
+            DeliveryId(done.delivery_id),
+            None,
+            state,
+            true,
+            &mut self.transport,
+        );
     }
 
     /// Hand one resolved dispatch outcome to its queue.
@@ -1225,9 +1294,10 @@ impl<S: IoStream> BrokerConnection<S> {
                             // The client pipelines transactional dispositions
                             // ahead of its discharge; their settlement
                             // futures are resolved but may not be staged yet.
-                            // Drain them first or a discharge could take an
-                            // incomplete transaction.
-                            self.drain_ready_settlements().await;
+                            // Drain the ready ones first or a discharge could
+                            // take an incomplete transaction — the zero-wait
+                            // variant so a control message adds no latency.
+                            self.drain_ready_settlements_now().await;
                             self.handle_txn_control(channel, handle, d);
                             continue;
                         }
@@ -1338,10 +1408,22 @@ impl<S: IoStream> BrokerConnection<S> {
                     }
                 }
                 LinkEvent::Detached { handle, .. } => {
-                    if let Some(Binding::Consumer { queue, sub, .. }) =
-                        self.bindings.remove(&(channel, handle.0))
-                    {
-                        let _ = queue.tx.send(QueueMsg::Unsubscribe { sub }).await;
+                    match self.bindings.remove(&(channel, handle.0)) {
+                        Some(Binding::Consumer { queue, sub, .. }) => {
+                            let _ = queue.tx.send(QueueMsg::Unsubscribe { sub }).await;
+                        }
+                        // A coordinator link detaching orphans this
+                        // connection's transactions: roll them all back so
+                        // staged settles requeue, staged publish bytes free,
+                        // and the MAX_TXNS slots are reclaimed (MED-14) —
+                        // otherwise a client that re-attaches its coordinator
+                        // on error leaks slots until the connection closes.
+                        Some(Binding::Coordinator) => {
+                            for txn in self.txns.take_all() {
+                                tokio::spawn(crate::txn::execute_rollback(txn));
+                            }
+                        }
+                        _ => {}
                     }
                 }
                 // Consumer settlements arrive via the per-dispatch replies in
@@ -1530,4 +1612,25 @@ fn unknown_channel(channel: u16) -> ConnectError {
         ErrorKind::ProtocolViolation,
         format!("frame on unmapped channel {channel}"),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// MED-16 (issue #19): the decoy verifier for an unknown user must be
+    /// stable per username (a changing salt across probes would itself be an
+    /// enumeration oracle) and differ between usernames.
+    #[test]
+    fn fake_scram_verifier_is_deterministic_per_username() {
+        let m = ScramMechanism::Sha256;
+        let a1 = fake_scram_verifier(m, "mallory");
+        let a2 = fake_scram_verifier(m, "mallory");
+        assert_eq!(a1.salt, a2.salt, "same user → same salt");
+        assert_eq!(a1.stored_key, a2.stored_key);
+        assert_eq!(a1.iterations, 8192, "matches the StaticScram default");
+
+        let b = fake_scram_verifier(m, "trudy");
+        assert_ne!(a1.salt, b.salt, "different users → different salts");
+    }
 }
