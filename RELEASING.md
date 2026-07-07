@@ -53,10 +53,28 @@ Other manifest facts worth knowing:
   pulls `ramqp-core` transitively. `ramqp-core`/`ramqp-broker` are only for
   people who want the engine alone or an embedded broker.
 
+## Prerequisites (one-time)
+
+- **`CARGO_REGISTRY_TOKEN` repository secret** — `release.yml` publishes with
+  it, and the job fails without it. Create a token at
+  <https://crates.io/settings/tokens> with the **publish-update** scope (add
+  **publish-new** for a crate's first-ever publish), then add it under
+  **Settings → Secrets and variables → Actions → New repository secret**, named
+  exactly `CARGO_REGISTRY_TOKEN`.
+- **crates.io account** must own (or be able to claim) the crate names — the
+  `ramqp-core` name is claimed on its first `cargo publish`.
+- **Toolchain**: the workspace tracks **latest stable Rust** (there is no pinned
+  MSRV — the broker's `openraft` tree needs ≥ 1.88). Run `rustup update stable`
+  before releasing.
+
 ## Release steps
 
+
+
 1. Bump versions (semver: major = breaking, minor = features, patch = fixes)
-   and sync the dependents' pins as above. Update `CHANGELOG.md`.
+   and sync the dependents' pins as above. Update `CHANGELOG.md`: change the
+   `## [X.Y.Z] - unreleased` heading to `## [X.Y.Z] - YYYY-MM-DD` (today's date)
+   and confirm the entries are accurate.
 2. `cargo test --all-features && cargo clippy --all-targets --all-features -- -D warnings`
 3. Dry-run the packaging (catches stripped-path/readme/include mistakes):
    `cargo publish -p ramqp-core --dry-run`, then
@@ -71,13 +89,35 @@ Other manifest facts worth knowing:
 
 ## The 0.8.0 release specifically
 
-First release from the workspace; one-time notes:
+First release from the workspace.
 
-- Publishes `ramqp-core` **0.2.1** (its first release — 0.1.0/0.2.0 were never
-  published) and `ramqp` **0.8.0**.
+**Current state (on `main`):** all code + CI is merged and green. Versions are
+`ramqp-core` **0.2.1**, `ramqp` **0.8.0**, `ramqp-broker` **0.1.10** (the
+broker's patch number is just per-commit workspace churn, not a release
+cadence — reset it to a deliberate value if/when it first publishes).
+`cargo publish -p ramqp-core --dry-run` passes; the pins are synced to 0.2.1.
+
+**What's left to actually ship 0.8.0** (do these, in order):
+
+1. **Decide `ramqp-broker`'s publish policy** — it does **not** publish by
+   default (pre-alpha; not yet durable — durability is broker.md Phase 7):
+   - **A — keep it back (recommended):** add `publish = false` to
+     `ramqp-broker/Cargo.toml` so it can't be published by accident. Ship only
+     `ramqp-core` + `ramqp` now; publish the broker once Phase 7 lands and its
+     config/auth/addressing surface settles.
+   - **B — reserve the name:** publish a placeholder `ramqp-broker 0.0.1`.
+   - **C — publish it for real:** only after Phase 7 durability; you'd also want
+     `#[non_exhaustive]` on `BrokerConfig` and a "pre-alpha" README banner first.
+2. **Stamp the CHANGELOG** `0.8.0` heading with today's date (Release step 1).
+3. **Confirm the `CARGO_REGISTRY_TOKEN` secret** exists (Prerequisites).
+4. **Dry-run** `cargo publish -p ramqp-core --dry-run` (Release step 3).
+5. **Tag `v0.8.0` and push the tag** → `release.yml` publishes `ramqp-core`
+   then `ramqp`, then creates the GitHub release.
+
+Notes:
+
 - `ramqp` 0.8.0 is an internal restructure: the public API is byte-compatible
   with 0.7 (enforced by `tests/public_api.rs`), so downstream upgrades are a
   version-bump only.
-- `ramqp-broker` does **not** publish. If someone squats the name in the
-  meantime it's recoverable (crates.io policy), but publishing an early
-  placeholder `0.0.1` is an option if that risk feels real.
+- `ramqp-broker`: if someone squats the name while it's held back it's
+  recoverable (crates.io policy), so option A is safe.
