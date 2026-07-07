@@ -212,6 +212,11 @@ impl Proxy {
         let deadline = tokio::time::Instant::now() + REBIND_DEADLINE;
         let mut backoff = std::time::Duration::from_millis(50);
         loop {
+            // A stopping node will never produce a leader again — exit
+            // instead of pinning the node (and its store) for the deadline.
+            if self.node.is_stopping() {
+                return false;
+            }
             match self.try_bind().await {
                 Ok(()) => return true,
                 Err(e) => {

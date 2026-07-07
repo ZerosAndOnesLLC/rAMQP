@@ -250,3 +250,180 @@ async fn kill_leader_mid_stream_loses_nothing() {
         node.shutdown.shutdown();
     }
 }
+
+/// Fault injection, availability boundary (broker.md Phase 10): rolling
+/// leader kills. With 2/3 nodes the cluster keeps serving; at 1/3 (quorum
+/// LOST) publishes are cleanly REFUSED — consistency over availability,
+/// never silent loss, never a hang.
+#[tokio::test(flavor = "multi_thread")]
+async fn rolling_leader_kills_hit_a_clean_availability_boundary() {
+    let nodes = start_cluster(3).await;
+    let queue = "/quorum/rolling";
+
+    // Declare via a probe and learn the leader.
+    let probe = ConnectionBuilder::new(format!("amqp://{}", nodes[0].amqp_addr))
+        .connect()
+        .await
+        .expect("probe connect");
+    let ps = probe.begin_session().await.expect("probe session");
+    let pp = ps.create_producer(queue).await.expect("probe producer");
+    assert!(matches!(
+        pp.send(Message::text("seed")).await.expect("seed"),
+        DeliveryState::Accepted(_)
+    ));
+    probe.close().await.expect("probe close");
+    let leader1 = nodes[0]
+        .broker
+        .queue_leader(queue)
+        .await
+        .expect("leader known");
+
+    // Client on a survivor.
+    let survivor = nodes
+        .iter()
+        .enumerate()
+        .find(|(i, _)| (*i as u64 + 1) != leader1)
+        .map(|(_, n)| n)
+        .expect("survivor");
+    let conn = ConnectionBuilder::new(format!("amqp://{}", survivor.amqp_addr))
+        .connect()
+        .await
+        .expect("connect");
+    let session = conn.begin_session().await.expect("session");
+    let producer = session.create_producer(queue).await.expect("producer");
+
+    // Kill #1 (the leader): 2/3 alive — the cluster recovers and accepts.
+    nodes[leader1 as usize - 1].shutdown.shutdown();
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        match producer.send(Message::text("after-kill-1")).await {
+            Ok(DeliveryState::Accepted(_)) => break,
+            _ => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "cluster never recovered from the first leader kill"
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
+
+    // Kill #2 (the new leader): 1/3 alive — quorum LOST. Publishes must be
+    // refused (rejected or errored), promptly, with no hang and no
+    // false accept.
+    let leader2 = survivor
+        .broker
+        .queue_leader(queue)
+        .await
+        .expect("re-elected leader");
+    // (If the surviving client node itself leads, kill it anyway — the test
+    // then just ends; pick the OTHER remaining node as the victim when
+    // possible so the client's node stays up.)
+    let victim = nodes
+        .iter()
+        .enumerate()
+        .find(|(i, n)| (*i as u64 + 1) == leader2 && !std::ptr::eq(*n, survivor))
+        .map(|(_, n)| n);
+    let Some(victim) = victim else {
+        // The client's own node leads; killing it would sever the client,
+        // which tests nothing about the queue. Covered scope ends here.
+        conn.close().await.ok();
+        for n in &nodes {
+            n.shutdown.shutdown();
+        }
+        return;
+    };
+    victim.shutdown.shutdown();
+
+    // Without quorum nothing may be accepted; every send resolves promptly
+    // as a rejection or error (bounded worst case: the publish-retry
+    // window), and none hang.
+    let mut refusals = 0;
+    for i in 0..3 {
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(45),
+            producer.send(Message::text(format!("no-quorum-{i}"))),
+        )
+        .await
+        .expect("send resolves (no hang) even without quorum");
+        match outcome {
+            Ok(DeliveryState::Accepted(_)) => {
+                panic!("accepted a publish WITHOUT quorum — silent-loss hazard")
+            }
+            Ok(_) | Err(_) => refusals += 1,
+        }
+    }
+    assert_eq!(refusals, 3, "all quorum-less publishes refused cleanly");
+
+    conn.close().await.ok();
+    for n in &nodes {
+        n.shutdown.shutdown();
+    }
+}
+
+/// Losing a FOLLOWER is transparent: the leader keeps accepting and the
+/// consumer keeps receiving with zero interruption-visible loss.
+#[tokio::test(flavor = "multi_thread")]
+async fn follower_loss_is_transparent() {
+    let nodes = start_cluster(3).await;
+    let queue = "/quorum/follower-loss";
+
+    let probe = ConnectionBuilder::new(format!("amqp://{}", nodes[0].amqp_addr))
+        .connect()
+        .await
+        .expect("probe connect");
+    let ps = probe.begin_session().await.expect("probe session");
+    let pp = ps.create_producer(queue).await.expect("probe producer");
+    assert!(matches!(
+        pp.send(Message::text("m0")).await.expect("seed"),
+        DeliveryState::Accepted(_)
+    ));
+    probe.close().await.expect("probe close");
+
+    let leader = nodes[0].broker.queue_leader(queue).await.expect("leader");
+    // Kill one follower.
+    let follower = nodes
+        .iter()
+        .enumerate()
+        .find(|(i, _)| (*i as u64 + 1) != leader)
+        .map(|(_, n)| n)
+        .expect("follower");
+    follower.shutdown.shutdown();
+
+    // The remaining pair keeps serving: produce + consume through the LEADER
+    // node (guaranteed alive).
+    let leader_node = &nodes[leader as usize - 1];
+    let conn = ConnectionBuilder::new(format!("amqp://{}", leader_node.amqp_addr))
+        .connect()
+        .await
+        .expect("connect");
+    let session = conn.begin_session().await.expect("session");
+    let producer = session.create_producer(queue).await.expect("producer");
+    for i in 1..20 {
+        let outcome = producer
+            .send(Message::text(format!("m{i}")))
+            .await
+            .expect("send");
+        assert!(
+            matches!(outcome, DeliveryState::Accepted(_)),
+            "follower loss must not refuse publishes: {outcome:?}"
+        );
+    }
+    let mut consumer = session.create_consumer(queue).await.expect("consumer");
+    let mut got = BTreeSet::new();
+    while got.len() < 20 {
+        let d = tokio::time::timeout(Duration::from_secs(15), consumer.recv())
+            .await
+            .expect("delivery in time")
+            .expect("delivery");
+        got.insert(text_of(&d));
+        consumer.accept(&d).await.expect("accept");
+    }
+    let want: BTreeSet<String> = (0..20).map(|i| format!("m{i}")).collect();
+    assert_eq!(got, want, "no loss across follower failure");
+
+    conn.close().await.expect("close");
+    for n in &nodes {
+        n.shutdown.shutdown();
+    }
+}

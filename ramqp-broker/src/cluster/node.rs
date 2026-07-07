@@ -87,6 +87,12 @@ pub struct ClusterNode {
     /// The bound fabric address (useful with port `0`).
     pub fabric_addr: std::net::SocketAddr,
     shutdown: watch::Sender<bool>,
+    /// Set for good by [`stop`](ClusterNode::stop): no group member may be
+    /// (re)created past this point. Without it, a still-open inbound fabric
+    /// connection could lazily resurrect an EMPTY member on a dying node —
+    /// which then answers the leader's appends with conflicts below its
+    /// matched index ("follower log reversion", an openraft panic).
+    stopping: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for ClusterNode {
@@ -175,6 +181,7 @@ impl ClusterNode {
             fabric_addr,
             shutdown,
             settings,
+            stopping: std::sync::atomic::AtomicBool::new(false),
         });
 
         tokio::spawn(serve_fabric(listener, node.clone(), shutdown_rx));
@@ -228,9 +235,17 @@ impl ClusterNode {
             .ok_or_else(|| std::io::Error::other("no leader after wait"))
     }
 
+    /// Whether [`stop`](ClusterNode::stop) has begun (proxies abort their
+    /// leader-rebind loops instead of spinning against a dead node).
+    pub(crate) fn is_stopping(&self) -> bool {
+        self.stopping.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// Stop this node: fabric listener, every Raft member, every actor.
     /// Abrupt by design (the kill-the-leader path); no draining.
     pub async fn stop(&self) {
+        self.stopping
+            .store(true, std::sync::atomic::Ordering::Release);
         let _ = self.shutdown.send(true);
         self.actors.lock().expect("actors lock").clear();
         let members: Vec<Arc<GroupMember>> = {
@@ -385,6 +400,9 @@ impl ClusterNode {
         name: &str,
         members: &[(NodeId, String)],
     ) -> Result<(), String> {
+        if self.stopping.load(std::sync::atomic::Ordering::Acquire) {
+            return Err("node is stopping".to_owned());
+        }
         if !members.iter().any(|(id, _)| *id == self.node_id) {
             return Err(format!("node {} not in placement for {name}", self.node_id));
         }
