@@ -53,6 +53,22 @@ pub struct AcceptedLink {
     pub role: Role,
 }
 
+/// Diagnostics snapshot of one sender link's backlog (see
+/// [`Session::sender_backlog`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SenderBacklog {
+    /// The link's local handle.
+    pub handle: u32,
+    /// Messages queued locally, not yet sent (credit/window-gated).
+    pub outbox: usize,
+    /// Sent deliveries the peer has not settled.
+    pub unsettled: usize,
+    /// Send futures awaiting a terminal outcome.
+    pub pending: usize,
+    /// The (min, max) unsettled delivery ids, when any.
+    pub unsettled_ids: Option<(u32, u32)>,
+}
+
 /// Per-session protocol state owned by the driver.
 pub struct Session {
     /// Process-local logical id (stable across reconnects).
@@ -343,6 +359,24 @@ impl Session {
     /// peer-initiated attach for [`Session::accept_peer_attach`].
     pub fn knows_link(&self, name: &str) -> bool {
         self.link_handles.contains_key(name)
+    }
+
+    /// Diagnostics: per sender link, what is still queued locally, what the
+    /// peer has not settled, and how many send futures await an outcome.
+    pub fn sender_backlog(&self) -> Vec<SenderBacklog> {
+        self.links
+            .iter()
+            .filter_map(|(h, link)| match link {
+                Link::Sender(s) => Some(SenderBacklog {
+                    handle: *h,
+                    outbox: s.outbox.len(),
+                    unsettled: s.unsettled.len(),
+                    pending: s.pending.len(),
+                    unsettled_ids: s.unsettled.id_range(),
+                }),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Accept a peer-initiated `attach` (server polarity): create the mirror

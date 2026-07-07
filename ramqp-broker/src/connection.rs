@@ -332,8 +332,18 @@ impl<S: IoStream> BrokerConnection<S> {
                     self.flush().await?;
                 }
 
-                Some((queue, sub, msg_id, outcome)) = self.settlements.next() => {
-                    let _ = queue.send(QueueMsg::Settle { sub, msg_id, outcome }).await;
+                Some(result) = self.settlements.next() => {
+                    self.forward_settlement(result).await;
+                    // Drain everything else already resolved: a burst of
+                    // ranged dispositions resolves thousands of settlement
+                    // futures at once, and forwarding one per wakeup lets the
+                    // (biased, read-preferring) loop starve them — the queue
+                    // then thinks acked messages are still in flight, and a
+                    // close would requeue them all as duplicates.
+                    use futures_util::FutureExt;
+                    while let Some(Some(next)) = self.settlements.next().now_or_never() {
+                        self.forward_settlement(next).await;
+                    }
                 }
 
                 Some(event) = self.session_events_rx.recv() => {
@@ -372,11 +382,48 @@ impl<S: IoStream> BrokerConnection<S> {
     /// unacked messages requeue immediately (rather than on the queue's next
     /// failed dispatch).
     async fn cleanup(&mut self) {
+        // First forward every settlement outcome that already resolved (the
+        // dispositions a client pipelines right before `close`) — dropping
+        // them would requeue acked messages and redeliver them to the next
+        // consumer as duplicates. Two traps here:
+        // - `now_or_never` is unusable: the settlement futures await tokio
+        //   oneshots, whose polls consult the task's cooperative budget.
+        //   Right after a busy close the budget is exhausted, every poll
+        //   reports `Pending` regardless of actual readiness, and a
+        //   ready-only drain silently forwards nothing (hundreds of acked
+        //   messages requeued per close). `unconstrained` bypasses the
+        //   budget.
+        // - Some futures may be genuinely unresolved (the peer closed
+        //   without settling): the per-item timeout stops the drain there;
+        //   whatever remains requeues via the unsubscribes below
+        //   (at-least-once, as before).
+        loop {
+            let next = tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                tokio::task::unconstrained(self.settlements.next()),
+            );
+            match next.await {
+                Ok(Some(result)) => self.forward_settlement(result).await,
+                Ok(None) | Err(_) => break,
+            }
+        }
         for ((_, _), binding) in self.bindings.drain() {
             if let Binding::Consumer { queue, sub, .. } = binding {
                 let _ = queue.tx.send(QueueMsg::Unsubscribe { sub }).await;
             }
         }
+    }
+
+    /// Hand one resolved dispatch outcome to its queue.
+    async fn forward_settlement(&mut self, result: SettlementResult) {
+        let (queue, sub, msg_id, outcome) = result;
+        let _ = queue
+            .send(QueueMsg::Settle {
+                sub,
+                msg_id,
+                outcome,
+            })
+            .await;
     }
 
     async fn flush(&mut self) -> Result<(), ConnectError> {
