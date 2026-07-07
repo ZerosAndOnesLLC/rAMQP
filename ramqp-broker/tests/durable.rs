@@ -72,6 +72,61 @@ async fn durable_produce_consume_round_trip() {
     shutdown.shutdown();
 }
 
+/// Durable → durable dead-lettering (MED-12 from issue #19): the expired
+/// message reaches the durable DLQ, riding the confirm-ordered path (the
+/// source's Remove now waits for the copy's fate before committing).
+#[tokio::test]
+async fn durable_dead_letter_lands_in_a_durable_dlq() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut config = config_with(dir.path());
+    config.policies.push((
+        "ttl-src".to_owned(),
+        ramqp_broker::QueuePolicy {
+            message_ttl: Some(std::time::Duration::from_millis(200)),
+            dead_letter: Some("/durable/ttl-dlx".to_owned()),
+            ..Default::default()
+        },
+    ));
+    let (addr, shutdown) = start(config).await;
+    let conn = ConnectionBuilder::new(format!("amqp://{addr}"))
+        .connect()
+        .await
+        .expect("connect");
+    let session = conn.begin_session().await.expect("session");
+
+    let producer = session
+        .create_producer("/durable/ttl-src")
+        .await
+        .expect("producer");
+    producer
+        .send(Message::text("stale"))
+        .await
+        .expect("fsynced send");
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+    // Attaching a consumer triggers dispatch → lazy expiry → dead-letter.
+    let mut src = session
+        .create_consumer("/durable/ttl-src")
+        .await
+        .expect("source consumer");
+    let empty = tokio::time::timeout(std::time::Duration::from_millis(300), src.recv()).await;
+    assert!(empty.is_err(), "expired message must not deliver");
+
+    let mut dlq = session
+        .create_consumer("/durable/ttl-dlx")
+        .await
+        .expect("dlq consumer");
+    let d = tokio::time::timeout(std::time::Duration::from_secs(5), dlq.recv())
+        .await
+        .expect("dead letter in time")
+        .expect("dead letter");
+    assert_eq!(text_of(&d), "stale");
+    dlq.accept(&d).await.expect("accept");
+
+    conn.close().await.expect("close");
+    shutdown.shutdown();
+}
+
 /// The Phase 7 headline: accepted messages survive a full broker restart —
 /// stop the broker, start a new one on the same data dir, and a fresh
 /// consumer receives everything that was not settled.

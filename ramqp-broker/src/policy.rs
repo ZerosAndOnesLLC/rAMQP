@@ -31,6 +31,12 @@ pub(crate) struct DeadLetter {
     pub target: String,
     /// The raw message bytes.
     pub body: Bytes,
+    /// When set, resolved (fired or dropped) once the copy's fate is known —
+    /// durably stored by the target, refused, or unroutable. A durable
+    /// source orders its own Remove after this (MED-12): removing first
+    /// opens a crash window that loses the message from both the source and
+    /// the DLQ.
+    pub confirm: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 /// Where actors send dead letters.
@@ -51,20 +57,52 @@ pub(crate) fn spawn_dlx_router(registry: &Arc<QueueRegistry>) -> DeadLetterSende
             };
             match registry.resolve(&dl.target).await {
                 Some(queue) => {
-                    // Pre-settled: dead-lettering is best-effort by contract.
+                    // Confirmed dead letters ride with an ack so the source
+                    // can order its durable Remove after the copy's fate is
+                    // known; the rest stay pre-settled (best-effort by
+                    // contract).
+                    let waiter = dl.confirm.map(|confirm| {
+                        let (ack_tx, ack_rx) = mpsc::unbounded_channel();
+                        (
+                            confirm,
+                            ack_rx,
+                            crate::queue::PublishAck {
+                                conn: ack_tx,
+                                channel: 0,
+                                handle: 0,
+                                binding_gen: 0,
+                                delivery_id: 0,
+                            },
+                        )
+                    });
+                    let (ack, waiter) = match waiter {
+                        Some((confirm, ack_rx, ack)) => (Some(ack), Some((confirm, ack_rx))),
+                        None => (None, None),
+                    };
                     if queue
                         .tx
                         .send(QueueMsg::Publish {
                             body: dl.body,
-                            ack: None,
+                            ack,
                         })
                         .await
                         .is_err()
                     {
+                        // `waiter` (and its confirm) drops here: the fate is
+                        // resolved — dropped — and the source may proceed.
                         tracing::warn!(target = %dl.target, "dead-letter queue actor gone; message dropped");
+                    } else if let Some((confirm, mut ack_rx)) = waiter {
+                        // Await the target's own durability confirm off this
+                        // task: a slow durable/quorum DLQ must not stall
+                        // dead-lettering broker-wide.
+                        tokio::spawn(async move {
+                            let _ = ack_rx.recv().await;
+                            let _ = confirm.send(());
+                        });
                     }
                 }
                 None => {
+                    // `dl.confirm` (if any) drops with `dl`: fate resolved.
                     tracing::warn!(target = %dl.target, "dead-letter target unresolvable; message dropped");
                 }
             }
@@ -149,6 +187,7 @@ impl EffectivePolicy {
                 let _ = dlx.send(DeadLetter {
                     target: target.clone(),
                     body,
+                    confirm: None,
                 });
             }
             (Some(target), None) => {
@@ -156,6 +195,40 @@ impl EffectivePolicy {
             }
             (None, _) => {
                 tracing::debug!(queue = %queue, reason, "message dropped (no dead-letter target)");
+            }
+        }
+    }
+
+    /// Route one dead message like [`dead_letter`](Self::dead_letter), and —
+    /// when it actually rides to a dead-letter queue — hand back a receiver
+    /// that resolves once the copy's fate is known (durably stored, refused,
+    /// or dropped). A durable source orders its own Remove after it; `None`
+    /// means the message simply dropped and the caller may proceed at once.
+    pub fn dead_letter_ordered(
+        &self,
+        queue: &str,
+        reason: &str,
+        body: Bytes,
+    ) -> Option<tokio::sync::oneshot::Receiver<()>> {
+        match (&self.dead_letter, &self.dlx) {
+            (Some(target), Some(dlx)) => {
+                let (confirm, resolved) = tokio::sync::oneshot::channel();
+                // A dead router drops the message (and the confirm with it):
+                // the receiver resolves immediately and the caller proceeds.
+                let _ = dlx.send(DeadLetter {
+                    target: target.clone(),
+                    body,
+                    confirm: Some(confirm),
+                });
+                Some(resolved)
+            }
+            (Some(target), None) => {
+                tracing::warn!(queue = %queue, %target, reason, "no dead-letter router; message dropped");
+                None
+            }
+            (None, _) => {
+                tracing::debug!(queue = %queue, reason, "message dropped (no dead-letter target)");
+                None
             }
         }
     }

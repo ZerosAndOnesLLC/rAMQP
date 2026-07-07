@@ -109,13 +109,11 @@ async fn run(
                                 .flatten();
                             match dropped {
                                 Some((old_id, _)) => {
-                                    if let Some(old) = store.body(queue_id, old_id) {
-                                        policy.dead_letter(&name, "maxlen", old);
-                                    }
                                     failures.remove(&old_id);
-                                    let _ = store
-                                        .submit(StoreOp::Remove { queue: queue_id, msg_id: old_id })
-                                        .await;
+                                    dead_letter_then_remove(
+                                        &name, &policy, &store, queue_id, old_id, "maxlen",
+                                    )
+                                    .await;
                                 }
                                 // A reserved publish is never refused: its
                                 // slot was admitted at Reserve time.
@@ -194,12 +192,15 @@ async fn run(
                                 *count += 1;
                                 if policy.attempts_exhausted(*count) {
                                     failures.remove(&msg_id);
-                                    if let Some(body) = store.body(queue_id, msg_id) {
-                                        policy.dead_letter(&name, "delivery-limit", body);
-                                    }
-                                    let _ = store
-                                        .submit(StoreOp::Remove { queue: queue_id, msg_id })
-                                        .await;
+                                    dead_letter_then_remove(
+                                        &name,
+                                        &policy,
+                                        &store,
+                                        queue_id,
+                                        msg_id,
+                                        "delivery-limit",
+                                    )
+                                    .await;
                                 } else {
                                     ready.insert(msg_id, enqueue_time.unwrap_or_else(now_ms));
                                     let _ = store
@@ -261,6 +262,43 @@ async fn run(
     tracing::debug!(queue = %name, "durable queue actor stopped");
 }
 
+/// Dead-letter a stored message, then durably remove the source copy only
+/// after the dead-letter router resolves the copy's fate (MED-12): removing
+/// first opens a crash window in which a previously-confirmed durable
+/// message vanishes from both the source and the DLQ (the Remove batch
+/// fsyncs while the copy still rides an in-memory channel). Deferring the
+/// remove means a crash instead redelivers — and re-dead-letters — the
+/// message: at-least-once, never silent loss.
+async fn dead_letter_then_remove(
+    name: &str,
+    policy: &EffectivePolicy,
+    store: &Store,
+    queue_id: u64,
+    msg_id: u64,
+    reason: &str,
+) {
+    let confirm = store
+        .body(queue_id, msg_id)
+        .and_then(|body| policy.dead_letter_ordered(name, reason, body));
+    match confirm {
+        Some(resolved) => {
+            let store = store.clone();
+            tokio::spawn(async move {
+                let _ = resolved.await;
+                let _ = store
+                    .submit(StoreOp::Remove { queue: queue_id, msg_id })
+                    .await;
+            });
+        }
+        // Nothing rode to a DLQ: no ordering to keep.
+        None => {
+            let _ = store
+                .submit(StoreOp::Remove { queue: queue_id, msg_id })
+                .await;
+        }
+    }
+}
+
 /// Round-robin dispatch; bodies come off the store's read path.
 #[allow(clippy::too_many_arguments)]
 async fn dispatch(
@@ -283,15 +321,7 @@ async fn dispatch(
             }
             ready.remove(&id);
             failures.remove(&id);
-            if let Some(body) = store.body(queue_id, id) {
-                policy.dead_letter(name, "expired", body);
-            }
-            let _ = store
-                .submit(StoreOp::Remove {
-                    queue: queue_id,
-                    msg_id: id,
-                })
-                .await;
+            dead_letter_then_remove(name, policy, store, queue_id, id, "expired").await;
         }
     }
     while !ready.is_empty() {
