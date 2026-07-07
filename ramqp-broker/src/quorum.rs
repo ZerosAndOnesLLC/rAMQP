@@ -106,6 +106,13 @@ async fn run(
     let mut subs: Vec<Subscriber> = Vec::new();
     // Which subscriber holds each in-flight (dispatched, unsettled) message.
     let mut inflight: HashMap<u64, SubId> = HashMap::new();
+    // Leader-local failed-delivery counts, seeded lazily from applied state.
+    // Counting from applied state directly is WRONG under a fast nack loop:
+    // the pipelined Settle{requeue} proposals lag, so the read stays stale
+    // and the delivery limit fires late — or never, if increments keep
+    // failing to commit. This map is exact while this leader lives; a
+    // failover re-seeds from whatever committed (at-least-once).
+    let mut failures: HashMap<u64, u32> = HashMap::new();
     // Dispatchable message ids, in FIFO (id) order. Maintained incrementally;
     // seeded from applied state so a takeover/restart redelivers everything
     // not currently held.
@@ -153,6 +160,7 @@ async fn run(
                     &mut subs,
                     &mut inflight,
                     &mut ready,
+                    &mut failures,
                     &mut commits,
                     &mut publishes_pending,
                     &mut pending_bytes,
@@ -210,6 +218,7 @@ fn handle_msg(
     subs: &mut Vec<Subscriber>,
     inflight: &mut HashMap<u64, SubId>,
     ready: &mut BTreeSet<u64>,
+    failures: &mut HashMap<u64, u32>,
     commits: &mut FuturesUnordered<CommitFuture>,
     publishes_pending: &mut usize,
     pending_bytes: &mut usize,
@@ -323,6 +332,7 @@ fn handle_msg(
             inflight.remove(&msg_id);
             match outcome {
                 SettleOutcome::Ack | SettleOutcome::Drop => {
+                    failures.remove(&msg_id);
                     let raft = raft.clone();
                     commits.push(Box::pin(async move {
                         let result = raft
@@ -342,14 +352,18 @@ fn handle_msg(
                     ready.insert(msg_id);
                 }
                 SettleOutcome::RequeueFailed => {
-                    // Out of retries → dead-letter (or drop) instead of
-                    // requeueing. Failures come from applied state; this
-                    // attempt is the +1.
-                    let failed = store
-                        .with_state(|s| s.meta_of(msg_id).map(|(_, f)| f))
-                        .unwrap_or(0)
-                        + 1;
-                    if policy.attempts_exhausted(failed) {
+                    // Count locally, seeded from applied state on first
+                    // sight — exact while this leader lives (the applied
+                    // read alone lags the pipelined increments and fires
+                    // the limit late or never under a fast nack loop).
+                    let count = failures.entry(msg_id).or_insert_with(|| {
+                        store
+                            .with_state(|s| s.meta_of(msg_id).map(|(_, f)| f))
+                            .unwrap_or(0)
+                    });
+                    *count += 1;
+                    if policy.attempts_exhausted(*count) {
+                        failures.remove(&msg_id);
                         dead_letter_stored(name, policy, store, msg_id, "delivery-limit");
                         push_remove(commits, raft, msg_id);
                     } else {

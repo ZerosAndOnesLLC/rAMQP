@@ -216,6 +216,75 @@ async fn delivery_limit_dead_letters_poison_messages() {
     shutdown.shutdown();
 }
 
+/// MED-1 (issue #19): quorum delivery limits count nacks EXACTLY, even in a
+/// fast nack loop — counting from applied state alone lagged the pipelined
+/// failure increments and fired late (or never).
+#[tokio::test]
+async fn quorum_delivery_limit_fires_exactly() {
+    let config = BrokerConfig {
+        policies: vec![(
+            "qpoison-".to_owned(),
+            QueuePolicy {
+                max_delivery_attempts: Some(2),
+                dead_letter: Some("/queues/qpoison-dlx".to_owned()),
+                ..Default::default()
+            },
+        )],
+        ..Default::default()
+    };
+    let (addr, shutdown) = start(config).await;
+    let conn = ConnectionBuilder::new(format!("amqp://{addr}"))
+        .connect()
+        .await
+        .expect("connect");
+    let session = conn.begin_session().await.expect("session");
+    let producer = session
+        .create_producer("/quorum/qpoison-work")
+        .await
+        .expect("producer");
+    producer.send(Message::text("poison")).await.expect("send");
+
+    let mut consumer = session
+        .create_consumer("/quorum/qpoison-work")
+        .await
+        .expect("consumer");
+    // Nack as fast as the deliveries arrive: exactly two attempts allowed.
+    for _ in 0..2 {
+        let d = consumer.recv().await.expect("delivery");
+        assert_eq!(text_of(&d), "poison");
+        consumer
+            .modify(
+                &d,
+                ramqp::types::messaging::Modified {
+                    delivery_failed: Some(true),
+                    undeliverable_here: None,
+                    message_annotations: None,
+                },
+            )
+            .await
+            .expect("modify");
+    }
+    let starved = tokio::time::timeout(Duration::from_millis(400), consumer.recv()).await;
+    assert!(
+        starved.is_err(),
+        "third delivery must not happen: the limit is exact"
+    );
+
+    let mut dlx = session
+        .create_consumer("/queues/qpoison-dlx")
+        .await
+        .expect("dlx consumer");
+    let d = tokio::time::timeout(Duration::from_secs(5), dlx.recv())
+        .await
+        .expect("dead letter in time")
+        .expect("dead letter");
+    assert_eq!(text_of(&d), "poison");
+    dlx.accept(&d).await.expect("accept");
+
+    conn.close().await.expect("close");
+    shutdown.shutdown();
+}
+
 /// The same policy machinery holds for quorum queues (leader-local
 /// enforcement; expiry timestamps ride the replicated log).
 #[tokio::test]
