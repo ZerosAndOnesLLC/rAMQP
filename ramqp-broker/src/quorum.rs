@@ -379,7 +379,11 @@ fn handle_msg(
                             .await
                             .map(|_| ())
                             .map_err(|e| e.to_string());
-                        Committed::Remove { msg_id, result, readd_on_failure: true }
+                        Committed::Remove {
+                            msg_id,
+                            result,
+                            readd_on_failure: true,
+                        }
                     }));
                 }
                 SettleOutcome::Requeue => {
@@ -455,7 +459,11 @@ fn push_remove(commits: &mut FuturesUnordered<CommitFuture>, raft: &QueueRaft, m
             .map(|_| ())
             .map_err(|e| e.to_string());
         // Dead-letter path: the body is already at the DLX; never re-ready.
-        Committed::Remove { msg_id, result, readd_on_failure: false }
+        Committed::Remove {
+            msg_id,
+            result,
+            readd_on_failure: false,
+        }
     }));
 }
 

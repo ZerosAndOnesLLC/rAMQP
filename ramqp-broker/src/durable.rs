@@ -304,14 +304,20 @@ async fn dead_letter_then_remove(
             tokio::spawn(async move {
                 let _ = resolved.await;
                 let _ = store
-                    .submit(StoreOp::Remove { queue: queue_id, msg_id })
+                    .submit(StoreOp::Remove {
+                        queue: queue_id,
+                        msg_id,
+                    })
                     .await;
             });
         }
         // Nothing rode to a DLQ: no ordering to keep.
         None => {
             let _ = store
-                .submit(StoreOp::Remove { queue: queue_id, msg_id })
+                .submit(StoreOp::Remove {
+                    queue: queue_id,
+                    msg_id,
+                })
                 .await;
         }
     }

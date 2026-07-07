@@ -87,8 +87,10 @@ struct VhostGrants {
 
 impl VhostGrants {
     fn grant(&mut self, username: impl Into<String>, vhosts: &[&str]) {
-        self.grants
-            .insert(username.into(), vhosts.iter().map(|v| (*v).to_owned()).collect());
+        self.grants.insert(
+            username.into(),
+            vhosts.iter().map(|v| (*v).to_owned()).collect(),
+        );
     }
 
     fn allows(&self, identity: Option<&str>, vhost: &str) -> bool {

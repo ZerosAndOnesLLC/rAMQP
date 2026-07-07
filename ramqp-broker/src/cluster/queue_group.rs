@@ -335,7 +335,11 @@ impl ReplicatedState for QueueState {
         }
         let mut spill_id = 0;
         if spilled {
-            let spill = &self.paging.as_ref().expect("spilled body implies paging").spill;
+            let spill = &self
+                .paging
+                .as_ref()
+                .expect("spilled body implies paging")
+                .spill;
             // The snapshot's External refs make the segment bytes the only
             // copy once the log purges behind it — they must be durable
             // BEFORE the snapshot pointer is.

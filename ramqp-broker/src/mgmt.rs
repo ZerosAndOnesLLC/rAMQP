@@ -59,9 +59,11 @@ pub(crate) fn spawn_mgmt(
             let counters = counters.clone();
             tokio::spawn(async move {
                 let _permit = permit;
-                let _ =
-                    tokio::time::timeout(REQUEST_TIMEOUT, handle_request(stream, registry, counters))
-                        .await;
+                let _ = tokio::time::timeout(
+                    REQUEST_TIMEOUT,
+                    handle_request(stream, registry, counters),
+                )
+                .await;
             });
         }
     });

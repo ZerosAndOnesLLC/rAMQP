@@ -205,7 +205,11 @@ impl SnapshotBlob {
 /// itself must be durable — without it a crash can leave the durable
 /// snapshot pointer naming a file that never made it to disk, which recovery
 /// reads as silent total state loss below the purge marker).
-fn write_blob_durably(dir: &std::path::Path, path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+fn write_blob_durably(
+    dir: &std::path::Path,
+    path: &std::path::Path,
+    data: &[u8],
+) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
     let mut file = std::fs::File::create(path)?;
     std::io::Write::write_all(&mut file, data)?;
@@ -342,8 +346,8 @@ impl<C: RaftTypeConfig, S> SharedStore<C, S> {
                         (bytes.clone(), SnapshotBlob::Memory(bytes.clone()))
                     }
                     SnapshotPersist::File(path) => {
-                        let data = std::fs::read(path)
-                            .map_err(|e| format!("snapshot blob read: {e}"))?;
+                        let data =
+                            std::fs::read(path).map_err(|e| format!("snapshot blob read: {e}"))?;
                         (data, SnapshotBlob::File(path.clone()))
                     }
                 };
@@ -701,12 +705,15 @@ where
             // restore releases old bodies as it replaces them. On failure the
             // member goes Fatal (openraft) with a partially-cleared state;
             // restart recovers from disk.
-            inner.state.restore_snapshot(&payload.state_bytes).map_err(|e| {
-                openraft::StorageIOError::read_snapshot(
-                    Some(meta.signature()),
-                    &std::io::Error::other(e),
-                )
-            })?;
+            inner
+                .state
+                .restore_snapshot(&payload.state_bytes)
+                .map_err(|e| {
+                    openraft::StorageIOError::read_snapshot(
+                        Some(meta.signature()),
+                        &std::io::Error::other(e),
+                    )
+                })?;
             inner.last_applied = payload.last_applied;
             inner.last_membership = payload.last_membership;
             let blob = match &inner.snapshot_dir {
@@ -730,9 +737,7 @@ where
             // pointing at nothing — an empty state below a durable purge
             // marker. Deletion waits until the new pointer is durable.
             let old_blob = match &inner.snapshot {
-                Some((_, SnapshotBlob::File(old)))
-                    if !matches!(&blob, SnapshotBlob::File(new) if new == old) =>
-                {
+                Some((_, SnapshotBlob::File(old))) if !matches!(&blob, SnapshotBlob::File(new) if new == old) => {
                     Some(old.clone())
                 }
                 _ => None,
@@ -786,9 +791,9 @@ mod tests {
 
     use openraft::Config;
 
+    use super::super::MetaRaft;
     use super::super::meta::{MetaCommand, QueueSpec, QueueType};
     use super::super::network::UnreachableNetwork;
-    use super::super::MetaRaft;
     use super::*;
 
     /// Reopen the redb store, waiting out the writer thread's lock release
@@ -840,16 +845,21 @@ mod tests {
         // First life: enough catalog writes to trigger snapshot + purge.
         {
             let store = crate::store::Store::open(dir.path()).expect("open");
-            let (sink, recovery) = crate::cluster::store::RaftPersistFactory::open_group(
-                &store, "meta",
-            )
-            .expect("open group");
+            let (sink, recovery) =
+                crate::cluster::store::RaftPersistFactory::open_group(&store, "meta")
+                    .expect("open group");
             let meta_store = MetaStore::new_persistent(MetaState::default(), None, sink, recovery)
                 .expect("fresh persistent store");
             let (log_store, state_machine) = openraft::storage::Adaptor::new(meta_store.clone());
-            let raft = MetaRaft::new(1, meta_config(), UnreachableNetwork, log_store, state_machine)
-                .await
-                .expect("raft");
+            let raft = MetaRaft::new(
+                1,
+                meta_config(),
+                UnreachableNetwork,
+                log_store,
+                state_machine,
+            )
+            .await
+            .expect("raft");
             raft.initialize(BTreeMap::from([(1u64, BasicNode::new("local"))]))
                 .await
                 .expect("initialize");
@@ -905,9 +915,15 @@ mod tests {
         // membership recover from disk); replaying the log tail on top of
         // the snapshot must yield the complete catalog.
         let (log_store, state_machine) = openraft::storage::Adaptor::new(meta_store.clone());
-        let raft = MetaRaft::new(1, meta_config(), UnreachableNetwork, log_store, state_machine)
-            .await
-            .expect("raft restart");
+        let raft = MetaRaft::new(
+            1,
+            meta_config(),
+            UnreachableNetwork,
+            log_store,
+            state_machine,
+        )
+        .await
+        .expect("raft restart");
         raft.wait(Some(Duration::from_secs(10)))
             .metrics(
                 |m| {

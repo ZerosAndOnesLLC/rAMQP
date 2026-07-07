@@ -503,7 +503,9 @@ mod tests {
         }
         // One more: refused, known txn, and the txn is now rollback-only.
         match txns.stage_settle(&id, mk_settle()) {
-            SettleStage::Refused { known_txn: true, .. } => {}
+            SettleStage::Refused {
+                known_txn: true, ..
+            } => {}
             _ => panic!("expected a known-txn refusal at the cap"),
         }
         let txn = txns.take(&id).expect("take");

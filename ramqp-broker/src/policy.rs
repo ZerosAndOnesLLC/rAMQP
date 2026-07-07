@@ -81,10 +81,7 @@ pub(crate) fn spawn_dlx_router(registry: &Arc<QueueRegistry>) -> DeadLetterSende
                     };
                     if queue
                         .tx
-                        .send(QueueMsg::Publish {
-                            body: dl.body,
-                            ack,
-                        })
+                        .send(QueueMsg::Publish { body: dl.body, ack })
                         .await
                         .is_err()
                     {

@@ -30,8 +30,8 @@ use ramqp_core::transport::IoStream;
 use ramqp_core::transport::frame::{Frame, FrameBody, FramedTransport};
 use ramqp_core::transport::header::{ProtocolHeader, accept as accept_header};
 use ramqp_core::types::definitions::{
-    AmqpError as AmqpCondition, ConnectionError, Error as AmqpError, ErrorCondition,
-    Role, TransactionError,
+    AmqpError as AmqpCondition, ConnectionError, Error as AmqpError, ErrorCondition, Role,
+    TransactionError,
 };
 use ramqp_core::types::messaging::{Accepted, DeliveryState, Rejected, TargetArchetype};
 use ramqp_core::types::performatives::{Attach, Begin, Close, End, Performative};
@@ -626,8 +626,7 @@ impl<S: IoStream> BrokerConnection<S> {
     /// declare/discharge previously stalled the whole connection ~20 ms).
     async fn drain_ready_settlements_now(&mut self) {
         loop {
-            let polled =
-                tokio::task::unconstrained(self.settlements.next()).now_or_never();
+            let polled = tokio::task::unconstrained(self.settlements.next()).now_or_never();
             match polled {
                 Some(Some(result)) => self.forward_settlement(result).await,
                 // Empty stream, or pending (nothing more is ready): stop.
@@ -919,7 +918,9 @@ impl<S: IoStream> BrokerConnection<S> {
                     DeliveryState::Rejected(Rejected {
                         error: Some(AmqpError::new(
                             AmqpCondition::NotImplemented,
-                            Some("distributed transactions (global-id) are not supported".to_owned()),
+                            Some(
+                                "distributed transactions (global-id) are not supported".to_owned(),
+                            ),
                         )),
                     })
                 } else {

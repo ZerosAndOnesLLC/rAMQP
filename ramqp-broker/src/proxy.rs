@@ -361,10 +361,8 @@ impl Proxy {
             QueueMsg::Reserve { count, reply } => match &self.downstream {
                 Some(Downstream::Local { queue }) => {
                     // Pass through; the leader-local actor replies directly.
-                    if let Err(mpsc::error::SendError(QueueMsg::Reserve { reply, .. })) = queue
-                        .tx
-                        .send(QueueMsg::Reserve { count, reply })
-                        .await
+                    if let Err(mpsc::error::SendError(QueueMsg::Reserve { reply, .. })) =
+                        queue.tx.send(QueueMsg::Reserve { count, reply }).await
                     {
                         let _ = reply.send(false);
                     }
@@ -434,7 +432,9 @@ impl Proxy {
                 let _ = reply.send(u64::from(key));
             }
             QueueMsg::Demand { sub, credit, drain } => {
-                let Ok(key) = u32::try_from(sub) else { return true };
+                let Ok(key) = u32::try_from(sub) else {
+                    return true;
+                };
                 let Some(record) = self.subs.get_mut(&key) else {
                     return true;
                 };
@@ -466,7 +466,9 @@ impl Proxy {
                 msg_id,
                 outcome,
             } => {
-                let Ok(key) = u32::try_from(sub) else { return true };
+                let Ok(key) = u32::try_from(sub) else {
+                    return true;
+                };
                 let Some(record) = self.subs.get(&key) else {
                     return true;
                 };
@@ -503,7 +505,9 @@ impl Proxy {
                 }
             }
             QueueMsg::Unsubscribe { sub } => {
-                let Ok(key) = u32::try_from(sub) else { return true };
+                let Ok(key) = u32::try_from(sub) else {
+                    return true;
+                };
                 let Some(record) = self.subs.remove(&key) else {
                     return true;
                 };
@@ -566,7 +570,13 @@ impl Proxy {
 
     /// Forward one publish downstream (attempt `attempt`). `reserved` marks a
     /// transaction-commit publish consuming a pre-reserved slot.
-    async fn publish(&mut self, body: Bytes, ack: Option<PublishAck>, reserved: bool, attempt: u32) {
+    async fn publish(
+        &mut self,
+        body: Bytes,
+        ack: Option<PublishAck>,
+        reserved: bool,
+        attempt: u32,
+    ) {
         match &self.downstream {
             Some(Downstream::Local { queue }) => {
                 // Wrap the ack so we observe the outcome (for retries) before
@@ -815,7 +825,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn rebind_tears_down_previous_downstream_subs() {
         let node = single_node().await;
-        node.declare_quorum("rebind-teardown").await.expect("declare");
+        node.declare_quorum("rebind-teardown")
+            .await
+            .expect("declare");
 
         let mut proxy = Proxy::new("rebind-teardown".into(), node.clone());
         assert!(proxy.rebind().await, "initial bind");

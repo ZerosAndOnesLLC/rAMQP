@@ -489,10 +489,7 @@ fn apply_batch(db: &Database, batch: &[StoreOp]) -> Result<(), String> {
                         }
                         SnapshotPersist::File(path) => {
                             raft_meta
-                                .insert(
-                                    (*group, "snap_path"),
-                                    path.to_string_lossy().as_bytes(),
-                                )
+                                .insert((*group, "snap_path"), path.to_string_lossy().as_bytes())
                                 .map_err(|e| e.to_string())?;
                             raft_meta
                                 .remove((*group, "snap_blob"))
