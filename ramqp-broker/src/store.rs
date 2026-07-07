@@ -32,7 +32,9 @@ const RAFT_GROUPS: TableDefinition<&str, u64> = TableDefinition::new("raft_group
 /// Raft log: `(group id, index)` → encoded entry.
 const RAFT_LOG: TableDefinition<(u64, u64), &[u8]> = TableDefinition::new("raft_log");
 /// Raft hard state: `(group id, key)` → encoded value (`"vote"`, `"purged"`,
-/// `"snap_meta"`, `"snap_path"`).
+/// `"snap_meta"`, and the snapshot blob as either `"snap_blob"` — the bytes
+/// inline, atomic with the pointer — or `"snap_path"` — a file path for
+/// large paged-queue blobs).
 const RAFT_META: TableDefinition<(u64, &str), &[u8]> = TableDefinition::new("raft_meta");
 
 /// How many operations one commit may absorb.
@@ -77,11 +79,11 @@ pub(crate) enum StoreOp {
         marker: Vec<u8>,
         done: oneshot::Sender<bool>,
     },
-    /// Record the current snapshot pointer.
+    /// Record the current snapshot (pointer or inline blob).
     RaftSnapshot {
         group: u64,
         meta: Vec<u8>,
-        path: Vec<u8>,
+        blob: crate::cluster::store::SnapshotPersist,
         done: oneshot::Sender<bool>,
     },
 }
@@ -250,14 +252,17 @@ impl Store {
                 .map_err(|e| e.to_string())?
                 .map(|v| v.value().to_vec()))
         };
+        use crate::cluster::store::SnapshotPersist;
         let vote = get("vote")?;
         let purged = get("purged")?;
         let snap_meta = get("snap_meta")?;
+        let snap_blob = get("snap_blob")?;
         let snap_path = get("snap_path")?;
-        let snapshot = match (snap_meta, snap_path) {
-            (Some(m), Some(p)) => {
+        let snapshot = match (snap_meta, snap_blob, snap_path) {
+            (Some(m), Some(b), _) => Some((m, SnapshotPersist::Inline(b))),
+            (Some(m), None, Some(p)) => {
                 let path = std::path::PathBuf::from(String::from_utf8_lossy(&p).into_owned());
-                path.exists().then_some((m, path))
+                path.exists().then_some((m, SnapshotPersist::File(path)))
             }
             _ => None,
         };
@@ -334,13 +339,16 @@ impl crate::cluster::store::RaftLogSink for GroupSink {
         })
     }
 
-    fn save_snapshot(&self, meta: Vec<u8>, blob_path: std::path::PathBuf) -> SinkFuture<'_> {
+    fn save_snapshot(
+        &self,
+        meta: Vec<u8>,
+        blob: crate::cluster::store::SnapshotPersist,
+    ) -> SinkFuture<'_> {
         let group = self.group;
-        let path = blob_path.to_string_lossy().into_owned().into_bytes();
         self.run(move |done| StoreOp::RaftSnapshot {
             group,
             meta,
-            path,
+            blob,
             done,
         })
     }
@@ -429,14 +437,36 @@ fn apply_batch(db: &Database, batch: &[StoreOp]) -> Result<(), String> {
                         .map_err(|e| e.to_string())?;
                 }
                 StoreOp::RaftSnapshot {
-                    group, meta, path, ..
+                    group, meta, blob, ..
                 } => {
+                    use crate::cluster::store::SnapshotPersist;
                     raft_meta
                         .insert((*group, "snap_meta"), meta.as_slice())
                         .map_err(|e| e.to_string())?;
-                    raft_meta
-                        .insert((*group, "snap_path"), path.as_slice())
-                        .map_err(|e| e.to_string())?;
+                    // Exactly one of blob/path survives, atomically with the
+                    // pointer (a stale sibling would resurrect an old
+                    // snapshot on recovery).
+                    match blob {
+                        SnapshotPersist::Inline(bytes) => {
+                            raft_meta
+                                .insert((*group, "snap_blob"), bytes.as_slice())
+                                .map_err(|e| e.to_string())?;
+                            raft_meta
+                                .remove((*group, "snap_path"))
+                                .map_err(|e| e.to_string())?;
+                        }
+                        SnapshotPersist::File(path) => {
+                            raft_meta
+                                .insert(
+                                    (*group, "snap_path"),
+                                    path.to_string_lossy().as_bytes(),
+                                )
+                                .map_err(|e| e.to_string())?;
+                            raft_meta
+                                .remove((*group, "snap_blob"))
+                                .map_err(|e| e.to_string())?;
+                        }
+                    }
                 }
                 StoreOp::Insert {
                     queue,

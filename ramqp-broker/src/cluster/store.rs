@@ -103,6 +103,21 @@ enum SnapshotBlob {
     File(PathBuf),
 }
 
+/// Where a snapshot blob lives for persistence purposes: small blobs (the
+/// metadata catalog, unpaged queues) ride **inline** through the sink and are
+/// stored in its database — durable and atomic with the snapshot pointer;
+/// large paged-queue blobs stay in their **file** and only the path is
+/// recorded. Without the inline form, a group whose blobs live in memory
+/// would durably purge its log (openraft persists the purge) while its
+/// snapshot evaporated on restart — silent total state loss.
+#[derive(Debug, Clone)]
+pub enum SnapshotPersist {
+    /// The blob bytes themselves; the sink stores them.
+    Inline(Vec<u8>),
+    /// The blob lives in this file; the sink records the path.
+    File(PathBuf),
+}
+
 /// Write-through persistence for one Raft group's hard state (log entries,
 /// vote, purge marker, snapshot pointer). The in-memory maps stay the
 /// working copy; every mutation that Raft requires to be durable goes
@@ -137,11 +152,12 @@ pub trait RaftLogSink: Send + Sync + std::fmt::Debug {
         marker: Vec<u8>,
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>>;
 
-    /// Record the current snapshot (encoded meta + where its blob lives).
+    /// Record the current snapshot (encoded meta + the blob, inline or by
+    /// path — see [`SnapshotPersist`]).
     fn save_snapshot(
         &self,
         meta: Vec<u8>,
-        blob_path: PathBuf,
+        blob: SnapshotPersist,
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>>;
 }
 
@@ -161,8 +177,9 @@ pub struct RaftLogRecovery {
     pub purged: Option<Vec<u8>>,
     /// Encoded `(index, entry)` pairs still in the log, ascending.
     pub entries: Vec<(u64, Vec<u8>)>,
-    /// Encoded snapshot meta + the blob file, when a snapshot was saved.
-    pub snapshot: Option<(Vec<u8>, PathBuf)>,
+    /// Encoded snapshot meta + its blob (inline bytes or the blob file),
+    /// when a snapshot was saved.
+    pub snapshot: Option<(Vec<u8>, SnapshotPersist)>,
 }
 
 use std::pin::Pin;
@@ -296,11 +313,19 @@ impl<C: RaftTypeConfig, S> SharedStore<C, S> {
                     .map_err(|e| format!("log entry {index} decode: {e}"))?;
                 inner.log.insert(*index, entry);
             }
-            if let Some((meta_bytes, blob_path)) = &recovery.snapshot {
+            if let Some((meta_bytes, recovered_blob)) = &recovery.snapshot {
                 let meta: SnapshotMeta<NodeId, BasicNode> = bincode::deserialize(meta_bytes)
                     .map_err(|e| format!("snapshot meta decode: {e}"))?;
-                let data =
-                    std::fs::read(blob_path).map_err(|e| format!("snapshot blob read: {e}"))?;
+                let (data, blob) = match recovered_blob {
+                    SnapshotPersist::Inline(bytes) => {
+                        (bytes.clone(), SnapshotBlob::Memory(bytes.clone()))
+                    }
+                    SnapshotPersist::File(path) => {
+                        let data = std::fs::read(path)
+                            .map_err(|e| format!("snapshot blob read: {e}"))?;
+                        (data, SnapshotBlob::File(path.clone()))
+                    }
+                };
                 let payload: SnapshotPayload = bincode::deserialize(&data)
                     .map_err(|e| format!("snapshot payload decode: {e}"))?;
                 inner
@@ -309,7 +334,7 @@ impl<C: RaftTypeConfig, S> SharedStore<C, S> {
                     .map_err(|e| format!("snapshot state restore: {e}"))?;
                 inner.last_applied = payload.last_applied;
                 inner.last_membership = payload.last_membership;
-                inner.snapshot = Some((meta, SnapshotBlob::File(blob_path.clone())));
+                inner.snapshot = Some((meta, blob));
             }
             inner.persist = Some(sink);
         }
@@ -432,12 +457,18 @@ where
                 openraft::StorageIOError::write_snapshot(None, &std::io::Error::other(e))
             })?;
         let (data, blob) = built;
-        // Record the snapshot pointer durably before the old blob goes away
-        // (recovery must never point at a deleted file).
-        if let (Some(sink), SnapshotBlob::File(path)) = (self.persist(), &blob) {
+        // Record the snapshot durably before the old blob goes away —
+        // memory-held blobs ride inline (a durably purged log with no
+        // durable snapshot would be silent total state loss on restart),
+        // file blobs by path (recovery must never point at a deleted file).
+        if let Some(sink) = self.persist() {
             let encoded = bincode::serialize(&meta)
                 .map_err(|e| openraft::StorageIOError::write_snapshot(None, &e))?;
-            sink.save_snapshot(encoded, path.clone())
+            let persist_blob = match &blob {
+                SnapshotBlob::Memory(bytes) => SnapshotPersist::Inline(bytes.clone()),
+                SnapshotBlob::File(path) => SnapshotPersist::File(path.clone()),
+            };
+            sink.save_snapshot(encoded, persist_blob)
                 .await
                 .map_err(|e| {
                     openraft::StorageIOError::write_snapshot(None, &std::io::Error::other(e))
@@ -652,10 +683,14 @@ where
             (blob, inner.persist.clone())
         };
         // Record the installed snapshot durably (recovery restarts from it).
-        if let (Some(sink), SnapshotBlob::File(path)) = (persist, &blob) {
+        if let Some(sink) = persist {
             let encoded = bincode::serialize(meta)
                 .map_err(|e| openraft::StorageIOError::write_snapshot(None, &e))?;
-            sink.save_snapshot(encoded, path.clone())
+            let persist_blob = match &blob {
+                SnapshotBlob::Memory(bytes) => SnapshotPersist::Inline(bytes.clone()),
+                SnapshotBlob::File(path) => SnapshotPersist::File(path.clone()),
+            };
+            sink.save_snapshot(encoded, persist_blob)
                 .await
                 .map_err(|e| {
                     openraft::StorageIOError::write_snapshot(None, &std::io::Error::other(e))
@@ -678,5 +713,154 @@ where
             }
             None => Ok(None),
         }
+    }
+}
+
+#[cfg(all(test, feature = "store-redb"))]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::time::Duration;
+
+    use openraft::Config;
+
+    use super::super::meta::{MetaCommand, QueueSpec, QueueType};
+    use super::super::network::UnreachableNetwork;
+    use super::super::MetaRaft;
+    use super::*;
+
+    /// Reopen the redb store, waiting out the writer thread's lock release
+    /// (a real restart is a process boundary).
+    fn reopen_store(path: &std::path::Path) -> crate::store::Store {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match crate::store::Store::open(path) {
+                Ok(store) => return store,
+                Err(e) => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "database lock never released: {e}"
+                    );
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+        }
+    }
+
+    fn meta_config() -> std::sync::Arc<Config> {
+        std::sync::Arc::new(
+            Config {
+                heartbeat_interval: 50,
+                election_timeout_min: 150,
+                election_timeout_max: 300,
+                // Aggressive compaction so the test crosses the
+                // snapshot-then-purge boundary quickly.
+                snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(50),
+                max_in_snapshot_log_to_keep: 10,
+                purge_batch_size: 50,
+                ..Default::default()
+            }
+            .validate()
+            .expect("valid config"),
+        )
+    }
+
+    /// The CRIT-3 regression (issue #19): once openraft durably purges the
+    /// log behind a snapshot, that snapshot is the ONLY copy of the state —
+    /// for the metadata group its blob lived purely in memory, so a restart
+    /// recovered an empty catalog with a purged log (silent loss of every
+    /// queue definition). Inline snapshot persistence closes this.
+    #[tokio::test]
+    async fn meta_snapshot_survives_restart_after_log_purge() {
+        const WRITES: usize = 200;
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // First life: enough catalog writes to trigger snapshot + purge.
+        {
+            let store = crate::store::Store::open(dir.path()).expect("open");
+            let (sink, recovery) = crate::cluster::store::RaftPersistFactory::open_group(
+                &store, "meta",
+            )
+            .expect("open group");
+            let meta_store = MetaStore::new_persistent(MetaState::default(), None, sink, recovery)
+                .expect("fresh persistent store");
+            let (log_store, state_machine) = openraft::storage::Adaptor::new(meta_store.clone());
+            let raft = MetaRaft::new(1, meta_config(), UnreachableNetwork, log_store, state_machine)
+                .await
+                .expect("raft");
+            raft.initialize(BTreeMap::from([(1u64, BasicNode::new("local"))]))
+                .await
+                .expect("initialize");
+            raft.wait(Some(Duration::from_secs(5)))
+                .current_leader(1, "self-elect")
+                .await
+                .expect("leader");
+
+            for i in 0..WRITES {
+                raft.client_write(MetaCommand::CreateQueue {
+                    name: format!("q{i:03}"),
+                    spec: QueueSpec {
+                        queue_type: QueueType::Quorum,
+                        replicas: 1,
+                        placement: vec![1],
+                    },
+                })
+                .await
+                .expect("catalog write");
+            }
+            // Compaction runs asynchronously; wait for the purge to land.
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while meta_store.log_stats().1.is_none() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "log never purged; snapshot policy did not fire"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            raft.shutdown().await.expect("shutdown");
+        }
+
+        // Second life: recover from disk. The purged prefix exists ONLY in
+        // the snapshot now — without inline blob persistence the catalog
+        // came back empty.
+        let store = reopen_store(dir.path());
+        let (sink, recovery) =
+            crate::cluster::store::RaftPersistFactory::open_group(&store, "meta")
+                .expect("reopen group");
+        assert!(
+            recovery.snapshot.is_some(),
+            "the snapshot must have been persisted before the log purge"
+        );
+        let meta_store = MetaStore::new_persistent(MetaState::default(), None, sink, recovery)
+            .expect("recovered persistent store");
+        let snapshot_catalog = meta_store.catalog();
+        assert!(
+            snapshot_catalog.contains_key("q000"),
+            "the purged prefix must come back from the snapshot"
+        );
+
+        // Restart the raft on the recovered store (no initialize — vote and
+        // membership recover from disk); replaying the log tail on top of
+        // the snapshot must yield the complete catalog.
+        let (log_store, state_machine) = openraft::storage::Adaptor::new(meta_store.clone());
+        let raft = MetaRaft::new(1, meta_config(), UnreachableNetwork, log_store, state_machine)
+            .await
+            .expect("raft restart");
+        raft.wait(Some(Duration::from_secs(10)))
+            .metrics(
+                |m| {
+                    m.current_leader == Some(1)
+                        && m.last_applied.map(|l| l.index) == m.last_log_index
+                },
+                "re-elected and caught up",
+            )
+            .await
+            .expect("recovery replay");
+        let catalog = meta_store.catalog();
+        assert_eq!(
+            catalog.len(),
+            WRITES,
+            "every catalog entry survives the restart"
+        );
+        raft.shutdown().await.expect("shutdown");
     }
 }
