@@ -39,6 +39,41 @@ pub struct BrokerConfig {
     /// allocation DoS guard. At the cap, an attach to a *new* address is
     /// refused. `0` disables the cap.
     pub max_queues: usize,
+    /// Cluster membership, when this broker is one node of a cluster.
+    /// `None` (the default) runs standalone: `/quorum/*` queues are
+    /// single-replica groups on this node.
+    pub cluster: Option<ClusterMemberConfig>,
+}
+
+/// Cluster membership settings for one broker node.
+///
+/// Every node runs the inter-node **fabric** (Raft replication + queue
+/// forwarding) on `listen`; the founding members are the static `seeds`
+/// list, identical on every node. The lowest seed id forms the cluster;
+/// formation is idempotent, so restarts and start-order races are safe.
+#[derive(Debug, Clone)]
+pub struct ClusterMemberConfig {
+    /// This node's id (must appear in `seeds`, unique per node).
+    pub node_id: u64,
+    /// The fabric listen address (e.g. `0.0.0.0:7472`).
+    pub listen: String,
+    /// All founding members: `(node id, fabric address as peers reach it)`.
+    pub seeds: Vec<(u64, String)>,
+    /// Replica count for newly declared quorum queues (capped at the current
+    /// cluster size at declaration).
+    pub replicas: u8,
+}
+
+impl ClusterMemberConfig {
+    /// A member config with the conventional replication factor of 3.
+    pub fn new(node_id: u64, listen: impl Into<String>, seeds: Vec<(u64, String)>) -> Self {
+        ClusterMemberConfig {
+            node_id,
+            listen: listen.into(),
+            seeds,
+            replicas: 3,
+        }
+    }
 }
 
 impl Default for BrokerConfig {
@@ -51,6 +86,7 @@ impl Default for BrokerConfig {
             max_queue_depth: 1_000_000,
             max_connections: 16_384,
             max_queues: 100_000,
+            cluster: None,
         }
     }
 }

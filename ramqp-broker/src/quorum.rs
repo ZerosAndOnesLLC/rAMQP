@@ -53,18 +53,26 @@ enum Committed {
 type CommitFuture = Pin<Box<dyn Future<Output = Committed> + Send>>;
 
 /// Spawn a quorum queue actor over an already-running queue group.
+///
+/// With `exit_on_demotion`, the actor exits the moment this node stops
+/// leading the group — a follower must never dispatch (its reads would be
+/// stale and its settles could not commit). The proxy layer detects the
+/// closed mailbox and rebinds to the new leader, which redelivers every
+/// unsettled message from applied state (at-least-once). Single-replica
+/// unclustered groups pass `false`: they can never be demoted.
 pub(crate) fn spawn(
     name: String,
     raft: QueueRaft,
     store: QueueStore,
     max_depth: usize,
+    exit_on_demotion: bool,
 ) -> QueueHandle {
     let (tx, rx) = mpsc::channel(1024);
     let handle = QueueHandle {
         name: name.clone(),
         tx,
     };
-    tokio::spawn(run(name, raft, store, rx, max_depth));
+    tokio::spawn(run(name, raft, store, rx, max_depth, exit_on_demotion));
     handle
 }
 
@@ -74,6 +82,7 @@ async fn run(
     store: QueueStore,
     mut rx: mpsc::Receiver<QueueMsg>,
     max_depth: usize,
+    exit_on_demotion: bool,
 ) {
     let mut subs: Vec<Subscriber> = Vec::new();
     // Which subscriber holds each in-flight (dispatched, unsettled) message.
@@ -88,9 +97,23 @@ async fn run(
     let mut next_sub_id: SubId = 0;
     let mut rr: usize = 0;
     let mut mailbox_open = true;
+    let mut metrics = raft.metrics();
+    let self_id = metrics.borrow().id;
 
     while mailbox_open || !commits.is_empty() {
         tokio::select! {
+            changed = metrics.changed(), if exit_on_demotion => {
+                let leader = metrics.borrow().current_leader;
+                if changed.is_err() || leader != Some(self_id) {
+                    // Demoted (or the Raft core stopped): stop immediately.
+                    // Dropped commit futures leave their publishes
+                    // unconfirmed — the proxy retries them against the new
+                    // leader; unsettled dispatches redeliver from state.
+                    tracing::info!(queue = %name, ?leader, "leadership lost; quorum actor exiting");
+                    return;
+                }
+            }
+
             msg = rx.recv(), if mailbox_open => {
                 let Some(msg) = msg else {
                     // Mailbox closed: stop accepting, drain outstanding commits.

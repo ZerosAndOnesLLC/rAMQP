@@ -11,6 +11,7 @@ use ramqp_core::error::ConnectError;
 use ramqp_core::transport::IoStream;
 
 use crate::auth::{AllowAll, Authenticator};
+use crate::cluster::node::{ClusterNode, NodeSettings};
 use crate::config::BrokerConfig;
 use crate::connection;
 use crate::registry::QueueRegistry;
@@ -53,7 +54,24 @@ impl Broker {
     }
 
     /// Bind a TCP listener (e.g. `"0.0.0.0:5672"` or `"127.0.0.1:0"`).
+    ///
+    /// When the config carries a [`crate::config::ClusterMemberConfig`], this
+    /// also starts the node's cluster half: the fabric listener, the
+    /// metadata-group member, and (on the lowest seed) cluster formation.
     pub async fn bind(self, addr: &str) -> std::io::Result<BoundBroker> {
+        if let Some(cluster) = &self.config.cluster
+            && self.registry.cluster().is_none()
+        {
+            let node = ClusterNode::bootstrap(NodeSettings {
+                node_id: cluster.node_id,
+                listen: cluster.listen.clone(),
+                seeds: cluster.seeds.clone(),
+                replicas: cluster.replicas,
+                max_queue_depth: self.config.max_queue_depth,
+            })
+            .await?;
+            self.registry.set_cluster(node);
+        }
         let listener = TcpListener::bind(addr).await?;
         let local_addr = listener.local_addr()?;
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -71,6 +89,25 @@ impl Broker {
             shutdown_rx,
             conn_limit,
         })
+    }
+
+    /// Which node currently leads the queue group behind `address`, when
+    /// this broker is clustered. Diagnostics/testing surface; the management
+    /// API (Phase 9) will supersede it.
+    #[doc(hidden)]
+    pub async fn queue_leader(&self, address: &str) -> Option<u64> {
+        let (_, name) = QueueRegistry::parse_address(address)?;
+        self.registry.cluster()?.resolve_queue_leader(name).await
+    }
+
+    /// Wait until the cluster (when configured) has formed. `true` once a
+    /// metadata leader exists; `false` on timeout or when not clustered.
+    #[doc(hidden)]
+    pub async fn cluster_formed(&self, timeout: std::time::Duration) -> bool {
+        match self.registry.cluster() {
+            Some(node) => node.await_membership(timeout).await.is_ok(),
+            None => false,
+        }
     }
 
     /// Serve a single already-established byte stream (in-process transports,
@@ -171,6 +208,13 @@ impl BoundBroker {
                 }
                 _ = self.shutdown_rx.changed() => {
                     tracing::info!("broker shutting down");
+                    // Stop the cluster half too: fabric listener, Raft
+                    // members, leader-local actors. Abrupt by design — a
+                    // shut-down node must look dead to its peers so their
+                    // groups re-elect.
+                    if let Some(node) = self.broker.registry.cluster() {
+                        node.stop().await;
+                    }
                     return Ok(());
                 }
             }

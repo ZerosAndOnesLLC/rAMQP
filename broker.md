@@ -6,16 +6,18 @@ shared `ramqp-core`, then adding a server crate on top. Clean-room, no external
 AMQP dependencies (same constraint as the client). Clustered from v1; single
 protocol, done excellently; **fast and light before anything else**.
 
-> **Status: building — Phases 0–5 complete; Phase 6 mostly done** (single-replica
-> quorum queues are live; the multi-node forwarding fabric is the remaining piece).
-> See §11 checkboxes. The broker runs, the unmodified `ramqp` client
-> produces/consumes against it (transient **and** quorum queues), first benchmark
-> numbers vs live RabbitMQ 4.3.1 and Artemis are in `bench-compare/README.md`, a
-> 3-node Raft metadata cluster forms over TCP, and CI runs the client interop
-> suite against our own broker alongside RabbitMQ and Artemis. A review-driven
-> correctness/hardening/perf pass has landed (see the git history on
-> `fix/review-findings`). This v2 supersedes the original single-node plan after
-> the scope decisions in §2.
+> **Status: building — Phases 0–6 complete** (the quorum-queue-vs-RabbitMQ bench
+> is the one Phase 6 straggler). See §11 checkboxes. The broker runs **clustered**:
+> a 3-node cluster forms from static seeds over the inter-node fabric (one
+> multiplexed TCP connection per peer pair carrying every Raft group + the
+> forwarded data plane), quorum queues are declared through the replicated
+> catalog with rendezvous placement, **any node serves any queue** through
+> leader-following proxies, and killing the leader node mid-stream loses zero
+> accepted messages — proven end-to-end with the unmodified `ramqp` client.
+> First benchmark numbers vs live RabbitMQ 4.3.1 and Artemis are in
+> `bench-compare/README.md`, and CI runs the client interop suite against our
+> own broker alongside RabbitMQ and Artemis. This v2 supersedes the original
+> single-node plan after the scope decisions in §2.
 
 ---
 
@@ -487,12 +489,13 @@ link/session → negotiate/mux/heartbeat → txn/sasl splits.
 - [x] **Static-seed bootstrap** (`cluster::bootstrap`): `ClusterConfig{node_id, raft_listen, seeds}`; lowest seed id initializes with retry-until-quorum (already-initialized → no-op, restart/race-safe); `ClusterHandle::await_membership`. Test: 3 nodes bootstrap concurrently from the same seed list, agree on a leader, converge. (Queue-declaration wiring through the catalog lands with Phase 6 quorum queues, where the catalog gains its consumer.)
 - [x] Tests: single-node group applies/deletes; **3-node cluster forms, catalog replicates to every node; leader kill → re-election → post-failover writes converge on survivors**; learner joins and catches up. (Node-*restart* durability needs the on-disk log — Phase 7.) Bench unchanged: the cluster layer is not yet on any message path.
 
-### Phase 6 — Quorum queues 🟡 (single-replica live; multi-node fabric remaining)
+### Phase 6 — Quorum queues ✅ (bench vs RabbitMQ quorum queues remaining)
 - [x] Per-queue Raft state machine (enqueue/settle log entries + unacked map).
 - [x] Quorum-vs-transient declaration wired through the address model (`/quorum/<name>`).
 - [x] Snapshots / log-compaction (bincode snapshots; `LogsSinceLast` policy; built off-lock, off the async worker).
-- [ ] **Leader routing + internal forwarding fabric** (any node serves any queue), zero-copy + batched.
-- [~] Test: produce to a quorum queue, **kill the leader mid-stream**, consumer continues, zero loss — proven at single-replica group scope (`leader_death_loses_no_committed_message`); the multi-node kill-leader test and **bench: quorum-queue tail latency/throughput vs RabbitMQ quorum queues** are pending the forwarding fabric. Commit.
+- [x] **Leader routing + internal forwarding fabric** (any node serves any queue), zero-copy + batched. Landed as: the **fabric** (`cluster/fabric.rs`) — one multiplexed TCP connection per peer pair, correlation-id RPC (no head-of-line blocking, cancel-safe), bincode Raft payloads, raw-`Bytes`-tail message bodies (never serde'd), batched single-flush writes — carrying every group's Raft traffic (shared-transport half of the multi-raft manager) **and** the data plane; the **cluster node** (`cluster/node.rs`) — catalog-driven declaration with deterministic rendezvous placement recorded in the catalog, StartGroup fanout + lazy member heal, `MetaWrite` leader forwarding, leader-side publish/subscribe bridging onto unmodified queue actors (per-connection ordered forwarder preserves producer FIFO); and the **proxy** (`proxy.rs`) — a leader-following local actor speaking the queue-mailbox protocol, so the connection driver is untouched; it re-resolves on failover, migrates subscriptions (re-arming outstanding demand), and retries in-flight publishes (epoch-guarded rebinds). Quorum actors exit on demotion (a follower never dispatches). Clustering is opt-in via `BrokerConfig::cluster` / daemon `--node-id/--cluster-listen/--seed`; standalone brokers are unchanged.
+- [x] Test: produce to a quorum queue, **kill the leader mid-stream**, consumer continues, zero loss — proven at three scopes: single-replica group (`leader_death_loses_no_committed_message`), 3-node fabric level (`killing_the_leader_node_loses_no_accepted_message`), and client-facing e2e with the unmodified `ramqp` client (`kill_leader_mid_stream_loses_nothing`, plus `any_node_serves_any_queue`).
+- [ ] **Bench: quorum-queue tail latency/throughput vs RabbitMQ quorum queues.** Commit.
 
 ### Phase 7 — Durability & deep-queue scaling (the §8 #1 risk)
 - [ ] Durable-local store for non-replicated durable queues (free embedded backend, feature-gated).

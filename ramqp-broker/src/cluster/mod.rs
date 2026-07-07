@@ -9,21 +9,19 @@
 //! multi-node tests without sockets).
 //!
 //! Crate-internal (not on the public API): these openraft-typed, pre-alpha
-//! internals must not appear on the crates.io semver surface. The
-//! metadata-group formation path (`bootstrap`, `tcp`, `network`, `meta`) is
-//! built and covered by tests but is not yet wired into the *running* broker —
-//! that multi-node integration is Phase-6-remaining work — so it reads as
-//! unused from the non-test crate build; `queue_group`/`store` are live via the
-//! quorum-queue actor. The allow marks this as ahead-of-integration scaffolding
-//! rather than accidental dead code.
+//! internals must not appear on the crates.io semver surface. Multi-node
+//! wiring lives in `fabric` (the shared per-peer transport), `node` (the
+//! cluster node: metadata + queue groups + the leader side of forwarding);
+//! the origin side is `crate::proxy`. `network::Router` remains as the
+//! in-process multi-node test harness.
 #![allow(dead_code)]
 
-pub mod bootstrap;
+pub mod fabric;
 pub mod meta;
 pub mod network;
+pub mod node;
 pub mod queue_group;
 pub mod store;
-pub mod tcp;
 
 use std::io::Cursor;
 
@@ -96,30 +94,34 @@ mod tests {
             .await
             .expect("leader");
 
+        let spec = QueueSpec {
+            queue_type: QueueType::Quorum,
+            replicas: 3,
+            placement: vec![1, 2, 3],
+        };
         let resp = raft
             .client_write(MetaCommand::CreateQueue {
                 name: "orders".into(),
-                spec: QueueSpec {
-                    queue_type: QueueType::Quorum,
-                    replicas: 3,
-                },
+                spec: spec.clone(),
             })
             .await
             .expect("write");
         assert_eq!(resp.data, MetaResponse::Created);
 
-        // Idempotence: re-creating reports AlreadyExists.
+        // Idempotence: re-creating reports AlreadyExists with the
+        // authoritative (first-writer) spec.
         let resp = raft
             .client_write(MetaCommand::CreateQueue {
                 name: "orders".into(),
                 spec: QueueSpec {
                     queue_type: QueueType::Quorum,
                     replicas: 3,
+                    placement: vec![4, 5, 6],
                 },
             })
             .await
             .expect("write");
-        assert_eq!(resp.data, MetaResponse::AlreadyExists);
+        assert_eq!(resp.data, MetaResponse::AlreadyExists(spec));
 
         let catalog = store.catalog();
         assert_eq!(catalog.len(), 1);
@@ -162,6 +164,7 @@ mod tests {
                 spec: QueueSpec {
                     queue_type: QueueType::Quorum,
                     replicas: 3,
+                    placement: vec![],
                 },
             })
             .await
@@ -233,6 +236,7 @@ mod tests {
                 spec: QueueSpec {
                     queue_type: QueueType::Quorum,
                     replicas: 3,
+                    placement: vec![],
                 },
             })
             .await
@@ -280,6 +284,7 @@ mod tests {
             spec: QueueSpec {
                 queue_type: QueueType::Transient,
                 replicas: 1,
+                placement: vec![],
             },
         })
         .await

@@ -3,20 +3,24 @@
 //! Address model (interim until the management API lands in Phase 9):
 //! `/queues/<name>` and bare names declare **transient** queues (the Phase 4
 //! in-memory actor); `/quorum/<name>` declares a **quorum** queue backed by a
-//! per-queue Raft group (single-replica in this slice — multi-node placement
-//! arrives with the forwarding fabric).
+//! per-queue Raft group. Standalone (no cluster configured), a quorum queue
+//! is a single-replica group on this node; clustered, it is declared through
+//! the replicated catalog, placed on its replica set, and served through a
+//! [`crate::proxy`] actor that follows the group's leader wherever it lives.
 //!
 //! Resolution happens only at attach time (never per-message), so an async
 //! mutex around the map is fine — the message path stays lock-free.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use openraft::BasicNode;
 
 use crate::cluster::NodeId;
 use crate::cluster::network::UnreachableNetwork;
+use crate::cluster::node::ClusterNode;
 use crate::cluster::queue_group::{QueueRaft, QueueStore};
+use crate::proxy;
 use crate::queue::{self, QueueHandle};
 use crate::quorum;
 
@@ -45,6 +49,8 @@ pub(crate) struct QueueRegistry {
     max_queues: usize,
     /// This node's id for single-replica queue groups.
     node_id: NodeId,
+    /// The cluster node, when this broker is clustered. Set once at bind.
+    cluster: OnceLock<Arc<ClusterNode>>,
 }
 
 impl QueueRegistry {
@@ -54,7 +60,18 @@ impl QueueRegistry {
             max_depth,
             max_queues,
             node_id: 1,
+            cluster: OnceLock::new(),
         }
+    }
+
+    /// Attach the cluster node (idempotent; first caller wins).
+    pub fn set_cluster(&self, node: Arc<ClusterNode>) {
+        let _ = self.cluster.set(node);
+    }
+
+    /// The cluster node, when clustered.
+    pub fn cluster(&self) -> Option<&Arc<ClusterNode>> {
+        self.cluster.get()
     }
 
     /// Normalize an AMQP address to `(kind, queue name)`. Accepts the
@@ -100,11 +117,21 @@ impl QueueRegistry {
                 .get_or_try_init(|| async {
                     let h = match kind {
                         QueueKind::Transient => queue::spawn(name.to_owned(), self.max_depth),
-                        QueueKind::Quorum => {
-                            spawn_quorum_group(name.to_owned(), self.node_id, self.max_depth)
+                        // Clustered: declare through the replicated catalog and
+                        // serve through a leader-following proxy.
+                        QueueKind::Quorum => match self.cluster.get() {
+                            Some(node) => {
+                                node.declare_quorum(name)
+                                    .await
+                                    .map_err(|e| {
+                                        tracing::warn!(queue = %name, error = %e, "quorum declare failed");
+                                    })?;
+                                proxy::spawn(name.to_owned(), node.clone())
+                            }
+                            None => spawn_quorum_group(name.to_owned(), self.node_id, self.max_depth)
                                 .await
-                                .ok_or(())?
-                        }
+                                .ok_or(())?,
+                        },
                     };
                     Ok::<_, ()>(h)
                 })
@@ -185,7 +212,8 @@ async fn spawn_quorum_group(
         .await
         .map_err(|e| tracing::error!(queue = %name, error = %e, "quorum leader-wait failed"))
         .ok()?;
-    Some(quorum::spawn(name, raft, store, max_depth))
+    // A single-replica standalone group can never be demoted.
+    Some(quorum::spawn(name, raft, store, max_depth, false))
 }
 
 #[cfg(test)]

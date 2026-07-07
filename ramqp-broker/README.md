@@ -23,12 +23,16 @@ A **performance-first, highly-available AMQP 1.0 broker** in Rust, built on
   (openraft). A publish is acknowledged only after the enqueue **commits to
   the replicated log** — the accepted disposition is the durability confirm.
   Pipelined commits, ready-set dispatch, snapshots + log compaction (memory
-  tracks queue depth, not history). Single-replica today; multi-node
-  placement and failover routing are the current work.
-- **Cluster foundation** — a metadata Raft group (replicated queue catalog)
-  over a real TCP inter-node transport with static-seed bootstrap; 3-node
-  clusters form, replicate, and survive leader failure with re-election and
-  zero committed-message loss (tested).
+  tracks queue depth, not history).
+- **Clustering with leader routing** — a metadata Raft group (replicated
+  queue catalog + rendezvous placement) and an **inter-node fabric**: one
+  multiplexed TCP connection per peer pair carrying every group's Raft
+  traffic *and* the data plane (publish/subscribe forwarding, zero-copy
+  bodies, batched writes). **Any node serves any queue** — attach anywhere;
+  a leader-following proxy routes to wherever the queue group's leader
+  lives, and re-routes on failover. Kill the leader node mid-stream and a
+  consumer on a survivor keeps receiving with zero accepted-message loss
+  (tested end-to-end with the unmodified `ramqp` client).
 
 ## Run it
 
@@ -36,8 +40,18 @@ A **performance-first, highly-available AMQP 1.0 broker** in Rust, built on
 cargo run -p ramqp-broker --bin ramqp-brokerd -- --listen 0.0.0.0:5672
 ```
 
-`--listen` (or `RAMQP_LISTEN`) is the only knob today; `RUST_LOG` controls
-tracing. Then point any client at it — e.g. the repo's example:
+`RUST_LOG` controls tracing. For a cluster, give each node an id, a fabric
+listen address, and the shared seed list:
+
+```sh
+ramqp-brokerd --listen 0.0.0.0:5672 \
+  --node-id 1 --cluster-listen 0.0.0.0:7472 \
+  --seed 1=host-a:7472 --seed 2=host-b:7472 --seed 3=host-c:7472
+```
+
+(env: `RAMQP_LISTEN`, `RAMQP_NODE_ID`, `RAMQP_CLUSTER_LISTEN`,
+`RAMQP_SEEDS=1=host-a:7472,2=host-b:7472,...`.) Then point any client at any
+node — e.g. the repo's example:
 
 ```sh
 RAMQP_URL=amqp://localhost:5672 RAMQP_ADDRESS=/queues/demo \
