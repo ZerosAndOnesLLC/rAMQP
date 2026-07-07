@@ -23,7 +23,8 @@ use ramqp_core::error::{ConnectError, ErrorKind};
 use ramqp_core::ids::{DeliveryId, SessionId};
 use ramqp_core::observe::{SharedMetrics, noop_metrics};
 use ramqp_core::proto::{LinkEvent, SessionEvent};
-use ramqp_core::sasl::server::parse_plain_response;
+use ramqp_core::sasl::scram::ScramMechanism;
+use ramqp_core::sasl::server::{ScramServer, parse_plain_response};
 use ramqp_core::session::state::Session;
 use ramqp_core::transport::IoStream;
 use ramqp_core::transport::frame::{Frame, FrameBody, FramedTransport};
@@ -37,7 +38,7 @@ use ramqp_core::types::sasl::{SaslCode, SaslFrame, SaslMechanisms, SaslOutcome};
 
 use ramqp_core::txn::{declared_state, transactional_state, txn_state};
 
-use crate::auth::{Authenticator, Credentials};
+use crate::auth::{Authenticator, Credentials, Operation};
 use crate::config::BrokerConfig;
 use crate::queue::{ConnCmd, PublishAck, QueueHandle, QueueMsg, SettleOutcome, SubId};
 use crate::registry::QueueRegistry;
@@ -57,7 +58,7 @@ pub(crate) async fn serve<S: IoStream>(
 ) -> Result<(), ConnectError> {
     // Bound the whole inbound handshake (header + SASL + open) so a client
     // that connects then stalls cannot pin this task (slow-loris guard).
-    let handshake = handshake(stream, &config, auth.as_ref(), registry);
+    let handshake = handshake(stream, &config, auth, registry);
     let mut conn = match config.connection.connect_timeout {
         Some(t) => tokio::time::timeout(t, handshake)
             .await
@@ -80,9 +81,10 @@ pub(crate) async fn serve<S: IoStream>(
 async fn handshake<S: IoStream>(
     mut stream: S,
     config: &Arc<BrokerConfig>,
-    auth: &dyn Authenticator,
+    auth_arc: Arc<dyn Authenticator>,
     registry: Arc<QueueRegistry>,
 ) -> Result<BrokerConnection<S>, ConnectError> {
+    let auth = auth_arc.as_ref();
     // 1. Protocol header, read-first. Offer SASL and (if permitted) bare AMQP.
     let supported: &[ProtocolHeader] = if auth.allow_unauthenticated() {
         &[ProtocolHeader::SASL, ProtocolHeader::AMQP]
@@ -94,8 +96,9 @@ async fn handshake<S: IoStream>(
     let mut transport = FramedTransport::new(stream, config.connection.max_frame_size);
 
     // 2. SASL layer (when chosen): mechanisms → init → outcome → AMQP header.
+    let mut identity = None;
     if chosen == ProtocolHeader::SASL {
-        server_sasl(&mut transport, auth).await?;
+        identity = server_sasl(&mut transport, auth).await?;
         let after = accept_header(transport.stream_mut(), &[ProtocolHeader::AMQP]).await?;
         debug_assert_eq!(after, ProtocolHeader::AMQP);
     }
@@ -141,9 +144,21 @@ async fn handshake<S: IoStream>(
     let (session_events_tx, session_events_rx) = mpsc::unbounded_channel();
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
 
-    tracing::debug!(container = %peer_open.container_id, "connection open");
+    // Tenant namespace: a hostname of `vhost:<name>` scopes every queue this
+    // connection touches (queues, policies, permissions) to that vhost.
+    let vhost = peer_open
+        .hostname
+        .as_deref()
+        .and_then(|h| h.strip_prefix("vhost:"))
+        .unwrap_or("")
+        .to_owned();
+
+    tracing::debug!(container = %peer_open.container_id, identity = ?identity, vhost = %vhost, "connection open");
     Ok(BrokerConnection {
         transport,
+        identity,
+        vhost,
+        auth: auth_arc,
         config: config.clone(),
         registry,
         max_frame_size: negotiated.max_frame_size as usize,
@@ -170,10 +185,11 @@ async fn handshake<S: IoStream>(
 }
 
 /// Server side of SASL: advertise, read `init`, verify, send the outcome.
+/// Returns the authenticated identity (`None` for ANONYMOUS).
 async fn server_sasl<S: IoStream>(
     transport: &mut FramedTransport<S>,
     auth: &dyn Authenticator,
-) -> Result<(), ConnectError> {
+) -> Result<Option<String>, ConnectError> {
     transport
         .send_sasl(&SaslFrame::Mechanisms(SaslMechanisms {
             sasl_server_mechanisms: auth.mechanisms().iter().map(|m| Symbol::new(*m)).collect(),
@@ -191,21 +207,39 @@ async fn server_sasl<S: IoStream>(
     };
 
     let mechanism = init.mechanism.as_str().to_ascii_uppercase();
-    let verified = match mechanism.as_str() {
+    let scram = match mechanism.as_str() {
+        "SCRAM-SHA-1" => Some(ScramMechanism::Sha1),
+        "SCRAM-SHA-256" => Some(ScramMechanism::Sha256),
+        "SCRAM-SHA-512" => Some(ScramMechanism::Sha512),
+        _ => None,
+    };
+    let verified: Option<Option<String>> = match mechanism.as_str() {
         "ANONYMOUS" if auth.mechanisms().contains(&"ANONYMOUS") => {
-            auth.verify(Credentials::Anonymous)
+            auth.verify(Credentials::Anonymous).then_some(None)
         }
         "PLAIN" if auth.mechanisms().contains(&"PLAIN") => init
             .initial_response
             .as_deref()
             .and_then(parse_plain_response)
-            .is_some_and(|(_authzid, authcid, passwd)| {
+            .and_then(|(_authzid, authcid, passwd)| {
                 auth.verify(Credentials::Plain { authcid, passwd })
+                    .then(|| Some(authcid.to_owned()))
             }),
-        _ => false,
+        _ if scram.is_some() && auth.mechanisms().contains(&mechanism.as_str()) => {
+            // RFC 5802 server flow: client-first → challenge → client-final
+            // → outcome carrying the server-final signature.
+            match server_scram(transport, auth, scram.expect("checked"), &init).await? {
+                Some(identity) => {
+                    // The outcome (with additional-data) was already sent.
+                    return Ok(Some(identity));
+                }
+                None => None,
+            }
+        }
+        _ => None,
     };
 
-    let code = if verified {
+    let code = if verified.is_some() {
         SaslCode::Ok
     } else {
         SaslCode::Auth
@@ -216,13 +250,64 @@ async fn server_sasl<S: IoStream>(
             additional_data: None,
         }))
         .await?;
-    if !verified {
-        return Err(ConnectError::msg(
+    match verified {
+        Some(identity) => Ok(identity),
+        None => Err(ConnectError::msg(
             ErrorKind::Sasl,
             format!("authentication failed (mechanism {mechanism})"),
-        ));
+        )),
     }
-    Ok(())
+}
+
+/// Run the SCRAM server exchange. On success the outcome (Ok + server-final
+/// in `additional-data`) is sent here and the identity returned; on failure
+/// `None` is returned and the caller sends the auth-failure outcome.
+async fn server_scram<S: IoStream>(
+    transport: &mut FramedTransport<S>,
+    auth: &dyn Authenticator,
+    mechanism: ScramMechanism,
+    init: &ramqp_core::types::sasl::SaslInit,
+) -> Result<Option<String>, ConnectError> {
+    use ramqp_core::types::sasl::{SaslChallenge, SaslResponse};
+
+    let mut server = ScramServer::new(mechanism);
+    let Some(client_first) = init.initial_response.as_deref() else {
+        return Ok(None);
+    };
+    let Ok(username) = server.on_client_first(client_first) else {
+        return Ok(None);
+    };
+    let username = username.to_owned();
+    let Some(verifier) = auth.scram_verifier(mechanism, &username) else {
+        return Ok(None);
+    };
+    let challenge = server.server_first(verifier);
+    transport
+        .send_sasl(&SaslFrame::Challenge(SaslChallenge {
+            challenge: challenge.to_vec().into(),
+        }))
+        .await?;
+    let response = match transport.read_frame().await?.body {
+        FrameBody::Sasl(SaslFrame::Response(SaslResponse { response })) => response,
+        other => {
+            return Err(ConnectError::msg(
+                ErrorKind::Sasl,
+                format!("expected sasl-response, got {other:?}"),
+            ));
+        }
+    };
+    match server.on_client_final(&response) {
+        Ok(server_final) => {
+            transport
+                .send_sasl(&SaslFrame::Outcome(SaslOutcome {
+                    code: SaslCode::Ok,
+                    additional_data: Some(server_final.to_vec().into()),
+                }))
+                .await?;
+            Ok(Some(username))
+        }
+        Err(_) => Ok(None),
+    }
 }
 
 /// A link's queue binding.
@@ -280,6 +365,12 @@ struct TxnDone {
 /// An established broker-side connection (post-handshake).
 struct BrokerConnection<S: IoStream> {
     transport: FramedTransport<S>,
+    /// The authenticated identity (`None` = anonymous).
+    identity: Option<String>,
+    /// The tenant namespace (empty = default vhost).
+    vhost: String,
+    /// Authorization decisions at attach time.
+    auth: Arc<dyn Authenticator>,
     config: Arc<BrokerConfig>,
     registry: Arc<QueueRegistry>,
     max_frame_size: usize,
@@ -921,6 +1012,23 @@ impl<S: IoStream> BrokerConnection<S> {
         if attach.role == Role::Sender
             && matches!(&attach.target, Some(TargetArchetype::Coordinator(_)))
         {
+            if !self.auth.authorize(
+                self.identity.as_deref(),
+                &self.vhost,
+                "$coordinator",
+                Operation::Send,
+            ) {
+                let session = self.sessions.get_mut(&local).expect("bound channel");
+                session.refuse_peer_attach(
+                    &attach,
+                    AmqpError::new(
+                        AmqpCondition::UnauthorizedAccess,
+                        Some("not authorized to use transactions".to_owned()),
+                    ),
+                    &mut self.transport,
+                );
+                return;
+            }
             let session = self.sessions.get_mut(&local).expect("bound channel");
             let accepted = session.accept_peer_attach(
                 attach,
@@ -957,8 +1065,31 @@ impl<S: IoStream> BrokerConnection<S> {
             },
             Role::Receiver => attach.source.as_ref().and_then(|s| s.address.clone()),
         };
+        // Authorize before resolving (an unauthorized attach must not even
+        // auto-declare the queue).
+        let operation = match attach.role {
+            Role::Sender => Operation::Send,
+            Role::Receiver => Operation::Receive,
+        };
+        if let Some(a) = address.as_deref()
+            && !self
+                .auth
+                .authorize(self.identity.as_deref(), &self.vhost, a, operation)
+        {
+            tracing::debug!(identity = ?self.identity, address = %a, ?operation, "attach denied");
+            let session = self.sessions.get_mut(&local).expect("bound channel");
+            session.refuse_peer_attach(
+                &attach,
+                AmqpError::new(
+                    AmqpCondition::UnauthorizedAccess,
+                    Some(format!("not authorized to {operation:?} on {a}")),
+                ),
+                &mut self.transport,
+            );
+            return;
+        }
         let queue = match address.as_deref() {
-            Some(a) => self.registry.resolve(a).await,
+            Some(a) => self.registry.resolve_in(&self.vhost, a).await,
             None => None,
         };
         let Some(queue) = queue else {

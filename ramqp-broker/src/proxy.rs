@@ -383,6 +383,19 @@ impl Proxy {
                     _ => {}
                 }
             }
+            QueueMsg::Stats { reply } => {
+                // Local leader: real stats from the actor; remote: only the
+                // proxy-side consumer count is known.
+                if let Some(Downstream::Local { queue }) = &self.downstream {
+                    let _ = queue.tx.send(QueueMsg::Stats { reply }).await;
+                } else {
+                    let _ = reply.send(crate::queue::QueueStats {
+                        ready: 0,
+                        unacked: 0,
+                        consumers: self.subs.len(),
+                    });
+                }
+            }
             QueueMsg::Unsubscribe { sub } => {
                 let Ok(key) = u32::try_from(sub) else { return };
                 let Some(record) = self.subs.remove(&key) else {

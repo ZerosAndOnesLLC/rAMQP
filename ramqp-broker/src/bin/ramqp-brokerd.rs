@@ -20,6 +20,7 @@ struct Args {
     cluster_listen: Option<String>,
     seeds: Vec<(u64, String)>,
     data_dir: Option<std::path::PathBuf>,
+    management_listen: Option<String>,
 }
 
 fn usage() -> ! {
@@ -49,6 +50,7 @@ fn parse_args() -> Args {
             .map(|v| v.split(',').filter_map(parse_seed).collect())
             .unwrap_or_default(),
         data_dir: std::env::var("RAMQP_DATA_DIR").ok().map(Into::into),
+        management_listen: std::env::var("RAMQP_MANAGEMENT_LISTEN").ok(),
     };
     let mut argv = std::env::args().skip(1);
     while let Some(arg) = argv.next() {
@@ -113,6 +115,7 @@ async fn main() -> std::io::Result<()> {
     }
 
     config.data_dir = args.data_dir.clone();
+    config.management_listen = args.management_listen.clone();
     if args.data_dir.is_some() && !cfg!(feature = "store-redb") {
         eprintln!("--data-dir given but this build lacks the `store-redb` feature");
         std::process::exit(2);

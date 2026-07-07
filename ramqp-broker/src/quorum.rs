@@ -319,6 +319,13 @@ fn handle_msg(
                 }
             }
         }
+        QueueMsg::Stats { reply } => {
+            let _ = reply.send(crate::queue::QueueStats {
+                ready: ready.len(),
+                unacked: inflight.len(),
+                consumers: subs.len(),
+            });
+        }
         QueueMsg::Unsubscribe { sub } => {
             subs.retain(|s| s.id != sub);
             // Everything that subscriber held becomes dispatchable again.

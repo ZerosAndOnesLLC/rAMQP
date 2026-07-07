@@ -1,10 +1,14 @@
-//! Pluggable connection authentication.
+//! Pluggable connection authentication and authorization.
 //!
-//! Phase 3 scope: ANONYMOUS and PLAIN. SCRAM verification (via
-//! `ramqp_core::sasl::server::ScramServer` + a credential/verifier store)
-//! arrives with the auth backend work (broker.md Phase 9).
+//! Mechanisms: ANONYMOUS, PLAIN, and SCRAM-SHA-1/-256/-512 (via
+//! `ramqp_core::sasl::server::ScramServer` against verifier-based storage —
+//! no plaintext at rest). Authorization is per-address: every link attach
+//! asks [`Authenticator::authorize`] before a queue is resolved.
 
 use std::collections::HashMap;
+
+use ramqp_core::sasl::scram::ScramMechanism;
+use ramqp_core::sasl::server::ScramVerifier;
 
 /// Credentials presented by a connecting client.
 #[derive(Debug, Clone, Copy)]
@@ -20,10 +24,20 @@ pub enum Credentials<'a> {
     },
 }
 
-/// Verifies connection credentials.
+/// What a link wants to do with an address (authorization checks).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Operation {
+    /// Publish into the address (a producer attach — or the transaction
+    /// coordinator, whose pseudo-address is `$coordinator`).
+    Send,
+    /// Consume from the address (a consumer attach).
+    Receive,
+}
+
+/// Verifies connection credentials and authorizes link attaches.
 ///
-/// Synchronous for now: Phase 3 backends are in-memory. When a database/LDAP
-/// backend lands (Phase 9) this becomes async.
+/// Synchronous for now: the built-in backends are in-memory. When a
+/// database/LDAP backend lands this becomes async.
 pub trait Authenticator: Send + Sync + 'static {
     /// The SASL mechanisms to advertise, in preference order.
     fn mechanisms(&self) -> &[&'static str];
@@ -33,6 +47,26 @@ pub trait Authenticator: Send + Sync + 'static {
     /// Defaults to whatever ANONYMOUS verification says.
     fn allow_unauthenticated(&self) -> bool {
         self.verify(Credentials::Anonymous)
+    }
+    /// The stored SCRAM verifier for `username` (advertising `SCRAM-*`
+    /// mechanisms requires implementing this). The username arrives
+    /// SASLprep-prepared.
+    fn scram_verifier(&self, mechanism: ScramMechanism, username: &str) -> Option<ScramVerifier> {
+        let _ = (mechanism, username);
+        None
+    }
+    /// May `identity` (the authenticated username; `None` for anonymous)
+    /// perform `operation` on `address` within `vhost`? Called at link
+    /// attach — never per message. Defaults to allow.
+    fn authorize(
+        &self,
+        identity: Option<&str>,
+        vhost: &str,
+        address: &str,
+        operation: Operation,
+    ) -> bool {
+        let _ = (identity, vhost, address, operation);
+        true
     }
 }
 
@@ -105,6 +139,58 @@ fn ct_str_eq(a: &str, b: &str) -> bool {
         diff |= x ^ y;
     }
     diff == 0
+}
+
+/// SCRAM authentication against a static, verifier-based user table
+/// (passwords are salted + iterated at construction; no plaintext at rest).
+#[derive(Debug, Default)]
+pub struct StaticScram {
+    users: HashMap<String, ScramVerifier>,
+}
+
+impl StaticScram {
+    /// PBKDF2 iteration count for derived verifiers (RFC 7677 recommends
+    /// at least 4096; this default trades a few ms at provisioning for a
+    /// real brute-force cost).
+    pub const ITERATIONS: u32 = 8192;
+
+    /// An empty user table (SCRAM-SHA-256).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add a user (builder-style). The password is SASLprep-prepared and
+    /// derived into a salted verifier immediately; panics on a password
+    /// SASLprep prohibits (provisioning-time input).
+    pub fn with_user(mut self, username: impl Into<String>, password: &str) -> Self {
+        // A fresh random salt per user (nonce entropy re-used as salt).
+        let salt = ramqp_core::sasl::scram::gen_nonce().into_bytes();
+        let verifier = ScramVerifier::derive(
+            ScramMechanism::Sha256,
+            password,
+            &salt[..16],
+            Self::ITERATIONS,
+        )
+        .expect("password must survive SASLprep");
+        self.users.insert(username.into(), verifier);
+        self
+    }
+}
+
+impl Authenticator for StaticScram {
+    fn mechanisms(&self) -> &[&'static str] {
+        &["SCRAM-SHA-256"]
+    }
+
+    fn verify(&self, _credentials: Credentials<'_>) -> bool {
+        false // only SCRAM; PLAIN/ANONYMOUS are refused
+    }
+
+    fn scram_verifier(&self, mechanism: ScramMechanism, username: &str) -> Option<ScramVerifier> {
+        (mechanism == ScramMechanism::Sha256)
+            .then(|| self.users.get(username).cloned())
+            .flatten()
+    }
 }
 
 #[cfg(test)]

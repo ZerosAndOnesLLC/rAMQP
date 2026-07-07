@@ -138,6 +138,15 @@ impl QueueRegistry {
         None
     }
 
+    /// Enumerate declared queues: `(kind-qualified key, handle)` — the
+    /// management/metrics surface (never on a message path).
+    pub fn queues(&self) -> Vec<(String, QueueHandle)> {
+        let map = self.queues.lock().expect("registry lock");
+        map.iter()
+            .filter_map(|(key, cell)| cell.get().map(|h| (key.clone(), h.clone())))
+            .collect()
+    }
+
     /// Attach the cluster node (idempotent; first caller wins).
     pub fn set_cluster(&self, node: Arc<ClusterNode>) {
         let _ = self.cluster.set(node);
@@ -165,9 +174,23 @@ impl QueueRegistry {
         (!name.is_empty()).then_some((QueueKind::Transient, name))
     }
 
-    /// Resolve an address, declaring the queue if it doesn't exist.
+    /// Resolve an address in the default vhost.
     pub async fn resolve(&self, address: &str) -> Option<QueueHandle> {
-        let (kind, name) = Self::parse_address(address)?;
+        self.resolve_in("", address).await
+    }
+
+    /// Resolve an address within a vhost, declaring the queue if it doesn't
+    /// exist. A non-empty vhost namespaces the queue (name, policies,
+    /// storage, catalog) as `<vhost>/<name>`.
+    pub async fn resolve_in(&self, vhost: &str, address: &str) -> Option<QueueHandle> {
+        let (kind, bare) = Self::parse_address(address)?;
+        let qualified;
+        let name: &str = if vhost.is_empty() {
+            bare
+        } else {
+            qualified = format!("{vhost}/{bare}");
+            &qualified
+        };
         // Kind-qualified key: `/queues/foo`, `/quorum/foo`, and
         // `/durable/foo` are distinct queues.
         let key = match kind {

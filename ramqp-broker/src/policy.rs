@@ -19,6 +19,12 @@ use crate::queue::QueueMsg;
 use crate::registry::QueueRegistry;
 
 /// One message bound for a dead-letter queue.
+///
+/// Targets resolve in the DEFAULT namespace: a per-vhost policy addresses a
+/// tenant's dead-letter queue by its qualified name (e.g.
+/// `/queues/<vhost>/dead`), which lands on the same storage key as
+/// `/queues/dead` resolved inside that vhost — the qualification scheme
+/// composes, no inference needed.
 #[derive(Debug)]
 pub(crate) struct DeadLetter {
     /// The dead-letter target address (any queue address).

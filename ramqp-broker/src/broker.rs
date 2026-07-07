@@ -14,6 +14,7 @@ use crate::auth::{AllowAll, Authenticator};
 use crate::cluster::node::{ClusterNode, NodeSettings};
 use crate::config::BrokerConfig;
 use crate::connection;
+use crate::mgmt::{self, BrokerCounters};
 use crate::policy::{self, DeadLetterSender};
 use crate::registry::QueueRegistry;
 
@@ -24,6 +25,7 @@ pub struct Broker {
     auth: Arc<dyn Authenticator>,
     registry: Arc<QueueRegistry>,
     dlx: DeadLetterSender,
+    counters: Arc<BrokerCounters>,
 }
 
 impl std::fmt::Debug for Broker {
@@ -46,6 +48,7 @@ impl Broker {
             auth: Arc::new(AllowAll),
             registry,
             dlx,
+            counters: Arc::new(BrokerCounters::default()),
         }
     }
 
@@ -89,6 +92,16 @@ impl Broker {
             })
             .await?;
             self.registry.set_cluster(node);
+        }
+        // The management endpoint (metrics + queue inspection), if enabled.
+        if let Some(mgmt_addr) = &self.config.management_listen {
+            let mgmt_listener = TcpListener::bind(mgmt_addr).await?;
+            tracing::info!(addr = %mgmt_listener.local_addr()?, "management endpoint listening");
+            mgmt::spawn_mgmt(
+                mgmt_listener,
+                Arc::downgrade(&self.registry),
+                self.counters.clone(),
+            );
         }
         let listener = TcpListener::bind(addr).await?;
         let local_addr = listener.local_addr()?;
@@ -249,11 +262,21 @@ impl BoundBroker {
         let auth = self.broker.auth.clone();
         let registry = self.broker.registry.clone();
         let shutdown = self.shutdown_rx.clone();
+        let counters = self.broker.counters.clone();
+        counters
+            .connections
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        counters
+            .connections_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         tokio::spawn(async move {
             match connection::serve(stream, config, auth, registry, shutdown).await {
                 Ok(()) => tracing::debug!(%peer, "connection closed"),
                 Err(e) => tracing::debug!(%peer, error = %e, "connection failed"),
             }
+            counters
+                .connections
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             // Held until here: the permit is released when the connection ends.
             drop(permit);
         });

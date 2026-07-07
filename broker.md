@@ -6,7 +6,7 @@ shared `ramqp-core`, then adding a server crate on top. Clean-room, no external
 AMQP dependencies (same constraint as the client). Clustered from v1; single
 protocol, done excellently; **fast and light before anything else**.
 
-> **Status: building — Phases 0–8 complete.** See §11 checkboxes. The broker runs **clustered**:
+> **Status: building — Phases 0–9 complete.** See §11 checkboxes. The broker runs **clustered**:
 > a 3-node cluster forms from static seeds over the inter-node fabric (one
 > multiplexed TCP connection per peer pair carrying every Raft group + the
 > forwarded data plane), quorum queues are declared through the replicated
@@ -509,10 +509,10 @@ link/session → negotiate/mux/heartbeat → txn/sasl splits.
 ### Phase 8 — Transactions
 - [ ] `amqp:coordinator` target + txn coordinator (commit/rollback), cluster-aware. Commit.
 
-### Phase 9 — Auth, limits, management
-- [ ] Pluggable authn/authz + per-address permissions; SCRAM credential store.
-- [~] Resource limits, backpressure, slow-loris guards, multi-tenant vhosts — **partially landed ahead of schedule** via the hardening pass: connection cap (`max_connections`), auto-declare cap (`max_queues`), and the slow-loris handshake timeout are in; per-tenant vhosts and richer backpressure remain.
-- [ ] Management/admin API + Prometheus metrics export (off the hot path). Commit.
+### Phase 9 — Auth, limits, management ✅
+- [x] Pluggable authn/authz + per-address permissions; SCRAM credential store. Landed as: the `Authenticator` trait grows `scram_verifier` (verifier-based storage — salted+iterated, no plaintext at rest) and `authorize(identity, vhost, address, operation)`; the SASL server flow speaks SCRAM-SHA-1/-256/-512 (full RFC 5802 exchange incl. the server-final signature in the outcome's additional-data, mutual auth against the unmodified client); `StaticScram` is the built-in verifier store. Every link attach is authorized BEFORE queue resolution (an unauthorized attach cannot even auto-declare); refusals are link-level (`unauthorized-access`, session survives); the transaction coordinator authorizes as `$coordinator`.
+- [x] Resource limits, backpressure, slow-loris guards, multi-tenant vhosts — connection cap (`max_connections`), auto-declare cap (`max_queues`), slow-loris handshake timeout, bounded queue depth/policy `max_length`, bounded txn staging, and now **vhosts**: an `open.hostname` of `vhost:<name>` namespaces every queue (name, storage, catalog, policies, permissions) as `<vhost>/<name>` — same address, different vhost, different queue (tested). Dead-letter targets compose across the scheme (a per-vhost policy addresses `/queues/<vhost>/dead`).
+- [x] Management/admin API + Prometheus metrics export (off the hot path): `BrokerConfig::management_listen` / brokerd `--management-listen` serves a dependency-free HTTP endpoint — `GET /metrics` (Prometheus text: connections, RSS, per-queue ready/unacked/consumer gauges) and `GET /queues` (JSON inspection). All queue stats are collected at scrape time by asking the actors (a `Stats` mailbox message) — nothing on the message path. Queue delete + a richer admin protocol ride with the management follow-up. Commit.
 
 ### Phase 10 — Interop, conformance, perf, docs
 - [~] Interop matrix: our client⇄our broker; our broker⇄RabbitMQ 4.x / Artemis / Qpid clients; `fe2o3-amqp` client — **our-client⇄our-broker is in CI** (the same `tests/broker.rs` suite that runs against RabbitMQ/Artemis, run against ramqp-broker); the cross-broker and other-client legs remain.

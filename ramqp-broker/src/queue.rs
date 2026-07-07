@@ -108,6 +108,22 @@ pub(crate) enum QueueMsg {
         /// Which subscriber.
         sub: SubId,
     },
+    /// Report queue statistics (management surface; never on the hot path).
+    Stats {
+        /// Where to reply.
+        reply: tokio::sync::oneshot::Sender<QueueStats>,
+    },
+}
+
+/// A point-in-time queue statistics snapshot.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct QueueStats {
+    /// Messages ready to dispatch.
+    pub ready: usize,
+    /// Messages dispatched, awaiting settlement.
+    pub unacked: usize,
+    /// Attached consumers.
+    pub consumers: usize,
 }
 
 /// Where to confirm an unsettled publish once stored (or refuse it).
@@ -269,6 +285,13 @@ async fn run(name: String, mut rx: mpsc::Receiver<QueueMsg>, policy: EffectivePo
                         }
                     }
                 }
+            }
+            QueueMsg::Stats { reply } => {
+                let _ = reply.send(QueueStats {
+                    ready: ready.len(),
+                    unacked: unacked.len(),
+                    consumers: subs.len(),
+                });
             }
             QueueMsg::Unsubscribe { sub } => {
                 subs.retain(|s| s.id != sub);

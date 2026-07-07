@@ -52,6 +52,11 @@ pub struct BrokerConfig {
     /// page out to disk under `data_dir` (deep queues must not live in RAM —
     /// broker.md §3.1/§8). Ignored without a `data_dir`.
     pub resident_bytes_max: usize,
+    /// Management/metrics HTTP listen address (e.g. `127.0.0.1:15692`):
+    /// `GET /metrics` (Prometheus) and `GET /queues` (JSON). `None` (the
+    /// default) disables the endpoint. No auth — bind it to loopback or a
+    /// management network.
+    pub management_listen: Option<String>,
     /// Queue policies: `(name prefix, policy)` pairs, first match wins (an
     /// empty prefix matches every queue). Matched against the normalized
     /// queue name (no `/queues/` etc. prefix) at declaration. The management
@@ -139,6 +144,7 @@ impl Default for BrokerConfig {
             cluster: None,
             data_dir: None,
             resident_bytes_max: 64 * 1024 * 1024,
+            management_listen: None,
             policies: Vec::new(),
         }
     }
