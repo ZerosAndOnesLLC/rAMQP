@@ -100,7 +100,12 @@ async fn run(
         )
         .await;
     if let Err(e) = replayed {
-        tracing::error!(queue = %name, error = %e, "log replay never completed; recovered messages may be stranded");
+        // Serving with a PARTIALLY-seeded ready set would strand every
+        // message applied after the seed until the next restart. Exit
+        // instead: the proxy/registry evicts the dead mailbox and respawns,
+        // which retries the wait (MED-11).
+        tracing::error!(queue = %name, error = %e, "log replay never completed; exiting for respawn");
+        return;
     }
 
     let mut subs: Vec<Subscriber> = Vec::new();
@@ -129,18 +134,31 @@ async fn run(
     let mut rr: usize = 0;
     let mut mailbox_open = true;
     let mut metrics = raft.metrics();
-    let self_id = metrics.borrow().id;
+    let (self_id, initial_term) = {
+        let m = metrics.borrow();
+        (m.id, m.current_term)
+    };
 
     while mailbox_open || !commits.is_empty() {
         tokio::select! {
             changed = metrics.changed(), if exit_on_demotion => {
-                let leader = metrics.borrow().current_leader;
-                if changed.is_err() || leader != Some(self_id) {
+                let (leader, term) = {
+                    let m = metrics.borrow();
+                    (m.current_leader, m.current_term)
+                };
+                // A demote→re-elect pair can coalesce into ONE watch
+                // notification that still reads `leader == self` — but the
+                // interim leader's enqueues were applied to the shared state
+                // machine without entering this actor's ready set (stranded
+                // until restart). A term change while we look like the
+                // leader means exactly that: exit and let the respawn
+                // re-seed from applied state (MED-7).
+                if changed.is_err() || leader != Some(self_id) || term != initial_term {
                     // Demoted (or the Raft core stopped): stop immediately.
                     // Dropped commit futures leave their publishes
                     // unconfirmed — the proxy retries them against the new
                     // leader; unsettled dispatches redeliver from state.
-                    tracing::info!(queue = %name, ?leader, "leadership lost; quorum actor exiting");
+                    tracing::info!(queue = %name, ?leader, term, "leadership lost or re-won; quorum actor exiting");
                     return;
                 }
             }
@@ -521,6 +539,17 @@ fn dispatch(
         } else {
             tracing::debug!(queue = %name, sub = sub_id, "subscriber connection closed");
             ready.insert(msg_id);
+            // Requeue everything ELSE the dead subscriber held: without a
+            // clean Unsubscribe its in-flights would stay undeliverable on a
+            // live actor forever (MED-9).
+            inflight.retain(|id, owner| {
+                if *owner == sub_id {
+                    ready.insert(*id);
+                    false
+                } else {
+                    true
+                }
+            });
             subs.retain(|s| s.id != sub_id);
         }
     }

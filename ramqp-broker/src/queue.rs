@@ -432,9 +432,22 @@ async fn dispatch(
         if sub.conn.send(cmd).is_ok() {
             unacked.insert(msg.id, (msg, sub_id));
         } else {
-            // Connection gone: drop the subscriber, put the message back.
+            // Connection gone: drop the subscriber, put the message back —
+            // and requeue everything ELSE it held (without a clean
+            // Unsubscribe those in-flights would strand forever, MED-9).
             tracing::debug!(queue = %name, sub = sub_id, "subscriber connection closed");
             ready.push_front(msg);
+            let mut orphaned: Vec<u64> = unacked
+                .iter()
+                .filter(|(_, (_, owner))| *owner == sub_id)
+                .map(|(id, _)| *id)
+                .collect();
+            orphaned.sort_unstable();
+            for id in orphaned.into_iter().rev() {
+                if let Some((stored, _)) = unacked.remove(&id) {
+                    ready.push_front(stored);
+                }
+            }
             subs.retain(|s| s.id != sub_id);
         }
     }
@@ -669,6 +682,71 @@ mod tests {
             got2 += 1;
         }
         assert_eq!((got1, got2), (2, 2));
+    }
+
+    /// MED-9 (issue #19): a subscriber whose connection channel drops
+    /// WITHOUT a clean Unsubscribe must have ALL its in-flight messages
+    /// requeued when the dead channel is detected — not just the one whose
+    /// send failed.
+    #[tokio::test]
+    async fn dead_subscriber_requeues_all_its_inflights() {
+        let q = spawn("t".into(), EffectivePolicy::depth_only(100));
+        let (c1_tx, mut c1_rx) = mpsc::unbounded_channel();
+        let s1 = subscribe(&q, &c1_tx, 1).await;
+        q.tx.send(QueueMsg::Demand {
+            sub: s1,
+            credit: 10,
+            drain: false,
+        })
+        .await
+        .unwrap();
+        // Two messages go in flight to s1.
+        for b in [b"m1".as_slice(), b"m2"] {
+            q.tx.send(QueueMsg::Publish {
+                body: Bytes::copy_from_slice(b),
+                ack: None,
+            })
+            .await
+            .unwrap();
+        }
+        for _ in 0..2 {
+            assert!(matches!(
+                c1_rx.recv().await.unwrap(),
+                ConnCmd::Deliver { .. }
+            ));
+        }
+        // The consumer's channel dies with NO Unsubscribe; a third publish
+        // makes the actor detect it (the send fails).
+        drop(c1_rx);
+        q.tx.send(QueueMsg::Publish {
+            body: Bytes::from_static(b"m3"),
+            ack: None,
+        })
+        .await
+        .unwrap();
+
+        // A fresh consumer must receive ALL THREE messages.
+        let (c2_tx, mut c2_rx) = mpsc::unbounded_channel();
+        let s2 = subscribe(&q, &c2_tx, 2).await;
+        q.tx.send(QueueMsg::Demand {
+            sub: s2,
+            credit: 10,
+            drain: false,
+        })
+        .await
+        .unwrap();
+        let mut got = Vec::new();
+        for _ in 0..3 {
+            let cmd = tokio::time::timeout(std::time::Duration::from_secs(5), c2_rx.recv())
+                .await
+                .expect("all in-flights requeued (m1/m2 were stranded before the fix)")
+                .expect("delivery");
+            if let ConnCmd::Deliver { body, .. } = cmd {
+                got.push(body);
+            }
+        }
+        got.sort();
+        assert_eq!(got, vec!["m1", "m2", "m3"]);
     }
 
     #[tokio::test]

@@ -374,6 +374,19 @@ async fn dispatch(
         } else {
             tracing::debug!(queue = %name, sub = sub_id, "subscriber connection closed");
             ready.insert(msg_id, (enqueued_ms, len));
+            // Requeue everything ELSE the dead subscriber held (MED-9).
+            let mut orphaned: Vec<(u64, u64, usize)> = Vec::new();
+            inflight.retain(|id, (owner, ms, l)| {
+                if *owner == sub_id {
+                    orphaned.push((*id, *ms, *l));
+                    false
+                } else {
+                    true
+                }
+            });
+            for (id, ms, l) in orphaned {
+                ready.insert(id, (ms, l));
+            }
             subs.retain(|s| s.id != sub_id);
         }
     }
