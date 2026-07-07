@@ -251,6 +251,19 @@ impl Spill {
         }
     }
 
+    /// Fsync every segment file. Called before a snapshot referencing
+    /// spilled bodies is durably recorded: once the log purges behind that
+    /// snapshot, these bytes are the ONLY copy — unsynced pages lost to a
+    /// power cut would silently corrupt every spilled body the snapshot
+    /// references.
+    pub fn sync_all(&self) -> Result<(), String> {
+        let inner = self.inner.lock().expect("spill lock");
+        for segment in inner.segments.values() {
+            segment.file.sync_data().map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
     /// Diagnostics: (segment count, total on-disk bytes).
     pub fn stats(&self) -> (usize, u64) {
         let inner = self.inner.lock().expect("spill lock");

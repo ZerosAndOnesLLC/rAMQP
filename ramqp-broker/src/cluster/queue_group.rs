@@ -315,15 +315,29 @@ impl ReplicatedState for QueueState {
         let _unpin = Unpin(self.paging.as_ref().map(|p| &p.spill));
 
         let mut messages = Vec::with_capacity(self.messages.len());
+        let mut spilled = false;
         for (id, m) in &self.messages {
             let body = match &m.body {
                 StoredBody::Resident(bytes) => PortableBody::Inline(bytes.to_vec()),
                 // Keep spilled bodies external: a deep queue's snapshot must
                 // not materialize gigabytes (§3.1). Node-local by design —
                 // see PortableBody::External.
-                StoredBody::Spilled(r) => PortableBody::External(*r),
+                StoredBody::Spilled(r) => {
+                    spilled = true;
+                    PortableBody::External(*r)
+                }
             };
             messages.push((*id, m.failures, m.enqueued_ms, body));
+        }
+        if spilled {
+            // The snapshot's External refs make the segment bytes the only
+            // copy once the log purges behind it — they must be durable
+            // BEFORE the snapshot pointer is.
+            self.paging
+                .as_ref()
+                .expect("spilled body implies paging")
+                .spill
+                .sync_all()?;
         }
         bincode::serialize(&PortableState {
             next_msg_id: self.next_msg_id,

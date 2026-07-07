@@ -193,6 +193,20 @@ impl SnapshotBlob {
     }
 }
 
+/// Write a snapshot blob so it survives power loss: create the directory,
+/// write the bytes, fsync the file, then fsync the directory (the entry
+/// itself must be durable — without it a crash can leave the durable
+/// snapshot pointer naming a file that never made it to disk, which recovery
+/// reads as silent total state loss below the purge marker).
+fn write_blob_durably(dir: &std::path::Path, path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let mut file = std::fs::File::create(path)?;
+    std::io::Write::write_all(&mut file, data)?;
+    file.sync_all()?;
+    std::fs::File::open(dir)?.sync_all()?;
+    Ok(())
+}
+
 #[derive(Debug)]
 struct Inner<C: RaftTypeConfig, S> {
     /// The Raft log.
@@ -334,6 +348,18 @@ impl<C: RaftTypeConfig, S> SharedStore<C, S> {
                     .map_err(|e| format!("snapshot state restore: {e}"))?;
                 inner.last_applied = payload.last_applied;
                 inner.last_membership = payload.last_membership;
+                // Continue the snapshot-id counter past the recovered
+                // snapshot: a fresh counter would rebuild at the same applied
+                // index under the SAME file name, truncating the only copy of
+                // the current snapshot in place (torn blob on crash).
+                if let Some(idx) = meta
+                    .snapshot_id
+                    .rsplit('-')
+                    .next()
+                    .and_then(|s| s.parse::<u64>().ok())
+                {
+                    inner.snapshot_idx = idx;
+                }
                 inner.snapshot = Some((meta, blob));
             }
             inner.persist = Some(sink);
@@ -439,12 +465,12 @@ where
                 };
                 let data = bincode::serialize(&payload).map_err(|e| e.to_string())?;
                 // Deep paged states: park the blob on disk so the snapshot does
-                // not double the queue's RSS.
+                // not double the queue's RSS. Written durably — this blob may
+                // become the ONLY copy of the state once the log purges.
                 let blob = match &snapshot_dir {
                     Some(dir) => {
-                        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
                         let path = dir.join(format!("snapshot-{idx}.bin"));
-                        std::fs::write(&path, &data).map_err(|e| e.to_string())?;
+                        write_blob_durably(dir, &path, &data).map_err(|e| e.to_string())?;
                         SnapshotBlob::File(path)
                     }
                     None => SnapshotBlob::Memory(data.clone()),
@@ -659,28 +685,41 @@ where
                 &std::io::Error::other(e),
             )
         })?;
-        let (blob, persist) = {
+        let (blob, persist, old_blob) = {
             let mut inner = self.lock();
             inner.last_applied = payload.last_applied;
             inner.last_membership = payload.last_membership;
             inner.state = state;
             let blob = match &inner.snapshot_dir {
-                Some(dir) => std::fs::create_dir_all(dir)
-                    .and_then(|()| {
-                        let path = dir.join(format!("snapshot-{}.bin", meta.snapshot_id));
-                        std::fs::write(&path, &data).map(|()| path)
-                    })
-                    .map(SnapshotBlob::File)
-                    .unwrap_or(SnapshotBlob::Memory(data)),
+                Some(dir) => {
+                    let path = dir.join(format!("snapshot-{}.bin", meta.snapshot_id));
+                    match write_blob_durably(dir, &path, &data) {
+                        Ok(()) => SnapshotBlob::File(path),
+                        Err(e) => {
+                            // Degraded but safe: the blob rides inline through
+                            // the sink instead (and the old file survives
+                            // until the new pointer is durable).
+                            tracing::warn!(error = %e, "snapshot blob write failed; keeping blob in memory");
+                            SnapshotBlob::Memory(data)
+                        }
+                    }
+                }
                 None => SnapshotBlob::Memory(data),
             };
-            if let Some((_, SnapshotBlob::File(old))) = &inner.snapshot
-                && !matches!(&blob, SnapshotBlob::File(new) if new == old)
-            {
-                let _ = std::fs::remove_file(old);
-            }
+            // The old blob file is NOT deleted here: a crash between deleting
+            // it and durably recording the new pointer would leave recovery
+            // pointing at nothing — an empty state below a durable purge
+            // marker. Deletion waits until the new pointer is durable.
+            let old_blob = match &inner.snapshot {
+                Some((_, SnapshotBlob::File(old)))
+                    if !matches!(&blob, SnapshotBlob::File(new) if new == old) =>
+                {
+                    Some(old.clone())
+                }
+                _ => None,
+            };
             inner.snapshot = Some((meta.clone(), blob.clone()));
-            (blob, inner.persist.clone())
+            (blob, inner.persist.clone(), old_blob)
         };
         // Record the installed snapshot durably (recovery restarts from it).
         if let Some(sink) = persist {
@@ -695,6 +734,11 @@ where
                 .map_err(|e| {
                     openraft::StorageIOError::write_snapshot(None, &std::io::Error::other(e))
                 })?;
+        }
+        // Only now — with the new snapshot durably recorded — may the
+        // previous blob go away.
+        if let Some(old) = old_blob {
+            let _ = std::fs::remove_file(&old);
         }
         Ok(())
     }

@@ -262,9 +262,24 @@ impl Store {
             (Some(m), Some(b), _) => Some((m, SnapshotPersist::Inline(b))),
             (Some(m), None, Some(p)) => {
                 let path = std::path::PathBuf::from(String::from_utf8_lossy(&p).into_owned());
-                path.exists().then_some((m, SnapshotPersist::File(path)))
+                // A durable pointer to a missing blob is data loss (the log
+                // below the purge marker exists only in that blob). Refuse to
+                // start rather than silently recovering an empty state.
+                if !path.exists() {
+                    return Err(format!(
+                        "raft group {group}: snapshot blob missing at {} — refusing to \
+                         recover an empty state below the purge marker",
+                        path.display()
+                    ));
+                }
+                Some((m, SnapshotPersist::File(path)))
             }
-            _ => None,
+            (Some(_), None, None) => {
+                return Err(format!(
+                    "raft group {group}: snapshot pointer has no blob or path — corrupt hard state"
+                ));
+            }
+            (None, _, _) => None,
         };
         let log = txn.open_table(RAFT_LOG).map_err(|e| e.to_string())?;
         let mut entries = Vec::new();
