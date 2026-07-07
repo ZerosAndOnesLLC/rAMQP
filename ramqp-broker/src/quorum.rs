@@ -85,6 +85,21 @@ async fn run(
     policy: EffectivePolicy,
     exit_on_demotion: bool,
 ) {
+    // A recovered (or newly-led) group may still be REPLAYING committed log
+    // entries into the state machine; seeding the ready-set before the
+    // replay finishes would strand recovered messages (never dispatched).
+    // Wait until applied catches up with the log.
+    let replayed = raft
+        .wait(Some(std::time::Duration::from_secs(30)))
+        .metrics(
+            |m| m.last_applied.map(|l| l.index).unwrap_or(0) >= m.last_log_index.unwrap_or(0),
+            "log replay complete",
+        )
+        .await;
+    if let Err(e) = replayed {
+        tracing::error!(queue = %name, error = %e, "log replay never completed; recovered messages may be stranded");
+    }
+
     let mut subs: Vec<Subscriber> = Vec::new();
     // Which subscriber holds each in-flight (dispatched, unsettled) message.
     let mut inflight: HashMap<u64, SubId> = HashMap::new();

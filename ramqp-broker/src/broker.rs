@@ -64,6 +64,17 @@ impl Broker {
         if let Some(cluster) = &self.config.cluster
             && self.registry.cluster().is_none()
         {
+            let persist = self.registry.persist_factory().await;
+            // With the store feature + a data dir, a clustered bind REQUIRES
+            // the store: silently starting with an empty metadata group
+            // would shadow persisted state (e.g. while a previous
+            // instance's file lock lingers). Fail the bind; callers retry.
+            #[cfg(feature = "store-redb")]
+            if self.config.data_dir.is_some() && persist.is_none() {
+                return Err(std::io::Error::other(
+                    "durable store not openable (previous instance still holds the lock?)",
+                ));
+            }
             let node = ClusterNode::bootstrap(NodeSettings {
                 node_id: cluster.node_id,
                 listen: cluster.listen.clone(),
@@ -74,6 +85,7 @@ impl Broker {
                 resident_bytes_max: self.config.resident_bytes_max,
                 policies: self.config.policies.clone(),
                 dlx: Some(self.dlx.clone()),
+                persist,
             })
             .await?;
             self.registry.set_cluster(node);

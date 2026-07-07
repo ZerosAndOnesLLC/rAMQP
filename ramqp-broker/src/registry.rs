@@ -121,6 +121,23 @@ impl QueueRegistry {
             .cloned()
     }
 
+    /// The Raft persistence factory (`store-redb` + data dir), if available.
+    #[cfg(feature = "store-redb")]
+    pub async fn persist_factory(
+        &self,
+    ) -> Option<Arc<dyn crate::cluster::store::RaftPersistFactory>> {
+        let store = self.store().await?;
+        Some(Arc::new(store) as Arc<dyn crate::cluster::store::RaftPersistFactory>)
+    }
+
+    /// Without `store-redb` there is no Raft persistence.
+    #[cfg(not(feature = "store-redb"))]
+    pub async fn persist_factory(
+        &self,
+    ) -> Option<Arc<dyn crate::cluster::store::RaftPersistFactory>> {
+        None
+    }
+
     /// Attach the cluster node (idempotent; first caller wins).
     pub fn set_cluster(&self, node: Arc<ClusterNode>) {
         let _ = self.cluster.set(node);
@@ -193,15 +210,33 @@ impl QueueRegistry {
                                     })?;
                                 proxy::spawn(name.to_owned(), node.clone())
                             }
-                            None => spawn_quorum_group(
-                                name.to_owned(),
-                                self.node_id,
-                                self.policy_for(name),
-                                self.data_dir.as_deref(),
-                                self.resident_bytes_max,
-                            )
-                            .await
-                            .ok_or(())?,
+                            None => {
+                                let persist = self.persist_factory().await;
+                                // With a data dir + the store feature, quorum
+                                // queues REQUIRE the store: falling back to a
+                                // fresh in-memory group would shadow (and wipe
+                                // the spill of) persisted state — e.g. while a
+                                // previous instance's file lock lingers.
+                                // Refuse instead; the next attach retries.
+                                #[cfg(feature = "store-redb")]
+                                if self.data_dir.is_some() && persist.is_none() {
+                                    tracing::warn!(
+                                        queue = %name,
+                                        "durable store not openable yet; refusing quorum declare"
+                                    );
+                                    return Err(());
+                                }
+                                spawn_quorum_group(
+                                    name.to_owned(),
+                                    self.node_id,
+                                    self.policy_for(name),
+                                    self.data_dir.as_deref(),
+                                    self.resident_bytes_max,
+                                    persist,
+                                )
+                                .await
+                                .ok_or(())?
+                            }
                         },
                         #[cfg(feature = "store-redb")]
                         QueueKind::Durable => {
@@ -269,6 +304,7 @@ async fn spawn_quorum_group(
     policy: EffectivePolicy,
     data_dir: Option<&std::path::Path>,
     resident_bytes_max: usize,
+    persist: Option<Arc<dyn crate::cluster::store::RaftPersistFactory>>,
 ) -> Option<QueueHandle> {
     let config = openraft::Config {
         heartbeat_interval: 100,
@@ -291,9 +327,14 @@ async fn spawn_quorum_group(
     .validate()
     .map_err(|e| tracing::error!(queue = %name, error = %e, "quorum config invalid"))
     .ok()?;
-    let store = crate::cluster::node::paged_queue_store(data_dir, &name, resident_bytes_max)
-        .map_err(|e| tracing::error!(queue = %name, error = %e, "paged store open failed"))
-        .ok()?;
+    let store = crate::cluster::node::paged_queue_store(
+        data_dir,
+        &name,
+        resident_bytes_max,
+        persist.as_ref(),
+    )
+    .map_err(|e| tracing::error!(queue = %name, error = %e, "paged store open failed"))
+    .ok()?;
     let (log_store, state_machine) = openraft::storage::Adaptor::new(store.clone());
     let raft = QueueRaft::new(
         node_id,
@@ -305,13 +346,24 @@ async fn spawn_quorum_group(
     .await
     .map_err(|e| tracing::error!(queue = %name, error = %e, "quorum raft init failed"))
     .ok()?;
-    raft.initialize(std::collections::BTreeMap::from([(
-        node_id,
-        BasicNode::new("local"),
-    )]))
-    .await
-    .map_err(|e| tracing::error!(queue = %name, error = %e, "quorum initialize failed"))
-    .ok()?;
+    match raft
+        .initialize(std::collections::BTreeMap::from([(
+            node_id,
+            BasicNode::new("local"),
+        )]))
+        .await
+    {
+        Ok(()) => {}
+        // A recovered (persisted) group is already initialized — expected
+        // on restart, not an error.
+        Err(openraft::error::RaftError::APIError(
+            openraft::error::InitializeError::NotAllowed(_),
+        )) => {}
+        Err(e) => {
+            tracing::error!(queue = %name, error = %e, "quorum initialize failed");
+            return None;
+        }
+    }
     raft.wait(Some(std::time::Duration::from_secs(10)))
         .current_leader(node_id, "single-replica leader")
         .await
@@ -383,5 +435,81 @@ mod tests {
         // ...but already-declared queues still resolve.
         assert!(r.resolve("/queues/a").await.is_some());
         assert!(r.resolve("b").await.is_some());
+    }
+
+    /// Probe: standalone quorum persistence round trip at the module level.
+    #[cfg(feature = "store-redb")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn quorum_group_persists_and_recovers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = BrokerConfig {
+            data_dir: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        };
+        // First life: publish 3.
+        {
+            let r = QueueRegistry::new(&config);
+            let h = r.resolve("/quorum/persist-probe").await.expect("resolve");
+            for i in 0..3u8 {
+                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+                h.tx.send(crate::queue::QueueMsg::Publish {
+                    body: bytes::Bytes::from(vec![i; 4]),
+                    ack: Some(crate::queue::PublishAck {
+                        conn: tx,
+                        channel: 0,
+                        handle: 0,
+                        binding_gen: 0,
+                        delivery_id: i as u32,
+                    }),
+                })
+                .await
+                .expect("publish");
+                match rx.recv().await {
+                    Some(crate::queue::ConnCmd::SettleIncoming { accepted, .. }) => {
+                        assert!(accepted, "publish {i} must commit")
+                    }
+                    other => panic!("expected settle, got {other:?}"),
+                }
+            }
+            // registry drops here; actors/raft wind down
+        }
+        // Give the store writer thread time to release the lock.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        // Second life: the queue recovers 3 ready messages.
+        let r = QueueRegistry::new(&config);
+        let h = match r.resolve("/quorum/persist-probe").await {
+            Some(h) => h,
+            None => panic!("recovered resolve failed"),
+        };
+        let (conn_tx, mut conn_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        h.tx.send(crate::queue::QueueMsg::Subscribe {
+            conn: conn_tx,
+            channel: 0,
+            handle: 0,
+            binding_gen: 0,
+            reply: reply_tx,
+        })
+        .await
+        .expect("subscribe");
+        let sub = reply_rx.await.expect("sub id");
+        h.tx.send(crate::queue::QueueMsg::Demand {
+            sub,
+            credit: 10,
+            drain: false,
+        })
+        .await
+        .expect("demand");
+        for i in 0..3u8 {
+            let cmd = tokio::time::timeout(std::time::Duration::from_secs(10), conn_rx.recv())
+                .await
+                .expect("recovered delivery in time")
+                .expect("delivery");
+            match cmd {
+                crate::queue::ConnCmd::Deliver { body, .. } => assert_eq!(&body[..], &[i; 4]),
+                other => panic!("expected deliver, got {other:?}"),
+            }
+        }
     }
 }

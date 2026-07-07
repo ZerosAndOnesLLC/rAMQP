@@ -32,7 +32,7 @@ use super::fabric::{
 };
 use super::meta::{MetaCommand, MetaResponse, MetaWriteError, QueueSpec, QueueType};
 use super::queue_group::{QueueRaft, QueueStore, QueueTypeConfig};
-use super::store::MetaStore;
+use super::store::{MetaState, MetaStore};
 use super::{MetaRaft, MetaTypeConfig, NodeId};
 use crate::queue::{ConnCmd, PublishAck, QueueHandle, QueueMsg};
 use crate::quorum;
@@ -62,6 +62,9 @@ pub struct NodeSettings {
     pub policies: Vec<(String, crate::config::QueuePolicy)>,
     /// The dead-letter router (None in bare-node tests).
     pub dlx: Option<crate::policy::DeadLetterSender>,
+    /// On-disk Raft hard-state persistence (`store-redb` + `data_dir`):
+    /// groups recover their log/vote/snapshot across restarts.
+    pub persist: Option<Arc<dyn super::store::RaftPersistFactory>>,
 }
 
 /// One local member of a per-queue Raft group.
@@ -136,7 +139,14 @@ impl ClusterNode {
                 .validate()
                 .map_err(std::io::Error::other)?,
         );
-        let meta_store = MetaStore::default();
+        let meta_store = match &settings.persist {
+            Some(factory) => {
+                let (sink, recovery) = factory.open_group("meta").map_err(std::io::Error::other)?;
+                MetaStore::new_persistent(MetaState::default(), None, sink, recovery)
+                    .map_err(std::io::Error::other)?
+            }
+            None => MetaStore::default(),
+        };
         let (log_store, state_machine) = openraft::storage::Adaptor::new(meta_store.clone());
         let meta = MetaRaft::new(
             settings.node_id,
@@ -386,6 +396,7 @@ impl ClusterNode {
             self.settings.data_dir.as_deref(),
             name,
             self.settings.resident_bytes_max,
+            self.settings.persist.as_ref(),
         )?;
         let (log_store, state_machine) = openraft::storage::Adaptor::new(store.clone());
         let raft = QueueRaft::new(
@@ -663,22 +674,48 @@ impl ClusterNode {
 use super::fnv1a;
 
 /// Build a queue group's store: paged (spill + on-disk snapshot blobs) when
-/// a data dir is available, plain in-memory otherwise.
+/// a data dir is available, plain in-memory otherwise; persistent (log/vote/
+/// snapshot recovered and written through) when a persistence factory is
+/// wired too.
 pub(crate) fn paged_queue_store(
     data_dir: Option<&std::path::Path>,
     queue: &str,
     resident_bytes_max: usize,
+    persist: Option<&Arc<dyn super::store::RaftPersistFactory>>,
 ) -> Result<QueueStore, String> {
-    match data_dir {
-        Some(dir) => {
-            let (spill_dir, snapshot_dir) = super::queue_dirs(dir, queue);
+    let Some(dir) = data_dir else {
+        return Ok(QueueStore::default());
+    };
+    let (spill_dir, snapshot_dir) = super::queue_dirs(dir, queue);
+    match persist {
+        Some(factory) => {
+            let (sink, recovery) = factory.open_group(&format!("queue/{queue}"))?;
+            // Preserve spill segments only when there is persisted state
+            // that may reference them.
+            let spill = if recovery.snapshot.is_some() {
+                super::paging::Spill::open_preserving(spill_dir)?
+            } else {
+                super::paging::Spill::open(spill_dir)?
+            };
+            let store = QueueStore::new_persistent(
+                super::queue_group::QueueState::paged(spill.clone(), resident_bytes_max),
+                Some(snapshot_dir),
+                sink,
+                recovery,
+            )?;
+            // Seed recovered segments' live counts from the restored state;
+            // unreferenced leftovers reclaim here.
+            let counts = store.with_state(|s| s.spill_live_counts());
+            spill.set_live(&counts);
+            Ok(store)
+        }
+        None => {
             let spill = super::paging::Spill::open(spill_dir)?;
             Ok(QueueStore::new_with(
                 super::queue_group::QueueState::paged(spill, resident_bytes_max),
                 Some(snapshot_dir),
             ))
         }
-        None => Ok(QueueStore::default()),
     }
 }
 
@@ -1259,6 +1296,7 @@ mod tests {
                 resident_bytes_max: usize::MAX,
                 policies: Vec::new(),
                 dlx: None,
+                persist: None,
             })
             .await
             .expect("bootstrap");

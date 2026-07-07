@@ -27,6 +27,13 @@ const MESSAGES: TableDefinition<(u64, u64), (u32, u64, &[u8])> = TableDefinition
 const QUEUES: TableDefinition<&str, u64> = TableDefinition::new("queues");
 /// Single-row metadata: key → counter (`"next_queue_id"`).
 const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
+/// Raft groups: group name → group id.
+const RAFT_GROUPS: TableDefinition<&str, u64> = TableDefinition::new("raft_groups");
+/// Raft log: `(group id, index)` → encoded entry.
+const RAFT_LOG: TableDefinition<(u64, u64), &[u8]> = TableDefinition::new("raft_log");
+/// Raft hard state: `(group id, key)` → encoded value (`"vote"`, `"purged"`,
+/// `"snap_meta"`, `"snap_path"`).
+const RAFT_META: TableDefinition<(u64, &str), &[u8]> = TableDefinition::new("raft_meta");
 
 /// How many operations one commit may absorb.
 const COMMIT_BATCH_MAX: usize = 1024;
@@ -45,6 +52,52 @@ pub(crate) enum StoreOp {
     Remove { queue: u64, msg_id: u64 },
     /// Count a failed delivery attempt (requeue with penalty).
     Fail { queue: u64, msg_id: u64 },
+    /// Durably append Raft log entries; `done` fires once fsynced.
+    RaftAppend {
+        group: u64,
+        entries: Vec<(u64, Vec<u8>)>,
+        done: oneshot::Sender<bool>,
+    },
+    /// Durably record a Raft vote.
+    RaftVote {
+        group: u64,
+        vote: Vec<u8>,
+        done: oneshot::Sender<bool>,
+    },
+    /// Remove Raft entries with `index >= since`.
+    RaftTruncate {
+        group: u64,
+        since: u64,
+        done: oneshot::Sender<bool>,
+    },
+    /// Remove Raft entries with `index <= upto`; record the purge marker.
+    RaftPurge {
+        group: u64,
+        upto: u64,
+        marker: Vec<u8>,
+        done: oneshot::Sender<bool>,
+    },
+    /// Record the current snapshot pointer.
+    RaftSnapshot {
+        group: u64,
+        meta: Vec<u8>,
+        path: Vec<u8>,
+        done: oneshot::Sender<bool>,
+    },
+}
+
+impl StoreOp {
+    fn take_done(self) -> Option<oneshot::Sender<bool>> {
+        match self {
+            StoreOp::Insert { done, .. }
+            | StoreOp::RaftAppend { done, .. }
+            | StoreOp::RaftVote { done, .. }
+            | StoreOp::RaftTruncate { done, .. }
+            | StoreOp::RaftPurge { done, .. }
+            | StoreOp::RaftSnapshot { done, .. } => Some(done),
+            StoreOp::Remove { .. } | StoreOp::Fail { .. } => None,
+        }
+    }
 }
 
 /// A handle to the node's durable store.
@@ -73,6 +126,9 @@ impl Store {
             txn.open_table(MESSAGES).map_err(|e| e.to_string())?;
             txn.open_table(QUEUES).map_err(|e| e.to_string())?;
             txn.open_table(META).map_err(|e| e.to_string())?;
+            txn.open_table(RAFT_GROUPS).map_err(|e| e.to_string())?;
+            txn.open_table(RAFT_LOG).map_err(|e| e.to_string())?;
+            txn.open_table(RAFT_META).map_err(|e| e.to_string())?;
             txn.commit().map_err(|e| e.to_string())?;
         }
         let (writer, rx) = mpsc::channel(4096);
@@ -152,6 +208,165 @@ impl Store {
         let value = table.get((queue, msg_id)).ok()??;
         Some(Bytes::copy_from_slice(value.value().2))
     }
+
+    /// The stable id for a Raft group name, allocating one on first use.
+    fn raft_group_id(&self, name: &str) -> Result<u64, String> {
+        {
+            let txn = self.db.begin_read().map_err(|e| e.to_string())?;
+            let table = txn.open_table(RAFT_GROUPS).map_err(|e| e.to_string())?;
+            if let Some(id) = table.get(name).map_err(|e| e.to_string())? {
+                return Ok(id.value());
+            }
+        }
+        let txn = self.db.begin_write().map_err(|e| e.to_string())?;
+        let id = {
+            let mut groups = txn.open_table(RAFT_GROUPS).map_err(|e| e.to_string())?;
+            if let Some(id) = groups.get(name).map_err(|e| e.to_string())? {
+                id.value()
+            } else {
+                let mut meta = txn.open_table(META).map_err(|e| e.to_string())?;
+                let next = meta
+                    .get("next_raft_group")
+                    .map_err(|e| e.to_string())?
+                    .map(|v| v.value())
+                    .unwrap_or(1);
+                meta.insert("next_raft_group", next + 1)
+                    .map_err(|e| e.to_string())?;
+                groups.insert(name, next).map_err(|e| e.to_string())?;
+                next
+            }
+        };
+        txn.commit().map_err(|e| e.to_string())?;
+        Ok(id)
+    }
+
+    /// Load a group's persisted hard state.
+    fn recover_raft(&self, group: u64) -> Result<crate::cluster::store::RaftLogRecovery, String> {
+        let txn = self.db.begin_read().map_err(|e| e.to_string())?;
+        let meta = txn.open_table(RAFT_META).map_err(|e| e.to_string())?;
+        let get = |key: &str| -> Result<Option<Vec<u8>>, String> {
+            Ok(meta
+                .get((group, key))
+                .map_err(|e| e.to_string())?
+                .map(|v| v.value().to_vec()))
+        };
+        let vote = get("vote")?;
+        let purged = get("purged")?;
+        let snap_meta = get("snap_meta")?;
+        let snap_path = get("snap_path")?;
+        let snapshot = match (snap_meta, snap_path) {
+            (Some(m), Some(p)) => {
+                let path = std::path::PathBuf::from(String::from_utf8_lossy(&p).into_owned());
+                path.exists().then_some((m, path))
+            }
+            _ => None,
+        };
+        let log = txn.open_table(RAFT_LOG).map_err(|e| e.to_string())?;
+        let mut entries = Vec::new();
+        for entry in log
+            .range((group, 0)..=(group, u64::MAX))
+            .map_err(|e| e.to_string())?
+        {
+            let (key, value) = entry.map_err(|e| e.to_string())?;
+            entries.push((key.value().1, value.value().to_vec()));
+        }
+        Ok(crate::cluster::store::RaftLogRecovery {
+            vote,
+            purged,
+            entries,
+            snapshot,
+        })
+    }
+}
+
+/// One group's view of the store as a [`RaftLogSink`]: each call submits an
+/// op to the group-commit writer and resolves when its batch fsyncs.
+#[derive(Debug)]
+struct GroupSink {
+    store: Store,
+    group: u64,
+}
+
+type SinkFuture<'a> = std::pin::Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+
+impl GroupSink {
+    fn run(&self, op_for: impl FnOnce(oneshot::Sender<bool>) -> StoreOp + Send) -> SinkFuture<'_> {
+        let (done_tx, done_rx) = oneshot::channel();
+        let op = op_for(done_tx);
+        Box::pin(async move {
+            self.store.submit(op).await?;
+            match done_rx.await {
+                Ok(true) => Ok(()),
+                Ok(false) => Err("raft persistence commit failed".to_owned()),
+                Err(_) => Err("store writer stopped".to_owned()),
+            }
+        })
+    }
+}
+
+impl crate::cluster::store::RaftLogSink for GroupSink {
+    fn append(&self, entries: Vec<(u64, Vec<u8>)>) -> SinkFuture<'_> {
+        let group = self.group;
+        self.run(move |done| StoreOp::RaftAppend {
+            group,
+            entries,
+            done,
+        })
+    }
+
+    fn save_vote(&self, vote: Vec<u8>) -> SinkFuture<'_> {
+        let group = self.group;
+        self.run(move |done| StoreOp::RaftVote { group, vote, done })
+    }
+
+    fn truncate_since(&self, since: u64) -> SinkFuture<'_> {
+        let group = self.group;
+        self.run(move |done| StoreOp::RaftTruncate { group, since, done })
+    }
+
+    fn purge_upto(&self, upto: u64, marker: Vec<u8>) -> SinkFuture<'_> {
+        let group = self.group;
+        self.run(move |done| StoreOp::RaftPurge {
+            group,
+            upto,
+            marker,
+            done,
+        })
+    }
+
+    fn save_snapshot(&self, meta: Vec<u8>, blob_path: std::path::PathBuf) -> SinkFuture<'_> {
+        let group = self.group;
+        let path = blob_path.to_string_lossy().into_owned().into_bytes();
+        self.run(move |done| StoreOp::RaftSnapshot {
+            group,
+            meta,
+            path,
+            done,
+        })
+    }
+}
+
+impl crate::cluster::store::RaftPersistFactory for Store {
+    fn open_group(
+        &self,
+        group: &str,
+    ) -> Result<
+        (
+            std::sync::Arc<dyn crate::cluster::store::RaftLogSink>,
+            crate::cluster::store::RaftLogRecovery,
+        ),
+        String,
+    > {
+        let id = self.raft_group_id(group)?;
+        let recovery = self.recover_raft(id)?;
+        Ok((
+            std::sync::Arc::new(GroupSink {
+                store: self.clone(),
+                group: id,
+            }),
+            recovery,
+        ))
+    }
 }
 
 /// The group-commit loop: drain a burst, one transaction, one fsync,
@@ -167,7 +382,7 @@ fn writer_loop(db: Arc<Database>, mut rx: mpsc::Receiver<StoreOp>) {
         }
         let committed = apply_batch(&db, &batch).is_ok();
         for op in batch {
-            if let StoreOp::Insert { done, .. } = op {
+            if let Some(done) = op.take_done() {
                 let _ = done.send(committed);
             }
         }
@@ -178,9 +393,51 @@ fn writer_loop(db: Arc<Database>, mut rx: mpsc::Receiver<StoreOp>) {
 fn apply_batch(db: &Database, batch: &[StoreOp]) -> Result<(), String> {
     let txn = db.begin_write().map_err(|e| e.to_string())?;
     {
+        let mut raft_log = txn.open_table(RAFT_LOG).map_err(|e| e.to_string())?;
+        let mut raft_meta = txn.open_table(RAFT_META).map_err(|e| e.to_string())?;
         let mut table = txn.open_table(MESSAGES).map_err(|e| e.to_string())?;
         for op in batch {
             match op {
+                StoreOp::RaftAppend { group, entries, .. } => {
+                    for (index, bytes) in entries {
+                        raft_log
+                            .insert((*group, *index), bytes.as_slice())
+                            .map_err(|e| e.to_string())?;
+                    }
+                }
+                StoreOp::RaftVote { group, vote, .. } => {
+                    raft_meta
+                        .insert((*group, "vote"), vote.as_slice())
+                        .map_err(|e| e.to_string())?;
+                }
+                StoreOp::RaftTruncate { group, since, .. } => {
+                    raft_log
+                        .retain_in((*group, *since)..=(*group, u64::MAX), |_, _| false)
+                        .map_err(|e| e.to_string())?;
+                }
+                StoreOp::RaftPurge {
+                    group,
+                    upto,
+                    marker,
+                    ..
+                } => {
+                    raft_log
+                        .retain_in((*group, 0)..=(*group, *upto), |_, _| false)
+                        .map_err(|e| e.to_string())?;
+                    raft_meta
+                        .insert((*group, "purged"), marker.as_slice())
+                        .map_err(|e| e.to_string())?;
+                }
+                StoreOp::RaftSnapshot {
+                    group, meta, path, ..
+                } => {
+                    raft_meta
+                        .insert((*group, "snap_meta"), meta.as_slice())
+                        .map_err(|e| e.to_string())?;
+                    raft_meta
+                        .insert((*group, "snap_path"), path.as_slice())
+                        .map_err(|e| e.to_string())?;
+                }
                 StoreOp::Insert {
                     queue,
                     msg_id,

@@ -191,6 +191,18 @@ impl QueueState {
             .map(|m| (m.enqueued_ms, m.failures))
     }
 
+    /// Spill segments referenced by the current state (recovery: seeds the
+    /// spill store's live counts).
+    pub fn spill_live_counts(&self) -> std::collections::HashMap<u64, usize> {
+        let mut counts = std::collections::HashMap::new();
+        for m in self.messages.values() {
+            if let StoredBody::Spilled(r) = &m.body {
+                *counts.entry(r.segment).or_insert(0) += 1;
+            }
+        }
+        counts
+    }
+
     fn store_body(&mut self, body: &Bytes) -> StoredBody {
         if let Some(paging) = &self.paging
             && self.resident_bytes + body.len() > paging.resident_max_bytes

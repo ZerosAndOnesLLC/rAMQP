@@ -73,24 +73,77 @@ impl std::fmt::Debug for Spill {
 
 impl Spill {
     /// Open a spill store under `dir`. Any leftover files from a previous
-    /// process are removed — spilled bodies only make sense next to the
-    /// in-memory Raft state that references them (the on-disk log is a
-    /// separate, later slice).
+    /// process are removed — without a persisted Raft log, spilled bodies
+    /// only make sense next to the in-memory state that referenced them.
     pub fn open(dir: PathBuf) -> Result<Spill, String> {
         if dir.exists() {
             std::fs::remove_dir_all(&dir).map_err(|e| e.to_string())?;
         }
+        Self::open_preserving(dir)
+    }
+
+    /// Open a spill store, KEEPING existing segment files — the persisted
+    /// (recovered) Raft state still references them. Recovered segments load
+    /// with a zero live count; call [`set_live`](Spill::set_live) with the
+    /// restored state's per-segment reference counts before any release can
+    /// reach them. New appends always roll a fresh segment.
+    pub fn open_preserving(dir: PathBuf) -> Result<Spill, String> {
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let mut segments = HashMap::new();
+        let mut next_segment = 0u64;
+        for entry in std::fs::read_dir(&dir).map_err(|e| e.to_string())? {
+            let entry = entry.map_err(|e| e.to_string())?;
+            let name = entry.file_name();
+            let Some(id) = name
+                .to_str()
+                .and_then(|n| n.strip_suffix(".seg"))
+                .and_then(|n| n.parse::<u64>().ok())
+            else {
+                continue;
+            };
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(entry.path())
+                .map_err(|e| e.to_string())?;
+            let size = file.metadata().map_err(|e| e.to_string())?.len();
+            segments.insert(
+                id,
+                Segment {
+                    file,
+                    live: 0,
+                    size,
+                },
+            );
+            next_segment = next_segment.max(id + 1);
+        }
         Ok(Spill {
             inner: Arc::new(Mutex::new(Inner {
                 dir,
-                next_segment: 0,
+                next_segment,
                 current: None,
-                segments: HashMap::new(),
+                segments,
                 pins: 0,
                 deferred_delete: Vec::new(),
             })),
         })
+    }
+
+    /// Set recovered segments' live reference counts (from the restored
+    /// state); segments present on disk but no longer referenced are
+    /// reclaimed here.
+    pub fn set_live(&self, counts: &HashMap<u64, usize>) {
+        let mut inner = self.inner.lock().expect("spill lock");
+        let ids: Vec<u64> = inner.segments.keys().copied().collect();
+        for id in ids {
+            let live = counts.get(&id).copied().unwrap_or(0);
+            if let Some(segment) = inner.segments.get_mut(&id) {
+                segment.live = live;
+            }
+            if live == 0 && inner.current != Some(id) {
+                delete_segment(&mut inner, id);
+            }
+        }
     }
 
     /// Append one body, returning where it landed.
