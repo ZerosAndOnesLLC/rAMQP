@@ -201,6 +201,13 @@ impl Proxy {
     /// (Re)resolve the leader and rebuild the downstream binding, migrating
     /// every subscriber and re-arming its outstanding demand.
     async fn rebind(&mut self) -> bool {
+        // Tear the old binding down FIRST. A rebind can land on the SAME
+        // still-alive leader (e.g. a publish timeout under backpressure);
+        // without explicit closes the old downstream subs keep receiving
+        // round-robin dispatches into dropped channels — messages marked
+        // in-flight under a subscriber nobody owns, stranded until the
+        // fabric connection or actor dies.
+        self.teardown_downstream().await;
         self.downstream = None;
         self.local_events = None;
         self.local_events_tx = None;
@@ -231,6 +238,30 @@ impl Proxy {
             }
             tokio::time::sleep(backoff).await;
             backoff = (backoff * 2).min(std::time::Duration::from_secs(1));
+        }
+    }
+
+    /// Close every downstream binding this proxy currently holds: local
+    /// subs unsubscribe from the leader-local actor (requeueing their
+    /// in-flight messages), remote subs close their fabric channels (the
+    /// leader side unsubscribes on receipt).
+    async fn teardown_downstream(&mut self) {
+        match &self.downstream {
+            Some(Downstream::Local { queue }) => {
+                for sub in self.subs.values() {
+                    if let Some(DownSub::Local { sub }) = &sub.down {
+                        let _ = queue.tx.send(QueueMsg::Unsubscribe { sub: *sub }).await;
+                    }
+                }
+            }
+            Some(Downstream::Remote { conn }) => {
+                for sub in self.subs.values() {
+                    if let Some(DownSub::Remote { sub_chan }) = &sub.down {
+                        conn.close_sub(*sub_chan);
+                    }
+                }
+            }
+            None => {}
         }
     }
 
@@ -281,14 +312,27 @@ impl Proxy {
         } else {
             let conn = self.node.peer_conn(leader).await?;
             let (events_tx, events_rx) = mpsc::unbounded_channel();
+            let mut opened: Vec<u64> = Vec::new();
             for (key, sub) in &mut self.subs {
                 let sub_chan = match conn.open_sub(&self.name, events_tx.clone()).await {
                     Ok(chan) => chan,
-                    Err(OpenSubError::NotLeader(hint)) => {
-                        return Err(format!("stale leader {leader} (hint {hint:?})"));
+                    Err(e) => {
+                        // Close the subs THIS attempt already opened; the
+                        // retry re-opens everything, and abandoned leader-side
+                        // subs would strand dispatches (HIGH-2).
+                        for chan in opened {
+                            self.remote_chans.remove(&chan);
+                            conn.close_sub(chan);
+                        }
+                        return Err(match e {
+                            OpenSubError::NotLeader(hint) => {
+                                format!("stale leader {leader} (hint {hint:?})")
+                            }
+                            OpenSubError::Transport(e) => e,
+                        });
                     }
-                    Err(OpenSubError::Transport(e)) => return Err(e),
                 };
+                opened.push(sub_chan);
                 self.remote_chans.insert(sub_chan, *key);
                 sub.down = Some(DownSub::Remote { sub_chan });
                 if sub.outstanding > 0 {
@@ -711,5 +755,90 @@ async fn local_actor_closed(down: &Option<Downstream>) {
     match down {
         Some(Downstream::Local { queue }) => queue.tx.closed().await,
         _ => std::future::pending().await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cluster::node::{ClusterNode, NodeSettings};
+    use crate::queue::QueueStats;
+    use tokio::sync::oneshot;
+
+    async fn single_node() -> Arc<ClusterNode> {
+        // Reserve a real port for the seed address (the node re-binds it).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        drop(listener);
+        let node = ClusterNode::bootstrap(NodeSettings {
+            node_id: 1,
+            listen: addr.clone(),
+            seeds: vec![(1, addr)],
+            replicas: 1,
+            max_queue_depth: 10_000,
+            data_dir: None,
+            resident_bytes_max: usize::MAX,
+            policies: Vec::new(),
+            dlx: None,
+            persist: None,
+        })
+        .await
+        .expect("bootstrap");
+        node.await_membership(std::time::Duration::from_secs(15))
+            .await
+            .expect("membership");
+        node
+    }
+
+    async fn actor_stats(queue: &QueueHandle) -> QueueStats {
+        let (tx, rx) = oneshot::channel();
+        queue
+            .tx
+            .send(QueueMsg::Stats { reply: tx })
+            .await
+            .expect("stats send");
+        rx.await.expect("stats reply")
+    }
+
+    /// The HIGH-2 regression (issue #19): a rebind that lands on the SAME
+    /// still-alive leader must tear down its previous downstream subs —
+    /// otherwise the old subs keep receiving round-robin dispatches into
+    /// dropped channels and those messages strand in flight.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rebind_tears_down_previous_downstream_subs() {
+        let node = single_node().await;
+        node.declare_quorum("rebind-teardown").await.expect("declare");
+
+        let mut proxy = Proxy::new("rebind-teardown".into(), node.clone());
+        assert!(proxy.rebind().await, "initial bind");
+
+        // One consumer bound through the proxy.
+        let (conn_tx, _conn_rx) = mpsc::unbounded_channel();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        proxy
+            .handle_msg(QueueMsg::Subscribe {
+                conn: conn_tx,
+                channel: 0,
+                handle: 1,
+                binding_gen: 1,
+                reply: reply_tx,
+            })
+            .await;
+        reply_rx.await.expect("subscribed");
+
+        let actor = node
+            .leader_actor("rebind-teardown")
+            .await
+            .expect("single node leads");
+        assert_eq!(actor_stats(&actor).await.consumers, 1);
+
+        // Rebind onto the same (still-alive) leader — the HIGH-2 trigger.
+        assert!(proxy.rebind().await, "rebind");
+        assert_eq!(
+            actor_stats(&actor).await.consumers,
+            1,
+            "the old downstream sub must be unsubscribed; only the rebound one remains"
+        );
+        node.stop().await;
     }
 }
