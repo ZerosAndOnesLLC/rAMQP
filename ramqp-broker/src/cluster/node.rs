@@ -60,7 +60,9 @@ pub struct NodeSettings {
     pub data_dir: Option<std::path::PathBuf>,
     /// Per-queue resident-body budget before paging kicks in.
     pub resident_bytes_max: usize,
-    /// Queue policies (prefix-matched; leader-local enforcement).
+    /// Queue policies (prefix-matched; leader-local enforcement). These are
+    /// NODE-LOCAL configuration: keep them identical on every node, or a
+    /// failover silently changes the policy a queue runs under.
     pub policies: Vec<(String, crate::config::QueuePolicy)>,
     /// The dead-letter router (None in bare-node tests).
     pub dlx: Option<crate::policy::DeadLetterSender>,
@@ -625,6 +627,23 @@ impl ClusterNode {
                     self.settings.max_queue_bytes,
                     self.settings.dlx.clone(),
                 );
+                // Dead letters route through THIS node's registry: a
+                // node-local target (transient/durable) lands on whichever
+                // node happens to lead when the message dies, scattering the
+                // DLQ across the cluster after failovers. A /quorum/ target
+                // is leader-routed and therefore cluster-wide — say so when
+                // the config picks otherwise.
+                if let Some(target) = &policy.dead_letter
+                    && !target.starts_with("/quorum/")
+                {
+                    tracing::warn!(
+                        queue = %name,
+                        %target,
+                        "clustered queue dead-letters into a NODE-LOCAL target: dead letters \
+                         will scatter across whichever nodes lead over time; use a /quorum/ \
+                         target for a cluster-wide dead-letter queue"
+                    );
+                }
                 let handle = quorum::spawn(
                     name.to_owned(),
                     member.raft.clone(),

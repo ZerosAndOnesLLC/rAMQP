@@ -85,6 +85,14 @@ pub struct QueuePolicy {
     /// lazily when a message reaches the head of the queue, RabbitMQ-classic
     /// style). Expired messages dead-letter when `dead_letter` is set,
     /// otherwise drop.
+    ///
+    /// TTL is measured on the **wall clock** (the only clock that survives
+    /// restarts, which durable/quorum TTLs require): a forward clock step
+    /// larger than the TTL (an NTP correction, a VM resume) expires the
+    /// affected backlog at once, and on a cluster the enqueue timestamp is
+    /// stamped by the proposing leader while expiry is judged by the
+    /// current leader — inter-node clock skew shifts expiry by that skew.
+    /// Keep NTP slewing (not stepping) on broker hosts.
     pub message_ttl: Option<std::time::Duration>,
     /// Maximum messages held (ready + unacked), overriding the broker-wide
     /// `max_queue_depth` for matching queues.
