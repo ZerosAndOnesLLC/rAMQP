@@ -309,18 +309,15 @@ impl ReplicatedState for QueueState {
         }
     }
 
-    fn snapshot_bytes(&self) -> Result<Vec<u8>, String> {
-        // Balance `prepare_snapshot` on every path.
-        struct Unpin<'a>(Option<&'a Spill>);
-        impl Drop for Unpin<'_> {
-            fn drop(&mut self) {
-                if let Some(spill) = self.0 {
-                    spill.unpin();
-                }
-            }
+    fn finish_snapshot(&self) {
+        // Balances `prepare_snapshot`'s pin; the builder calls this on every
+        // path (including task cancellation), so it is the sole unpin site.
+        if let Some(paging) = &self.paging {
+            paging.spill.unpin();
         }
-        let _unpin = Unpin(self.paging.as_ref().map(|p| &p.spill));
+    }
 
+    fn snapshot_bytes(&self) -> Result<Vec<u8>, String> {
         let mut messages = Vec::with_capacity(self.messages.len());
         let mut spilled = false;
         for (id, m) in &self.messages {
@@ -479,6 +476,7 @@ mod tests {
         // Snapshot with spilled bodies external; restore locally.
         state.prepare_snapshot();
         let bytes = state.snapshot_bytes().expect("snapshot");
+        state.finish_snapshot();
         let mut restored = QueueState::paged(spill.clone(), 16);
         restored.restore_snapshot(&bytes).expect("restore");
         assert_eq!(restored.messages.len(), 10);
@@ -827,6 +825,7 @@ mod tests {
         }
         state_a.prepare_snapshot();
         let bytes = state_a.snapshot_bytes().expect("snapshot");
+        state_a.finish_snapshot();
 
         // Replica B has its own spill (same segment ids, different bytes).
         let mut state_b = QueueState::paged(spill_b.clone(), 8);

@@ -48,9 +48,16 @@ pub trait ReplicatedState: Default + Debug + Clone + Send + Sync + 'static {
     fn prepare_snapshot(&self) {}
 
     /// Serialize the state for a snapshot (may read resources pinned by
-    /// [`prepare_snapshot`](ReplicatedState::prepare_snapshot); must unpin
-    /// them before returning).
+    /// [`prepare_snapshot`](ReplicatedState::prepare_snapshot)). Balanced by
+    /// [`finish_snapshot`](ReplicatedState::finish_snapshot), which the
+    /// builder ALWAYS calls afterward — including when serialization never
+    /// ran (task cancellation at runtime shutdown), so a pin can never leak.
     fn snapshot_bytes(&self) -> Result<Vec<u8>, String>;
+
+    /// Release whatever [`prepare_snapshot`](ReplicatedState::prepare_snapshot)
+    /// pinned. Called exactly once per build by the snapshot builder, on
+    /// every path.
+    fn finish_snapshot(&self) {}
 
     /// Restore from [`snapshot_bytes`](ReplicatedState::snapshot_bytes).
     fn restore_snapshot(&mut self, bytes: &[u8]) -> Result<(), String>;
@@ -477,7 +484,13 @@ where
                 };
                 Ok((data, blob))
             })
-            .await
+            .await;
+        // ALWAYS unpin, even if the blocking task was cancelled before it
+        // ran (runtime shutdown) — the clone shares the spill Arc with the
+        // live state, so unpinning through the live state balances the pin
+        // no matter what happened to the closure (LOW-16).
+        self.lock().state.finish_snapshot();
+        let built = built
             .map_err(|e| openraft::StorageIOError::write_snapshot(None, &e))?
             .map_err(|e| {
                 openraft::StorageIOError::write_snapshot(None, &std::io::Error::other(e))

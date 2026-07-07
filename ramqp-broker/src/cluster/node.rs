@@ -244,6 +244,11 @@ impl ClusterNode {
                         Err(RaftError::APIError(openraft::error::InitializeError::NotAllowed(
                             _,
                         ))) => return,
+                        // After stop() shuts the meta Raft down, initialize
+                        // returns Fatal forever — without this arm the task
+                        // spins on the 250ms retry until process exit (LOW-4;
+                        // the queue-group loop already has it).
+                        Err(RaftError::Fatal(_)) => return,
                         Err(e) => {
                             tracing::debug!(error = %e, "cluster initialize retry");
                             tokio::time::sleep(Duration::from_millis(250)).await;
@@ -983,12 +988,21 @@ struct LeaderSub {
     sub: crate::queue::SubId,
 }
 
+/// The leader side's open subscriptions for one connection, plus a `closed`
+/// flag set at teardown so an OpenSub racing the teardown does not insert an
+/// orphaned subscriber after the drain (LOW-5).
+#[derive(Default)]
+struct LeaderSubs {
+    map: HashMap<u64, LeaderSub>,
+    closed: bool,
+}
+
 /// Serve one inbound fabric connection.
 async fn handle_conn(stream: tokio::net::TcpStream, node: Arc<ClusterNode>) {
     let (mut reader, writer_half) = stream.into_split();
     let writer = spawn_writer(writer_half);
-    let subs: Arc<std::sync::Mutex<HashMap<u64, LeaderSub>>> =
-        Arc::new(std::sync::Mutex::new(HashMap::new()));
+    let subs: Arc<std::sync::Mutex<LeaderSubs>> =
+        Arc::new(std::sync::Mutex::new(LeaderSubs::default()));
 
     // The ordered toward-queues forwarder.
     let (fw_tx, fw_rx) = mpsc::unbounded_channel::<QueueBound>();
@@ -1012,6 +1026,7 @@ async fn handle_conn(stream: tokio::net::TcpStream, node: Arc<ClusterNode>) {
                 let target = subs
                     .lock()
                     .expect("leader subs lock")
+                    .map
                     .get(&sub_chan)
                     .map(|s| (s.queue.tx.clone(), s.sub));
                 if let Some((tx, sub)) = target {
@@ -1027,6 +1042,7 @@ async fn handle_conn(stream: tokio::net::TcpStream, node: Arc<ClusterNode>) {
                 let target = subs
                     .lock()
                     .expect("leader subs lock")
+                    .map
                     .get(&sub_chan)
                     .map(|s| (s.queue.tx.clone(), s.sub));
                 if let Some((tx, sub)) = target {
@@ -1041,7 +1057,7 @@ async fn handle_conn(stream: tokio::net::TcpStream, node: Arc<ClusterNode>) {
                 }
             }
             FabricHeader::CloseSub { sub_chan } => {
-                let removed = subs.lock().expect("leader subs lock").remove(&sub_chan);
+                let removed = subs.lock().expect("leader subs lock").map.remove(&sub_chan);
                 if let Some(s) = removed {
                     let _ = fw_tx.send(QueueBound::Cmd(
                         s.queue.tx.clone(),
@@ -1058,8 +1074,9 @@ async fn handle_conn(stream: tokio::net::TcpStream, node: Arc<ClusterNode>) {
     // Connection gone: every subscription it held unsubscribes, requeueing
     // whatever its consumers had in flight.
     let drained: Vec<LeaderSub> = {
-        let mut map = subs.lock().expect("leader subs lock");
-        map.drain().map(|(_, s)| s).collect()
+        let mut guard = subs.lock().expect("leader subs lock");
+        guard.closed = true;
+        guard.map.drain().map(|(_, s)| s).collect()
     };
     for s in drained {
         let _ = s.queue.tx.send(QueueMsg::Unsubscribe { sub: s.sub }).await;
@@ -1074,7 +1091,7 @@ async fn handle_request(
     body: Bytes,
     node: &Arc<ClusterNode>,
     writer: &mpsc::UnboundedSender<OutFrame>,
-    subs: &Arc<std::sync::Mutex<HashMap<u64, LeaderSub>>>,
+    subs: &Arc<std::sync::Mutex<LeaderSubs>>,
     fw_tx: &mpsc::UnboundedSender<QueueBound>,
 ) {
     match req {
@@ -1268,7 +1285,7 @@ async fn open_leader_sub(
     queue: &str,
     sub_chan: u64,
     writer: &mpsc::UnboundedSender<OutFrame>,
-    subs: &Arc<std::sync::Mutex<HashMap<u64, LeaderSub>>>,
+    subs: &Arc<std::sync::Mutex<LeaderSubs>>,
 ) -> Result<(), Option<NodeId>> {
     let handle = match node.leader_actor(queue).await {
         Ok(h) => h,
@@ -1290,13 +1307,27 @@ async fn open_leader_sub(
         // Actor died between resolve and subscribe (leadership moved).
         return Err(None);
     };
-    subs.lock().expect("leader subs lock").insert(
-        sub_chan,
-        LeaderSub {
-            queue: handle.clone(),
-            sub,
-        },
-    );
+    let closed = {
+        let mut guard = subs.lock().expect("leader subs lock");
+        if guard.closed {
+            true
+        } else {
+            guard.map.insert(
+                sub_chan,
+                LeaderSub {
+                    queue: handle.clone(),
+                    sub,
+                },
+            );
+            false
+        }
+    };
+    if closed {
+        // The connection tore down while we were subscribing: undo the
+        // actor-side subscribe instead of leaking it + a pump task (LOW-5).
+        let _ = handle.tx.send(QueueMsg::Unsubscribe { sub }).await;
+        return Err(None);
+    }
 
     // The delivery pump: actor → fabric. Exits when the actor drops the
     // subscriber (unsubscribe, actor death) or the connection's writer dies.
@@ -1313,7 +1344,7 @@ async fn open_leader_sub(
             }
         }
         // Actor dropped us (leadership lost / queue deleted): tell the origin.
-        subs.lock().expect("leader subs lock").remove(&sub_chan);
+        subs.lock().expect("leader subs lock").map.remove(&sub_chan);
         let _ = writer.send(OutFrame::control(FabricHeader::SubClosed { sub_chan }));
     });
     Ok(())
