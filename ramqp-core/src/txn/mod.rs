@@ -92,6 +92,23 @@ pub fn transactional_state(txn_id: TxnId, outcome: Option<Outcome>) -> DeliveryS
     DeliveryState::Other(value)
 }
 
+/// Build the `declared` outcome carrying `txn_id` — what a coordinator
+/// settles a `declare` control message with.
+pub fn declared_state(txn_id: TxnId) -> DeliveryState {
+    let declared = Declared { txn_id };
+    let value = from_slice::<crate::codec::Value>(&to_vec(&declared))
+        .expect("declared encodes to a valid described value");
+    DeliveryState::Other(value)
+}
+
+/// Try to interpret a delivery state as a `transactional-state` and decode it.
+pub fn txn_state(state: &DeliveryState) -> Option<TransactionalState> {
+    if let DeliveryState::Other(value) = state {
+        return from_slice::<TransactionalState>(&to_vec(value)).ok();
+    }
+    None
+}
+
 /// Try to interpret a delivery state as a `declared` outcome and extract its
 /// `txn-id`.
 pub fn declared_txn_id(state: &DeliveryState) -> Option<TxnId> {

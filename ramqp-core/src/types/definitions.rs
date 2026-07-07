@@ -180,6 +180,15 @@ condition_enum! {
 }
 
 condition_enum! {
+    /// Conditions in the `amqp:transaction:` domain (spec part 4).
+    TransactionError {
+        UnknownId => "amqp:transaction:unknown-id",
+        TransactionRollback => "amqp:transaction:rollback",
+        TransactionTimeout => "amqp:transaction:timeout",
+    } default UnknownId
+}
+
+condition_enum! {
     /// Conditions in the `amqp:link:` domain.
     LinkError {
         DetachForced => "amqp:link:detach-forced",
@@ -204,6 +213,8 @@ pub enum ErrorCondition {
     Session(SessionError),
     /// A condition in the `amqp:link:` domain.
     Link(LinkError),
+    /// A condition in the `amqp:transaction:` domain.
+    Transaction(TransactionError),
     /// Any other (vendor or extension) condition symbol.
     Custom(Symbol),
 }
@@ -216,6 +227,7 @@ impl ErrorCondition {
             ErrorCondition::Connection(e) => e.as_str(),
             ErrorCondition::Session(e) => e.as_str(),
             ErrorCondition::Link(e) => e.as_str(),
+            ErrorCondition::Transaction(e) => e.as_str(),
             ErrorCondition::Custom(s) => s.as_str(),
         }
     }
@@ -230,6 +242,8 @@ impl ErrorCondition {
             ErrorCondition::Session(e)
         } else if let Some(e) = LinkError::from_str(st) {
             ErrorCondition::Link(e)
+        } else if let Some(e) = TransactionError::from_str(st) {
+            ErrorCondition::Transaction(e)
         } else {
             ErrorCondition::Custom(s)
         }
@@ -260,6 +274,11 @@ impl From<SessionError> for ErrorCondition {
 impl From<LinkError> for ErrorCondition {
     fn from(e: LinkError) -> Self {
         ErrorCondition::Link(e)
+    }
+}
+impl From<TransactionError> for ErrorCondition {
+    fn from(e: TransactionError) -> Self {
+        ErrorCondition::Transaction(e)
     }
 }
 

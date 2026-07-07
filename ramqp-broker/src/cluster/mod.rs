@@ -9,21 +9,20 @@
 //! multi-node tests without sockets).
 //!
 //! Crate-internal (not on the public API): these openraft-typed, pre-alpha
-//! internals must not appear on the crates.io semver surface. The
-//! metadata-group formation path (`bootstrap`, `tcp`, `network`, `meta`) is
-//! built and covered by tests but is not yet wired into the *running* broker —
-//! that multi-node integration is Phase-6-remaining work — so it reads as
-//! unused from the non-test crate build; `queue_group`/`store` are live via the
-//! quorum-queue actor. The allow marks this as ahead-of-integration scaffolding
-//! rather than accidental dead code.
+//! internals must not appear on the crates.io semver surface. Multi-node
+//! wiring lives in `fabric` (the shared per-peer transport), `node` (the
+//! cluster node: metadata + queue groups + the leader side of forwarding);
+//! the origin side is `crate::proxy`. `network::Router` remains as the
+//! in-process multi-node test harness.
 #![allow(dead_code)]
 
-pub mod bootstrap;
+pub mod fabric;
 pub mod meta;
 pub mod network;
+pub mod node;
+pub mod paging;
 pub mod queue_group;
 pub mod store;
-pub mod tcp;
 
 use std::io::Cursor;
 
@@ -33,6 +32,48 @@ use meta::{MetaCommand, MetaResponse};
 
 /// The metadata group's node id.
 pub type NodeId = u64;
+
+/// FNV-1a — deterministic across builds and platforms (used for placement
+/// scoring and for stable on-disk directory names; must never depend on
+/// `DefaultHasher`'s per-version behavior).
+pub(crate) fn fnv1a(bytes: impl IntoIterator<Item = u8>) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// The per-queue on-disk layout under a broker `data_dir`:
+/// `(spill dir, snapshot dir)`. The tag is a **SHA-256** of the queue name,
+/// not FNV-1a: a 64-bit non-cryptographic tag lets a client that can declare
+/// queues construct a name colliding with an existing durable queue's tag,
+/// and `Spill::open`'s `remove_dir_all` then destroys the victim's segments
+/// (LOW-9). A 256-bit cryptographic digest makes a chosen collision
+/// infeasible.
+pub(crate) fn queue_dirs(
+    data_dir: &std::path::Path,
+    queue: &str,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    let tag = queue_tag(queue);
+    (
+        data_dir.join("spill").join(&tag),
+        data_dir.join("snapshots").join(&tag),
+    )
+}
+
+/// A collision-resistant, filesystem-safe directory tag for a queue name.
+pub(crate) fn queue_tag(queue: &str) -> String {
+    use ramqp_core::sasl::scram::ScramMechanism;
+    let digest = ScramMechanism::Sha256.h(queue.as_bytes());
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for b in digest {
+        use std::fmt::Write;
+        let _ = write!(hex, "{b:02x}");
+    }
+    hex
+}
 
 openraft::declare_raft_types!(
     /// Raft type configuration for the metadata group.
@@ -96,30 +137,34 @@ mod tests {
             .await
             .expect("leader");
 
+        let spec = QueueSpec {
+            queue_type: QueueType::Quorum,
+            replicas: 3,
+            placement: vec![1, 2, 3],
+        };
         let resp = raft
             .client_write(MetaCommand::CreateQueue {
                 name: "orders".into(),
-                spec: QueueSpec {
-                    queue_type: QueueType::Quorum,
-                    replicas: 3,
-                },
+                spec: spec.clone(),
             })
             .await
             .expect("write");
         assert_eq!(resp.data, MetaResponse::Created);
 
-        // Idempotence: re-creating reports AlreadyExists.
+        // Idempotence: re-creating reports AlreadyExists with the
+        // authoritative (first-writer) spec.
         let resp = raft
             .client_write(MetaCommand::CreateQueue {
                 name: "orders".into(),
                 spec: QueueSpec {
                     queue_type: QueueType::Quorum,
                     replicas: 3,
+                    placement: vec![4, 5, 6],
                 },
             })
             .await
             .expect("write");
-        assert_eq!(resp.data, MetaResponse::AlreadyExists);
+        assert_eq!(resp.data, MetaResponse::AlreadyExists(spec));
 
         let catalog = store.catalog();
         assert_eq!(catalog.len(), 1);
@@ -162,6 +207,7 @@ mod tests {
                 spec: QueueSpec {
                     queue_type: QueueType::Quorum,
                     replicas: 3,
+                    placement: vec![],
                 },
             })
             .await
@@ -233,6 +279,7 @@ mod tests {
                 spec: QueueSpec {
                     queue_type: QueueType::Quorum,
                     replicas: 3,
+                    placement: vec![],
                 },
             })
             .await
@@ -280,6 +327,7 @@ mod tests {
             spec: QueueSpec {
                 queue_type: QueueType::Transient,
                 replicas: 1,
+                placement: vec![],
             },
         })
         .await

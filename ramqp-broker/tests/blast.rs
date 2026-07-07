@@ -29,7 +29,34 @@ async fn settled_blast_with_ranged_accepts() {
     .await;
 }
 
-async fn blast(address: &str, n: usize) {
+/// A blast's ranged settles must all APPLY before the connection tears
+/// down: acked messages must not requeue at close and redeliver to the next
+/// consumer as duplicates. This is the tokio-coop regression — the driver's
+/// close-time settlement drain used to poll with an exhausted cooperative
+/// budget, see every resolved oneshot as pending, and drop hundreds of
+/// settlements per busy close.
+#[tokio::test]
+async fn close_after_blast_leaves_nothing_to_redeliver() {
+    let address = "/queues/clean-close";
+    let addr = blast(address, if cfg!(debug_assertions) { 3000 } else { 20000 }).await;
+
+    // A fresh consumer on the same queue: nothing may arrive.
+    let conn = ConnectionBuilder::new(format!("amqp://{addr}"))
+        .connect()
+        .await
+        .expect("connect");
+    let session = conn.begin_session().await.expect("session");
+    let mut consumer = session.create_consumer(address).await.expect("c");
+    let leftover =
+        tokio::time::timeout(std::time::Duration::from_millis(500), consumer.recv()).await;
+    assert!(
+        leftover.is_err(),
+        "settled blast left redeliverable messages behind: {leftover:?}"
+    );
+    conn.close().await.expect("close");
+}
+
+async fn blast(address: &str, n: usize) -> std::net::SocketAddr {
     let bound = Broker::new(BrokerConfig::default())
         .bind("127.0.0.1:0")
         .await
@@ -68,4 +95,5 @@ async fn blast(address: &str, n: usize) {
         .await
         .expect("final accept");
     conn.close().await.expect("close");
+    addr
 }

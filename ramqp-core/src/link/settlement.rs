@@ -46,6 +46,13 @@ impl UnsettledMap {
         self.entries.is_empty()
     }
 
+    /// Diagnostics: the (min, max) delivery ids currently unsettled.
+    pub fn id_range(&self) -> Option<(u32, u32)> {
+        let min = self.entries.keys().next()?;
+        let max = self.entries.keys().next_back()?;
+        Some((*min, *max))
+    }
+
     /// Begin tracking a delivery.
     pub fn insert(&mut self, delivery_id: u32, delivery_tag: Bytes, state: Option<DeliveryState>) {
         self.entries.insert(

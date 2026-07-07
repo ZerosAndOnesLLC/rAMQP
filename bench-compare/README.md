@@ -147,3 +147,85 @@ cargo run -p ramqp-bench-compare --release --bin latency                  # ours
 LAT_URL=amqp://guest:guest@localhost:5672 LAT_ADDRESS=/queues/bench-lat \
     cargo run -p ramqp-bench-compare --release --bin latency              # any broker
 ```
+
+## Quorum-queue numbers — ramqp-broker Phase 6 (2026-07-06)
+
+Same harness, same machine, 256 B payloads: replicated (`/quorum/*`) queues
+after the Phase 6 forwarding fabric landed. The 3-node cluster runs three
+`ramqp-brokerd` processes over real loopback TCP (fabric + Raft replication,
+replication factor 3); "via follower" attaches the client to a node that does
+NOT lead the queue's Raft group, so every message crosses the internal
+forwarding fabric to the leader and back.
+
+| 256 B, defaults | transient (in-proc) | quorum ×1 (in-proc) | **quorum ×3, leader node** | **quorum ×3, via follower** | RabbitMQ 4.3.1 quorum |
+|---|---|---|---|---|---|
+| p50 latency      | 92 µs  | 120 µs | **288 µs** | **427 µs** | 2234 µs |
+| p90              | 118 µs | 143 µs | **347 µs** | **489 µs** | 2639 µs |
+| p99              | 162 µs | 245 µs | **429 µs** | **626 µs** | 3963 µs |
+| p99.9            | 259 µs | 396 µs | **633 µs** | **815 µs** | 7496 µs |
+| blast throughput | 286k msg/s | 157k msg/s | **141k msg/s** | **157–165k msg/s** | 39k msg/s |
+| broker memory    | 28 MiB¹ | 218 MiB¹ | 451 MiB leader / ~190 MiB per follower² | — | 226 MiB³ |
+
+¹ whole-process RSS including client+harness (in-process broker).
+² per-`ramqp-brokerd` VmRSS after three consecutive 50k blasts; dominated by
+the in-memory Raft log + snapshot copies (high-water, not steady-state — the
+on-disk log and paged state machine are Phase 7).
+³ `docker stats` container memory after the run.
+
+**Read honestly:** the headline asymmetry — our quorum queue commits its Raft
+log **in memory** while RabbitMQ's quorum queue fsyncs to disk — makes the
+latency gap partly a durability gap; the disk-backed comparison is redo-work
+for Phase 7. Also: RabbitMQ ran as a single-node cluster (its quorum queue
+had one member, no replication RTT) while ours replicated to 3 members over
+loopback TCP — that asymmetry favors *RabbitMQ*. Untuned defaults, WSL2,
+docker NAT on the RabbitMQ leg. What the numbers do establish: the
+consensus-per-publish path (commit-backed accepts) plus the forwarding fabric
+keeps tails flat — p99.9/p50 ≈ 2× on every leg (§3.1 target ≤10×) — and one
+fabric hop costs ~140 µs p50 on this machine.
+
+Found by this bench (worth the price of admission): a broker-side bug where
+the close-time settlement drain polled tokio oneshots with an exhausted
+cooperative budget, silently requeuing hundreds of already-acked messages per
+busy connection close (duplicates for the next consumer). Fixed + regression-
+tested (`blast::close_after_blast_leaves_nothing_to_redeliver`).
+
+## Deep-queue numbers — paged state machine, Phase 7 (2026-07-07)
+
+The `depth` bin: publish→accepted (closed-loop) latency and process RSS as a
+`/quorum/*` queue fills — the broker.md §8 #1-risk defense. In-process broker
+(RSS includes client + harness); paging = `DEPTH_DATA_DIR` set (64 MiB
+resident-body budget; bodies beyond it spill to segment files; snapshot blobs
+park on disk).
+
+**Tail flatness (256 B bodies, 0 → 1M deep, paged):**
+
+| depth | p50 | p99 | p99.9 | RSS |
+|---|---|---|---|---|
+| 2k    | 117 µs | 197 µs | 316 µs  | 19 MiB |
+| 102k  | 117 µs | 244 µs | 5.0 ms  | 167 MiB |
+| 502k  | 122 µs | 222 µs | 3.9 ms  | 619 MiB |
+| 1.00M | 125 µs | 254 µs | 5.3 ms  | 1320 MiB |
+
+p50/p99 are **flat from empty to a million deep**; drain-out of the deep
+queue runs 274k msg/s. The p99.9/max spikes are snapshot builds (each one
+clones + serializes the full index; cadence is every 50k applies) —
+incremental snapshots are the standing follow-up.
+
+**The paging headline (4 KiB bodies × 252k ≈ 1 GiB of payload):**
+
+| | paged | unpaged |
+|---|---|---|
+| RSS at full depth | **878 MiB** | 2461 MiB |
+| final RSS after drain | **908 MiB** | 3040 MiB |
+| p50 at full depth | 124 µs | 126 µs |
+| drain throughput | 248k msg/s | 274k msg/s |
+
+~3x less memory at identical p50, for a ~10% drain-throughput cost — the
+flow-to-disk trade §3.1 asks for. At 256 B bodies the *index* (BTreeMap +
+ready-set + raft bookkeeping) dominates RSS, so paging buys proportionally
+less; body-size scaling is exactly the point of the split.
+
+Known limitation (documented in the code): a paged queue's snapshot keeps
+spilled bodies **external** (node-local refs) — follower catch-up *via
+snapshot* for a deep paged queue is not yet supported (log-replay catch-up
+is); segment shipping is the follow-up.

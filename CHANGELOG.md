@@ -44,9 +44,14 @@ side (publish order: `ramqp-core` first).
   read-first `header::accept`, and a SASL server side (PLAIN parsing + an
   RFC 5802 `ScramServer` with verifier-based credential storage, validated
   byte-for-byte against the RFC vectors and against `ramqp`'s own client).
-- **`ramqp-broker` 0.1.0 (unpublished)** — the broker: transient + quorum
-  (Raft-replicated) queues, cluster foundation, daemon. See the README and
-  `broker.md`.
+- **`ramqp-broker` 0.2.0 (unpublished)** — the broker: transient + quorum
+  (Raft-replicated) queues, and **clustering with leader routing**: a
+  multiplexed inter-node fabric (shared per-peer TCP for all Raft groups +
+  the forwarded data plane), catalog-driven quorum declaration with
+  rendezvous placement, leader-following proxies so any node serves any
+  queue, and zero accepted-message loss across a mid-stream leader kill
+  (tested e2e with the unmodified client). Daemon grows
+  `--node-id/--cluster-listen/--seed`. See the README and `broker.md`.
 
 ## [0.7.1] - 2026-06-24
 

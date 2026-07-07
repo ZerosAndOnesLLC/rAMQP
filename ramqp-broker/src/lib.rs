@@ -25,16 +25,26 @@
 
 pub mod auth;
 mod broker;
-// Cluster internals (openraft glue, in-memory storage, in-process router) are
-// not part of the crate's public API — they are pre-alpha and openraft-typed.
+// Cluster internals (openraft glue, the fabric transport, the cluster node)
+// are not part of the crate's public API — they are pre-alpha and
+// openraft-typed. Clustering is configured through the plain
+// [`config::ClusterMemberConfig`].
 pub(crate) mod cluster;
 pub mod config;
 mod connection;
 mod dispatch;
+#[cfg(feature = "store-redb")]
+mod durable;
+mod mgmt;
+mod policy;
+mod proxy;
 mod queue;
 mod quorum;
 mod registry;
+#[cfg(feature = "store-redb")]
+mod store;
+mod txn;
 
-pub use auth::{AllowAll, Authenticator, Credentials, StaticPlain};
+pub use auth::{AllowAll, Authenticator, Credentials, Operation, StaticPlain, StaticScram};
 pub use broker::{BoundBroker, Broker, ShutdownHandle};
-pub use config::BrokerConfig;
+pub use config::{BrokerConfig, ClusterMemberConfig, OverflowBehavior, QueuePolicy};

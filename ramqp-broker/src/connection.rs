@@ -10,8 +10,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use futures_util::StreamExt;
 use futures_util::stream::FuturesUnordered;
+use futures_util::{FutureExt, StreamExt};
 use tokio::sync::{mpsc, oneshot, watch};
 
 use ramqp_core::codec::Symbol;
@@ -23,22 +23,29 @@ use ramqp_core::error::{ConnectError, ErrorKind};
 use ramqp_core::ids::{DeliveryId, SessionId};
 use ramqp_core::observe::{SharedMetrics, noop_metrics};
 use ramqp_core::proto::{LinkEvent, SessionEvent};
-use ramqp_core::sasl::server::parse_plain_response;
+use ramqp_core::sasl::scram::ScramMechanism;
+use ramqp_core::sasl::server::{ScramServer, ScramVerifier, parse_plain_response};
 use ramqp_core::session::state::Session;
 use ramqp_core::transport::IoStream;
 use ramqp_core::transport::frame::{Frame, FrameBody, FramedTransport};
 use ramqp_core::transport::header::{ProtocolHeader, accept as accept_header};
 use ramqp_core::types::definitions::{
     AmqpError as AmqpCondition, ConnectionError, Error as AmqpError, ErrorCondition, Role,
+    TransactionError,
 };
 use ramqp_core::types::messaging::{Accepted, DeliveryState, Rejected, TargetArchetype};
 use ramqp_core::types::performatives::{Attach, Begin, Close, End, Performative};
 use ramqp_core::types::sasl::{SaslCode, SaslFrame, SaslMechanisms, SaslOutcome};
 
-use crate::auth::{Authenticator, Credentials};
+use ramqp_core::txn::{declared_state, transactional_state, txn_state};
+
+use crate::auth::{Authenticator, Credentials, Operation};
 use crate::config::BrokerConfig;
 use crate::queue::{ConnCmd, PublishAck, QueueHandle, QueueMsg, SettleOutcome, SubId};
 use crate::registry::QueueRegistry;
+use crate::txn::{
+    DischargeOutcome, StagedPublish, StagedSettle, TxnControl, TxnManager, decode_control,
+};
 
 /// How many queue commands to coalesce under one flush (mirrors the client
 /// driver's batching; bounds per-wakeup work so reads aren't starved).
@@ -54,7 +61,7 @@ pub(crate) async fn serve<S: IoStream>(
 ) -> Result<(), ConnectError> {
     // Bound the whole inbound handshake (header + SASL + open) so a client
     // that connects then stalls cannot pin this task (slow-loris guard).
-    let handshake = handshake(stream, &config, auth.as_ref(), registry);
+    let handshake = handshake(stream, &config, auth, registry);
     let mut conn = match config.connection.connect_timeout {
         Some(t) => tokio::time::timeout(t, handshake)
             .await
@@ -77,9 +84,10 @@ pub(crate) async fn serve<S: IoStream>(
 async fn handshake<S: IoStream>(
     mut stream: S,
     config: &Arc<BrokerConfig>,
-    auth: &dyn Authenticator,
+    auth_arc: Arc<dyn Authenticator>,
     registry: Arc<QueueRegistry>,
 ) -> Result<BrokerConnection<S>, ConnectError> {
+    let auth = auth_arc.as_ref();
     // 1. Protocol header, read-first. Offer SASL and (if permitted) bare AMQP.
     let supported: &[ProtocolHeader] = if auth.allow_unauthenticated() {
         &[ProtocolHeader::SASL, ProtocolHeader::AMQP]
@@ -91,8 +99,9 @@ async fn handshake<S: IoStream>(
     let mut transport = FramedTransport::new(stream, config.connection.max_frame_size);
 
     // 2. SASL layer (when chosen): mechanisms → init → outcome → AMQP header.
+    let mut identity = None;
     if chosen == ProtocolHeader::SASL {
-        server_sasl(&mut transport, auth).await?;
+        identity = server_sasl(&mut transport, auth).await?;
         let after = accept_header(transport.stream_mut(), &[ProtocolHeader::AMQP]).await?;
         debug_assert_eq!(after, ProtocolHeader::AMQP);
     }
@@ -119,6 +128,25 @@ async fn handshake<S: IoStream>(
             ),
         ));
     }
+    // Tenant namespace: a hostname of `vhost:<name>` scopes every queue this
+    // connection touches (queues, policies, permissions) to that vhost. A
+    // vhost is one component of the storage key (`<vhost>/<name>`): a
+    // separator inside it would let `vhost:a` + queue `b/c` collide with
+    // `vhost:a/b` + queue `c` — cross-tenant reads/writes below the authz
+    // layer. Control characters are refused for log/metrics hygiene.
+    // Validated BEFORE our own `open` goes out, so the peer's connect fails.
+    let vhost = peer_open
+        .hostname
+        .as_deref()
+        .and_then(|h| h.strip_prefix("vhost:"))
+        .unwrap_or("")
+        .to_owned();
+    if vhost.contains('/') || vhost.chars().any(char::is_control) {
+        return Err(ConnectError::msg(
+            ErrorKind::ProtocolViolation,
+            format!("invalid vhost {vhost:?}: '/' and control characters are not allowed"),
+        ));
+    }
     let local_open = build_open(&config.connection);
     let negotiated = reconcile(&local_open, &peer_open);
     // max-frame-size is DIRECTIONAL (spec §2.7.1): our advertised value bounds
@@ -138,9 +166,12 @@ async fn handshake<S: IoStream>(
     let (session_events_tx, session_events_rx) = mpsc::unbounded_channel();
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
 
-    tracing::debug!(container = %peer_open.container_id, "connection open");
+    tracing::debug!(container = %peer_open.container_id, identity = ?identity, vhost = %vhost, "connection open");
     Ok(BrokerConnection {
         transport,
+        identity,
+        vhost,
+        auth: auth_arc,
         config: config.clone(),
         registry,
         max_frame_size: negotiated.max_frame_size as usize,
@@ -152,6 +183,8 @@ async fn handshake<S: IoStream>(
         bindings: HashMap::new(),
         next_gen: 0,
         settlements: FuturesUnordered::new(),
+        txns: TxnManager::default(),
+        txn_results: FuturesUnordered::new(),
         next_session_id: 0,
         metrics: noop_metrics(),
         link_events_tx,
@@ -165,10 +198,11 @@ async fn handshake<S: IoStream>(
 }
 
 /// Server side of SASL: advertise, read `init`, verify, send the outcome.
+/// Returns the authenticated identity (`None` for ANONYMOUS).
 async fn server_sasl<S: IoStream>(
     transport: &mut FramedTransport<S>,
     auth: &dyn Authenticator,
-) -> Result<(), ConnectError> {
+) -> Result<Option<String>, ConnectError> {
     transport
         .send_sasl(&SaslFrame::Mechanisms(SaslMechanisms {
             sasl_server_mechanisms: auth.mechanisms().iter().map(|m| Symbol::new(*m)).collect(),
@@ -186,21 +220,39 @@ async fn server_sasl<S: IoStream>(
     };
 
     let mechanism = init.mechanism.as_str().to_ascii_uppercase();
-    let verified = match mechanism.as_str() {
+    let scram = match mechanism.as_str() {
+        "SCRAM-SHA-1" => Some(ScramMechanism::Sha1),
+        "SCRAM-SHA-256" => Some(ScramMechanism::Sha256),
+        "SCRAM-SHA-512" => Some(ScramMechanism::Sha512),
+        _ => None,
+    };
+    let verified: Option<Option<String>> = match mechanism.as_str() {
         "ANONYMOUS" if auth.mechanisms().contains(&"ANONYMOUS") => {
-            auth.verify(Credentials::Anonymous)
+            auth.verify(Credentials::Anonymous).then_some(None)
         }
         "PLAIN" if auth.mechanisms().contains(&"PLAIN") => init
             .initial_response
             .as_deref()
             .and_then(parse_plain_response)
-            .is_some_and(|(_authzid, authcid, passwd)| {
+            .and_then(|(_authzid, authcid, passwd)| {
                 auth.verify(Credentials::Plain { authcid, passwd })
+                    .then(|| Some(authcid.to_owned()))
             }),
-        _ => false,
+        _ if scram.is_some() && auth.mechanisms().contains(&mechanism.as_str()) => {
+            // RFC 5802 server flow: client-first → challenge → client-final
+            // → outcome carrying the server-final signature.
+            match server_scram(transport, auth, scram.expect("checked"), &init).await? {
+                Some(identity) => {
+                    // The outcome (with additional-data) was already sent.
+                    return Ok(Some(identity));
+                }
+                None => None,
+            }
+        }
+        _ => None,
     };
 
-    let code = if verified {
+    let code = if verified.is_some() {
         SaslCode::Ok
     } else {
         SaslCode::Auth
@@ -211,13 +263,107 @@ async fn server_sasl<S: IoStream>(
             additional_data: None,
         }))
         .await?;
-    if !verified {
-        return Err(ConnectError::msg(
+    match verified {
+        Some(identity) => Ok(identity),
+        None => Err(ConnectError::msg(
             ErrorKind::Sasl,
             format!("authentication failed (mechanism {mechanism})"),
-        ));
+        )),
     }
-    Ok(())
+}
+
+/// Run the SCRAM server exchange. On success the outcome (Ok + server-final
+/// in `additional-data`) is sent here and the identity returned; on failure
+/// `None` is returned and the caller sends the auth-failure outcome.
+async fn server_scram<S: IoStream>(
+    transport: &mut FramedTransport<S>,
+    auth: &dyn Authenticator,
+    mechanism: ScramMechanism,
+    init: &ramqp_core::types::sasl::SaslInit,
+) -> Result<Option<String>, ConnectError> {
+    use ramqp_core::types::sasl::{SaslChallenge, SaslResponse};
+
+    let mut server = ScramServer::new(mechanism);
+    let Some(client_first) = init.initial_response.as_deref() else {
+        return Ok(None);
+    };
+    let Ok(username) = server.on_client_first(client_first) else {
+        return Ok(None);
+    };
+    let username = username.to_owned();
+    // Unknown user: proceed with a FAKE verifier (deterministic per
+    // username, so a repeated probe sees a stable salt) instead of failing
+    // immediately. Both the unknown-user and wrong-password paths now send a
+    // server-first challenge and fail at client-final — closing the
+    // username-enumeration oracle (RFC 5802 §7). MED-16.
+    let verifier = auth
+        .scram_verifier(mechanism, &username)
+        .unwrap_or_else(|| fake_scram_verifier(mechanism, &username));
+    let challenge = server.server_first(verifier);
+    transport
+        .send_sasl(&SaslFrame::Challenge(SaslChallenge {
+            challenge: challenge.to_vec().into(),
+        }))
+        .await?;
+    let response = match transport.read_frame().await?.body {
+        FrameBody::Sasl(SaslFrame::Response(SaslResponse { response })) => response,
+        other => {
+            return Err(ConnectError::msg(
+                ErrorKind::Sasl,
+                format!("expected sasl-response, got {other:?}"),
+            ));
+        }
+    };
+    match server.on_client_final(&response) {
+        Ok(server_final) => {
+            transport
+                .send_sasl(&SaslFrame::Outcome(SaslOutcome {
+                    code: SaslCode::Ok,
+                    additional_data: Some(server_final.to_vec().into()),
+                }))
+                .await?;
+            Ok(Some(username))
+        }
+        Err(_) => Ok(None),
+    }
+}
+
+/// A deterministic decoy SCRAM verifier for an unknown user: a real client
+/// proof can never match its keys (derived from a per-process secret), but
+/// the exchange is indistinguishable from a known user's until client-final
+/// fails — no username-existence oracle. The salt is stable per username so
+/// a repeated probe cannot detect a fake from a changing salt.
+fn fake_scram_verifier(mechanism: ScramMechanism, username: &str) -> ScramVerifier {
+    use std::sync::OnceLock;
+    static SECRET: OnceLock<[u8; 32]> = OnceLock::new();
+    let secret = SECRET.get_or_init(|| {
+        // Process-lifetime secret; unknowable to a client, so the derived
+        // salt/keys cannot be predicted or replayed.
+        let nonce = ramqp_core::sasl::scram::gen_nonce();
+        let mut seed = [0u8; 32];
+        let bytes = nonce.as_bytes();
+        for (i, slot) in seed.iter_mut().enumerate() {
+            *slot = bytes[i % bytes.len()] ^ (i as u8).wrapping_mul(31);
+        }
+        seed
+    });
+    let salt = mechanism.hmac(secret, format!("salt:{username}").as_bytes());
+    let fake_pw = mechanism.hmac(secret, format!("pw:{username}").as_bytes());
+    let salted = mechanism.pbkdf2(&fake_pw, &salt[..16], StaticScramIterations::VALUE);
+    let client_key = mechanism.hmac(&salted, b"Client Key");
+    ScramVerifier {
+        salt: salt[..16].to_vec(),
+        iterations: StaticScramIterations::VALUE,
+        stored_key: mechanism.h(&client_key),
+        server_key: mechanism.hmac(&salted, b"Server Key"),
+    }
+}
+
+/// The iteration count decoy verifiers advertise (matches the shipped
+/// `StaticScram` default so a decoy is indistinguishable from a real user).
+struct StaticScramIterations;
+impl StaticScramIterations {
+    const VALUE: u32 = 8192;
 }
 
 /// A link's queue binding.
@@ -234,6 +380,8 @@ enum Binding {
         /// acks are not draining runs out of credit and stops (backpressure).
         acked_since_grant: u32,
     },
+    /// Peer sender → the transaction coordinator (declare/discharge).
+    Coordinator,
     /// Peer receiver → our sender → subscribed to `queue` as `sub`.
     Consumer {
         queue: QueueHandle,
@@ -248,13 +396,43 @@ enum Binding {
     },
 }
 
+/// How a consumer's terminal state resolves a dispatched message: applied
+/// immediately, or staged under a transaction until discharge.
+enum SettleAction {
+    /// Apply now.
+    Now(SettleOutcome),
+    /// Stage under this transaction (`transactional-state` disposition).
+    Txn(ramqp_core::txn::TxnId, SettleOutcome),
+}
+
 /// The resolution of one dispatched delivery: which queue/sub/message it was
-/// and the outcome the consumer settled it with.
-type SettlementResult = (mpsc::Sender<QueueMsg>, SubId, u64, SettleOutcome);
+/// and how the consumer settled it.
+type SettlementResult = (mpsc::Sender<QueueMsg>, SubId, u64, SettleAction);
+
+/// The async half of a transaction discharge (commit): where to report the
+/// outcome once every staged operation lands.
+struct TxnDone {
+    channel: u16,
+    /// The identity of the session the discharge arrived on. Channels are
+    /// reused after end/begin, so the outcome is delivered only if the
+    /// session at `channel` is still THIS one — without the check a slow
+    /// commit's disposition would settle an unrelated delivery on whatever
+    /// new session inherited the channel.
+    session_id: SessionId,
+    handle: u32,
+    delivery_id: u32,
+    outcome: DischargeOutcome,
+}
 
 /// An established broker-side connection (post-handshake).
 struct BrokerConnection<S: IoStream> {
     transport: FramedTransport<S>,
+    /// The authenticated identity (`None` = anonymous).
+    identity: Option<String>,
+    /// The tenant namespace (empty = default vhost).
+    vhost: String,
+    /// Authorization decisions at attach time.
+    auth: Arc<dyn Authenticator>,
     config: Arc<BrokerConfig>,
     registry: Arc<QueueRegistry>,
     max_frame_size: usize,
@@ -276,6 +454,10 @@ struct BrokerConnection<S: IoStream> {
     next_gen: u64,
     /// In-flight consumer dispatches awaiting a terminal outcome.
     settlements: FuturesUnordered<std::pin::Pin<Box<dyn Future<Output = SettlementResult> + Send>>>,
+    /// Open transactions (staged work; dropped = rolled back).
+    txns: TxnManager,
+    /// In-flight transaction commits awaiting their staged work.
+    txn_results: FuturesUnordered<std::pin::Pin<Box<dyn Future<Output = TxnDone> + Send>>>,
     next_session_id: u64,
     metrics: SharedMetrics,
     /// Shared event channel for all accepted links; drained synchronously
@@ -332,8 +514,31 @@ impl<S: IoStream> BrokerConnection<S> {
                     self.flush().await?;
                 }
 
-                Some((queue, sub, msg_id, outcome)) = self.settlements.next() => {
-                    let _ = queue.send(QueueMsg::Settle { sub, msg_id, outcome }).await;
+                Some(done) = self.txn_results.next() => {
+                    self.report_txn_done(done);
+                    // Drain every other already-resolved discharge outcome:
+                    // the biased, read-preferring loop would otherwise defer
+                    // them behind a saturating producer (MED-15). Commit
+                    // EXECUTION already runs on its own task (see
+                    // handle_txn_control), so only the outcome reporting
+                    // rides this arm.
+                    while let Some(Some(next)) = self.txn_results.next().now_or_never() {
+                        self.report_txn_done(next);
+                    }
+                    self.flush().await?;
+                }
+
+                Some(result) = self.settlements.next() => {
+                    self.forward_settlement(result).await;
+                    // Drain everything else already resolved: a burst of
+                    // ranged dispositions resolves thousands of settlement
+                    // futures at once, and forwarding one per wakeup lets the
+                    // (biased, read-preferring) loop starve them — the queue
+                    // then thinks acked messages are still in flight, and a
+                    // close would requeue them all as duplicates.
+                    while let Some(Some(next)) = self.settlements.next().now_or_never() {
+                        self.forward_settlement(next).await;
+                    }
                 }
 
                 Some(event) = self.session_events_rx.recv() => {
@@ -372,9 +577,161 @@ impl<S: IoStream> BrokerConnection<S> {
     /// unacked messages requeue immediately (rather than on the queue's next
     /// failed dispatch).
     async fn cleanup(&mut self) {
+        // First forward every settlement outcome that already resolved (the
+        // dispositions a client pipelines right before `close`) — dropping
+        // them would requeue acked messages and redeliver them to the next
+        // consumer as duplicates. Two traps here:
+        // - `now_or_never` is unusable: the settlement futures await tokio
+        //   oneshots, whose polls consult the task's cooperative budget.
+        //   Right after a busy close the budget is exhausted, every poll
+        //   reports `Pending` regardless of actual readiness, and a
+        //   ready-only drain silently forwards nothing (hundreds of acked
+        //   messages requeued per close). `unconstrained` bypasses the
+        //   budget.
+        // - Some futures may be genuinely unresolved (the peer closed
+        //   without settling): the per-item timeout stops the drain there;
+        //   whatever remains requeues via the unsubscribes below
+        //   (at-least-once, as before).
+        self.drain_ready_settlements().await;
         for ((_, _), binding) in self.bindings.drain() {
             if let Binding::Consumer { queue, sub, .. } = binding {
                 let _ = queue.tx.send(QueueMsg::Unsubscribe { sub }).await;
+            }
+        }
+    }
+
+    /// Forward every settlement whose outcome has already resolved (see the
+    /// cleanup notes on the tokio-coop trap; `unconstrained` + a per-item
+    /// timeout so genuinely pending futures stop the drain).
+    async fn drain_ready_settlements(&mut self) {
+        loop {
+            let next = tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                tokio::task::unconstrained(self.settlements.next()),
+            );
+            match next.await {
+                Ok(Some(result)) => self.forward_settlement(result).await,
+                Ok(None) | Err(_) => break,
+            }
+        }
+    }
+
+    /// Forward only settlements that are resolved RIGHT NOW — no wait. Used
+    /// on the coordinator control path, where the client's pipelined
+    /// transactional dispositions were already processed synchronously by
+    /// the session in an earlier frame, so their settlement futures are
+    /// ready (or never will be). `unconstrained` bypasses the tokio-coop
+    /// budget so a ready oneshot isn't misread as pending; unlike the 20 ms
+    /// cleanup drain this adds no per-control-message latency (MED-13: every
+    /// declare/discharge previously stalled the whole connection ~20 ms).
+    async fn drain_ready_settlements_now(&mut self) {
+        loop {
+            let polled = tokio::task::unconstrained(self.settlements.next()).now_or_never();
+            match polled {
+                Some(Some(result)) => self.forward_settlement(result).await,
+                // Empty stream, or pending (nothing more is ready): stop.
+                Some(None) | None => break,
+            }
+        }
+    }
+
+    /// Report one discharge outcome to the coordinator link's client — only
+    /// if the session it arrived on is still the same one (channels are
+    /// reused; see [`TxnDone::session_id`]).
+    fn report_txn_done(&mut self, done: TxnDone) {
+        let Some(session) = self
+            .sessions
+            .get_mut(&done.channel)
+            .filter(|s| s.session_id == done.session_id)
+        else {
+            tracing::debug!(
+                channel = done.channel,
+                "discharge outcome dropped: its session is gone (channel reused or ended)"
+            );
+            return;
+        };
+        let state = match done.outcome {
+            DischargeOutcome::Complete => DeliveryState::Accepted(Accepted::default()),
+            DischargeOutcome::RolledBack => DeliveryState::Rejected(Rejected {
+                error: Some(AmqpError::new(
+                    AmqpCondition::InternalError,
+                    Some("transaction failed; rolled back (nothing was applied)".to_owned()),
+                )),
+            }),
+            // Atomicity broke mid-apply (fsync/Raft/actor failure after the
+            // reserve phase): tell the truth — a retry may duplicate what
+            // landed.
+            DischargeOutcome::Partial { applied, total } => DeliveryState::Rejected(Rejected {
+                error: Some(AmqpError::new(
+                    AmqpCondition::InternalError,
+                    Some(format!(
+                        "transaction failed after partial application: {applied} of {total} \
+                         staged publishes were committed; retrying may duplicate them"
+                    )),
+                )),
+            }),
+            DischargeOutcome::Unknown => DeliveryState::Rejected(Rejected {
+                error: Some(AmqpError::new(
+                    AmqpCondition::InternalError,
+                    Some("transaction outcome unknown (coordinator failed)".to_owned()),
+                )),
+            }),
+        };
+        session.send_disposition(
+            done.handle,
+            DeliveryId(done.delivery_id),
+            None,
+            state,
+            true,
+            &mut self.transport,
+        );
+    }
+
+    /// Hand one resolved dispatch outcome to its queue.
+    async fn forward_settlement(&mut self, result: SettlementResult) {
+        let (queue, sub, msg_id, action) = result;
+        match action {
+            SettleAction::Now(outcome) => {
+                let _ = queue
+                    .send(QueueMsg::Settle {
+                        sub,
+                        msg_id,
+                        outcome,
+                    })
+                    .await;
+            }
+            SettleAction::Txn(txn_id, outcome) => {
+                let staged = self.txns.stage_settle(
+                    &txn_id,
+                    StagedSettle {
+                        queue,
+                        sub,
+                        msg_id,
+                        outcome,
+                    },
+                );
+                if let crate::txn::SettleStage::Refused { settle, known_txn } = staged {
+                    // The settle cannot ride the transaction: the txn is at
+                    // its cap (now rollback-only — its discharge will fail)
+                    // or was already discharged (the disposition raced the
+                    // discharge frame). Requeue instead of leaving the
+                    // message stranded in flight with no redelivery path —
+                    // a duplicate is recoverable (at-least-once), an
+                    // invisible message is not.
+                    tracing::warn!(
+                        msg_id,
+                        known_txn,
+                        "transactional settle refused; requeueing the message"
+                    );
+                    let _ = settle
+                        .queue
+                        .send(QueueMsg::Settle {
+                            sub: settle.sub,
+                            msg_id: settle.msg_id,
+                            outcome: SettleOutcome::Requeue,
+                        })
+                        .await;
+                }
             }
         }
     }
@@ -420,7 +777,12 @@ impl<S: IoStream> BrokerConnection<S> {
                 let Some(session) = self.sessions.get_mut(&channel) else {
                     // Session raced away: requeue on the validated queue.
                     self.settlements.push(Box::pin(async move {
-                        (queue_tx, sub, msg_id, SettleOutcome::Requeue)
+                        (
+                            queue_tx,
+                            sub,
+                            msg_id,
+                            SettleAction::Now(SettleOutcome::Requeue),
+                        )
                     }));
                     return;
                 };
@@ -436,13 +798,24 @@ impl<S: IoStream> BrokerConnection<S> {
                     self.max_frame_size,
                 );
                 self.settlements.push(Box::pin(async move {
-                    let outcome = match reply_rx.await {
-                        Ok(Ok(state)) => state_to_outcome(&state),
+                    let action = match reply_rx.await {
+                        Ok(Ok(state)) => match txn_state(&state) {
+                            // A transactional settlement: stage it under the
+                            // transaction (applied/undone at discharge).
+                            Some(ts) => SettleAction::Txn(
+                                ts.txn_id,
+                                ts.outcome
+                                    .as_ref()
+                                    .map(outcome_to_settle)
+                                    .unwrap_or(SettleOutcome::Ack),
+                            ),
+                            None => SettleAction::Now(state_to_outcome(&state)),
+                        },
                         // Link/connection died before a terminal outcome:
                         // requeue (no-op if an unsubscribe already did).
-                        Ok(Err(_)) | Err(_) => SettleOutcome::Requeue,
+                        Ok(Err(_)) | Err(_) => SettleAction::Now(SettleOutcome::Requeue),
                     };
-                    (queue_tx, sub, msg_id, outcome)
+                    (queue_tx, sub, msg_id, action)
                 }));
             }
             ConnCmd::SettleIncoming {
@@ -514,6 +887,158 @@ impl<S: IoStream> BrokerConnection<S> {
         }
     }
 
+    /// Handle one coordinator control message (`declare` / `discharge`).
+    ///
+    /// Declares and rollbacks answer synchronously. A commit resolves
+    /// asynchronously through `txn_results`: every staged enqueue must be
+    /// accepted by its queue (Raft-committed / fsynced for replicated and
+    /// durable queues — the coordinator inherits cluster-awareness from the
+    /// queue layer) before the discharge is answered `accepted`.
+    fn handle_txn_control(
+        &mut self,
+        channel: u16,
+        handle: u32,
+        d: ramqp_core::proto::IncomingDelivery,
+    ) {
+        let delivery_id = d.delivery_id;
+        let control = decode_control(&d.message);
+        match control {
+            Some(TxnControl::Declare { global_id }) => {
+                // Confirm the session is live FIRST: declaring before that
+                // would allocate a MAX_TXNS slot that leaks until connection
+                // close if the session is already gone (LOW-14).
+                if !self.sessions.contains_key(&channel) {
+                    return;
+                }
+                let state = if global_id {
+                    // A global-id declare requests a DISTRIBUTED transaction;
+                    // this coordinator advertises local transactions only —
+                    // reject it instead of silently making a local txn
+                    // (LOW-15).
+                    DeliveryState::Rejected(Rejected {
+                        error: Some(AmqpError::new(
+                            AmqpCondition::NotImplemented,
+                            Some(
+                                "distributed transactions (global-id) are not supported".to_owned(),
+                            ),
+                        )),
+                    })
+                } else {
+                    match self.txns.declare() {
+                        Some(txn_id) => declared_state(txn_id),
+                        None => DeliveryState::Rejected(Rejected {
+                            error: Some(AmqpError::new(
+                                AmqpCondition::ResourceLimitExceeded,
+                                Some("too many open transactions".to_owned()),
+                            )),
+                        }),
+                    }
+                };
+                if let Some(session) = self.sessions.get_mut(&channel) {
+                    session.send_disposition(
+                        handle,
+                        delivery_id,
+                        None,
+                        state,
+                        true,
+                        &mut self.transport,
+                    );
+                    session.grant_credit(handle, 1, &mut self.transport);
+                }
+            }
+            Some(TxnControl::Discharge { txn_id, fail }) => {
+                let Some(txn) = self.txns.take(&txn_id) else {
+                    if let Some(session) = self.sessions.get_mut(&channel) {
+                        session.send_disposition(
+                            handle,
+                            delivery_id,
+                            None,
+                            DeliveryState::Rejected(Rejected {
+                                error: Some(AmqpError::new(
+                                    // Spec part 4: an unknown txn-id is
+                                    // amqp:transaction:unknown-id, not the
+                                    // generic amqp:not-found (LOW-15).
+                                    TransactionError::UnknownId,
+                                    Some("unknown transaction".to_owned()),
+                                )),
+                            }),
+                            true,
+                            &mut self.transport,
+                        );
+                        session.grant_credit(handle, 1, &mut self.transport);
+                    }
+                    return;
+                };
+                let done = TxnDone {
+                    channel,
+                    session_id: self
+                        .sessions
+                        .get(&channel)
+                        .map(|s| s.session_id)
+                        // No live session: stamp an id that can never match,
+                        // so the outcome is silently dropped (nothing to
+                        // answer) while the discharge still executes.
+                        .unwrap_or(SessionId(u64::MAX)),
+                    handle,
+                    delivery_id: delivery_id.value(),
+                    outcome: DischargeOutcome::Complete,
+                };
+                // Detached execution: the commit/rollback runs to completion
+                // even if this connection dies mid-way — dropping it with the
+                // connection would strand a half-applied transaction (some
+                // enqueues landed, settlements never processed, no outcome).
+                let (done_tx, done_rx) = oneshot::channel();
+                tokio::spawn(async move {
+                    let outcome = if fail {
+                        // Roll back: staged enqueues drop; staged settlements
+                        // requeue their (still in-flight) messages.
+                        crate::txn::execute_rollback(txn).await;
+                        DischargeOutcome::Complete
+                    } else if txn.rollback_only {
+                        // A staged operation was refused (staging cap): the
+                        // transaction's work is incomplete, so committing it
+                        // would be silently partial. Roll back and tell the
+                        // client the commit failed.
+                        crate::txn::execute_rollback(txn).await;
+                        DischargeOutcome::RolledBack
+                    } else {
+                        // Commit: reserve on every queue, then land every
+                        // staged enqueue (its queue's own durability confirm)
+                        // before the settlements apply (see txn.rs).
+                        crate::txn::execute_commit(txn).await
+                    };
+                    let _ = done_tx.send(outcome);
+                });
+                self.txn_results.push(Box::pin(async move {
+                    let outcome = done_rx.await.unwrap_or(DischargeOutcome::Unknown);
+                    TxnDone { outcome, ..done }
+                }));
+                if let Some(session) = self.sessions.get_mut(&channel) {
+                    session.grant_credit(handle, 1, &mut self.transport);
+                }
+            }
+            None => {
+                tracing::warn!("undecodable coordinator control message");
+                if let Some(session) = self.sessions.get_mut(&channel) {
+                    session.send_disposition(
+                        handle,
+                        delivery_id,
+                        None,
+                        DeliveryState::Rejected(Rejected {
+                            error: Some(AmqpError::new(
+                                AmqpCondition::DecodeError,
+                                Some("expected declare or discharge".to_owned()),
+                            )),
+                        }),
+                        true,
+                        &mut self.transport,
+                    );
+                    session.grant_credit(handle, 1, &mut self.transport);
+                }
+            }
+        }
+    }
+
     /// Resolve a peer channel to our local channel for an inbound link frame.
     /// `Ok(Some(local))` — process it; `Ok(None)` — silently ignore (a frame
     /// pipelined behind an `End` we already sent for a session we ended);
@@ -571,7 +1096,14 @@ impl<S: IoStream> BrokerConnection<S> {
                     .expect("bound channel")
                     .knows_link(&attach.name)
                 {
-                    // A response to a link we initiated (none today).
+                    // A response to a link WE initiated — of which there are
+                    // none today (the broker never initiates links), so this
+                    // branch is unreachable for peer attaches. It routes to
+                    // handle_link_frame, which does NOT call authorize(): the
+                    // one attach path that skips authz. It stays safe only
+                    // because a "known" link is already bound (no new binding
+                    // or queue resolution happens here) — if the broker ever
+                    // initiates links, re-verify that invariant (LOW-13).
                     let session = self.sessions.get_mut(&local).expect("bound channel");
                     session
                         .handle_link_frame(
@@ -607,6 +1139,56 @@ impl<S: IoStream> BrokerConnection<S> {
     /// Accept a peer-initiated attach: resolve its address to a queue, mirror
     /// the endpoint, and bind it.
     async fn accept_attach(&mut self, local: u16, remote_channel: u16, attach: Attach) {
+        // A sender targeting a COORDINATOR is a transaction control link
+        // (spec part 4) — no queue behind it; declare/discharge control
+        // messages arrive as deliveries.
+        if attach.role == Role::Sender
+            && matches!(&attach.target, Some(TargetArchetype::Coordinator(_)))
+        {
+            if !self.auth.authorize(
+                self.identity.as_deref(),
+                &self.vhost,
+                "$coordinator",
+                Operation::Send,
+            ) {
+                let session = self.sessions.get_mut(&local).expect("bound channel");
+                session.refuse_peer_attach(
+                    &attach,
+                    AmqpError::new(
+                        AmqpCondition::UnauthorizedAccess,
+                        Some("not authorized to use transactions".to_owned()),
+                    ),
+                    &mut self.transport,
+                );
+                return;
+            }
+            let session = self.sessions.get_mut(&local).expect("bound channel");
+            let accepted = session.accept_peer_attach(
+                attach,
+                CreditMode::Manual,
+                self.config.initial_credit,
+                self.config.max_message_size,
+                self.link_events_tx.clone(),
+                &mut self.transport,
+            );
+            match accepted {
+                Ok(a) => {
+                    self.bindings
+                        .insert((local, a.handle.0), Binding::Coordinator);
+                    tracing::debug!(handle = a.handle.0, "coordinator link bound");
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "coordinator attach rejected; ending session");
+                    self.end_session_with_error(
+                        local,
+                        remote_channel,
+                        AmqpError::new(AmqpCondition::ResourceLimitExceeded, Some(e.to_string())),
+                    )
+                    .await;
+                }
+            }
+            return;
+        }
         // Producer (peer sender) targets a queue; consumer (peer receiver)
         // sources from one.
         let address = match attach.role {
@@ -616,8 +1198,31 @@ impl<S: IoStream> BrokerConnection<S> {
             },
             Role::Receiver => attach.source.as_ref().and_then(|s| s.address.clone()),
         };
+        // Authorize before resolving (an unauthorized attach must not even
+        // auto-declare the queue).
+        let operation = match attach.role {
+            Role::Sender => Operation::Send,
+            Role::Receiver => Operation::Receive,
+        };
+        if let Some(a) = address.as_deref()
+            && !self
+                .auth
+                .authorize(self.identity.as_deref(), &self.vhost, a, operation)
+        {
+            tracing::debug!(identity = ?self.identity, address = %a, ?operation, "attach denied");
+            let session = self.sessions.get_mut(&local).expect("bound channel");
+            session.refuse_peer_attach(
+                &attach,
+                AmqpError::new(
+                    AmqpCondition::UnauthorizedAccess,
+                    Some(format!("not authorized to {operation:?} on {a}")),
+                ),
+                &mut self.transport,
+            );
+            return;
+        }
         let queue = match address.as_deref() {
-            Some(a) => self.registry.resolve(a).await,
+            Some(a) => self.registry.resolve_in(&self.vhost, a).await,
             None => None,
         };
         let Some(queue) = queue else {
@@ -687,7 +1292,20 @@ impl<S: IoStream> BrokerConnection<S> {
                     .is_ok();
                 let Ok(sub) = reply_rx.await else {
                     debug_assert!(!subscribed, "queue died between send and reply");
-                    tracing::warn!(queue = %queue.name, "queue actor unavailable");
+                    // The actor died after we accepted the attach: end the
+                    // session with an error so the consumer learns its link
+                    // is dead instead of waiting forever on a zombie link
+                    // that ignores flow/drain (LOW-8).
+                    tracing::warn!(queue = %queue.name, "queue actor unavailable; ending session");
+                    self.end_session_with_error(
+                        local,
+                        remote_channel,
+                        AmqpError::new(
+                            AmqpCondition::InternalError,
+                            Some(format!("queue {} became unavailable", queue.name)),
+                        ),
+                    )
+                    .await;
                     return;
                 };
                 Binding::Consumer {
@@ -711,10 +1329,69 @@ impl<S: IoStream> BrokerConnection<S> {
                     let handle = d.handle.0;
                     // Clone the sender + epoch out so the bindings borrow is
                     // released before the await / the credit replenishment.
-                    let (queue_tx, epoch) = match self.bindings.get(&(channel, handle)) {
-                        Some(Binding::Producer { queue, epoch, .. }) => (queue.tx.clone(), *epoch),
+                    let (queue_tx, queue_name, epoch) = match self.bindings.get(&(channel, handle))
+                    {
+                        Some(Binding::Producer { queue, epoch, .. }) => {
+                            (queue.tx.clone(), queue.name.clone(), *epoch)
+                        }
+                        Some(Binding::Coordinator) => {
+                            // The client pipelines transactional dispositions
+                            // ahead of its discharge; their settlement
+                            // futures are resolved but may not be staged yet.
+                            // Drain the ready ones first or a discharge could
+                            // take an incomplete transaction — the zero-wait
+                            // variant so a control message adds no latency.
+                            self.drain_ready_settlements_now().await;
+                            self.handle_txn_control(channel, handle, d);
+                            continue;
+                        }
                         _ => continue, // link vanished mid-flight
                     };
+                    // A transfer carrying `transactional-state` stages its
+                    // enqueue under the transaction instead of publishing.
+                    if let Some(ts) = d.state.as_ref().and_then(txn_state) {
+                        let staged = self.txns.stage_publish(
+                            &ts.txn_id,
+                            StagedPublish {
+                                queue: queue_tx,
+                                queue_name,
+                                body: d.message,
+                            },
+                        );
+                        if let Some(session) = self.sessions.get_mut(&channel) {
+                            use crate::txn::PublishStage;
+                            let state = match staged {
+                                PublishStage::Staged => transactional_state(
+                                    ts.txn_id,
+                                    Some(ramqp_core::types::messaging::Outcome::Accepted(
+                                        Accepted::default(),
+                                    )),
+                                ),
+                                PublishStage::UnknownTxn => DeliveryState::Rejected(Rejected {
+                                    error: Some(AmqpError::new(
+                                        TransactionError::UnknownId,
+                                        Some("unknown transaction".to_owned()),
+                                    )),
+                                }),
+                                PublishStage::Capped => DeliveryState::Rejected(Rejected {
+                                    error: Some(AmqpError::new(
+                                        AmqpCondition::ResourceLimitExceeded,
+                                        Some("transaction staging cap reached".to_owned()),
+                                    )),
+                                }),
+                            };
+                            session.send_disposition(
+                                handle,
+                                d.delivery_id,
+                                None,
+                                state,
+                                true,
+                                &mut self.transport,
+                            );
+                        }
+                        self.replenish_producer_credit(channel, handle);
+                        continue;
+                    }
                     let settled = d.settled;
                     let ack = (!settled).then(|| PublishAck {
                         conn: self.cmd_tx.clone(),
@@ -781,10 +1458,22 @@ impl<S: IoStream> BrokerConnection<S> {
                     }
                 }
                 LinkEvent::Detached { handle, .. } => {
-                    if let Some(Binding::Consumer { queue, sub, .. }) =
-                        self.bindings.remove(&(channel, handle.0))
-                    {
-                        let _ = queue.tx.send(QueueMsg::Unsubscribe { sub }).await;
+                    match self.bindings.remove(&(channel, handle.0)) {
+                        Some(Binding::Consumer { queue, sub, .. }) => {
+                            let _ = queue.tx.send(QueueMsg::Unsubscribe { sub }).await;
+                        }
+                        // A coordinator link detaching orphans this
+                        // connection's transactions: roll them all back so
+                        // staged settles requeue, staged publish bytes free,
+                        // and the MAX_TXNS slots are reclaimed (MED-14) —
+                        // otherwise a client that re-attaches its coordinator
+                        // on error leaks slots until the connection closes.
+                        Some(Binding::Coordinator) => {
+                            for txn in self.txns.take_all() {
+                                tokio::spawn(crate::txn::execute_rollback(txn));
+                            }
+                        }
+                        _ => {}
                     }
                 }
                 // Consumer settlements arrive via the per-dispatch replies in
@@ -932,6 +1621,23 @@ impl<S: IoStream> BrokerConnection<S> {
     }
 }
 
+/// Map a transactional provisional outcome onto a queue settlement.
+fn outcome_to_settle(outcome: &ramqp_core::types::messaging::Outcome) -> SettleOutcome {
+    use ramqp_core::types::messaging::Outcome;
+    match outcome {
+        Outcome::Accepted(_) => SettleOutcome::Ack,
+        Outcome::Released(_) => SettleOutcome::Requeue,
+        Outcome::Modified(m) => {
+            if m.delivery_failed.unwrap_or(false) {
+                SettleOutcome::RequeueFailed
+            } else {
+                SettleOutcome::Requeue
+            }
+        }
+        Outcome::Rejected(_) => SettleOutcome::Drop,
+    }
+}
+
 /// Map a consumer's terminal delivery state onto a queue settlement.
 fn state_to_outcome(state: &DeliveryState) -> SettleOutcome {
     match state {
@@ -956,4 +1662,25 @@ fn unknown_channel(channel: u16) -> ConnectError {
         ErrorKind::ProtocolViolation,
         format!("frame on unmapped channel {channel}"),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// MED-16 (issue #19): the decoy verifier for an unknown user must be
+    /// stable per username (a changing salt across probes would itself be an
+    /// enumeration oracle) and differ between usernames.
+    #[test]
+    fn fake_scram_verifier_is_deterministic_per_username() {
+        let m = ScramMechanism::Sha256;
+        let a1 = fake_scram_verifier(m, "mallory");
+        let a2 = fake_scram_verifier(m, "mallory");
+        assert_eq!(a1.salt, a2.salt, "same user → same salt");
+        assert_eq!(a1.stored_key, a2.stored_key);
+        assert_eq!(a1.iterations, 8192, "matches the StaticScram default");
+
+        let b = fake_scram_verifier(m, "trudy");
+        assert_ne!(a1.salt, b.salt, "different users → different salts");
+    }
 }

@@ -191,6 +191,23 @@ impl Consumer {
         self.dispose(delivery, DeliveryState::from(outcome)).await
     }
 
+    /// Settle a delivery **inside a transaction**: the disposition carries
+    /// `transactional-state`, so the broker stages `outcome` under `txn_id`
+    /// and applies it at commit (a rollback requeues the message instead).
+    #[cfg(feature = "transaction")]
+    pub async fn settle_in_txn(
+        &self,
+        delivery: &Delivery,
+        txn_id: crate::txn::TxnId,
+        outcome: Outcome,
+    ) -> Result<(), RecvError> {
+        self.dispose(
+            delivery,
+            crate::txn::transactional_state(txn_id, Some(outcome)),
+        )
+        .await
+    }
+
     async fn dispose(&self, delivery: &Delivery, state: DeliveryState) -> Result<(), RecvError> {
         self.dispose_range(delivery.delivery_id, None, state).await
     }

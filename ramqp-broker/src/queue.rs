@@ -28,6 +28,7 @@ use bytes::Bytes;
 use tokio::sync::mpsc;
 
 use crate::dispatch::{Subscriber, complete_drains, confirm_publish, pick_ready, refuse_publish};
+use crate::policy::{EffectivePolicy, now_ms};
 
 /// A queue's identity + mailbox, cheap to clone.
 #[derive(Debug, Clone)]
@@ -64,6 +65,31 @@ pub(crate) enum QueueMsg {
         body: Bytes,
         /// Where to confirm (unsettled publishes); `None` for pre-settled.
         ack: Option<PublishAck>,
+    },
+    /// Store a message into a slot previously held by [`QueueMsg::Reserve`]
+    /// (the transaction-commit path): consumes one reserved slot and is never
+    /// refused for capacity — admission was decided at reserve time.
+    PublishReserved {
+        /// The raw message bytes as received (all sections).
+        body: Bytes,
+        /// Where to confirm; `None` for pre-settled.
+        ack: Option<PublishAck>,
+    },
+    /// Atomically reserve `count` capacity slots (transaction commit phase 1).
+    /// Reserved slots count against the depth bound for ordinary publishes and
+    /// are consumed by [`QueueMsg::PublishReserved`] or released by
+    /// [`QueueMsg::Unreserve`]. Replies `false` when the queue cannot hold
+    /// `count` more messages (drop-head queues always accept — they make room).
+    Reserve {
+        /// Slots requested.
+        count: u32,
+        /// `true` — reserved; `false` — refused (commit must roll back).
+        reply: tokio::sync::oneshot::Sender<bool>,
+    },
+    /// Release reserved slots that will not be published (commit abort).
+    Unreserve {
+        /// Slots to release.
+        count: u32,
     },
     /// Add a consumer. Deliveries flow to `conn` as [`ConnCmd::Deliver`].
     Subscribe {
@@ -107,6 +133,22 @@ pub(crate) enum QueueMsg {
         /// Which subscriber.
         sub: SubId,
     },
+    /// Report queue statistics (management surface; never on the hot path).
+    Stats {
+        /// Where to reply.
+        reply: tokio::sync::oneshot::Sender<QueueStats>,
+    },
+}
+
+/// A point-in-time queue statistics snapshot.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct QueueStats {
+    /// Messages ready to dispatch.
+    pub ready: usize,
+    /// Messages dispatched, awaiting settlement.
+    pub unacked: usize,
+    /// Attached consumers.
+    pub consumers: usize,
 }
 
 /// Where to confirm an unsettled publish once stored (or refuse it).
@@ -168,44 +210,90 @@ struct Stored {
     body: Bytes,
     /// Delivery attempts that failed (modified{delivery-failed}).
     failures: u32,
+    /// Enqueue time (ms since epoch), for lazy TTL expiry.
+    enqueued_ms: u64,
 }
 
 /// Spawn a queue actor; the returned handle is its only address.
-pub(crate) fn spawn(name: String, max_depth: usize) -> QueueHandle {
+pub(crate) fn spawn(name: String, policy: EffectivePolicy) -> QueueHandle {
     let (tx, rx) = mpsc::channel(1024);
     let handle = QueueHandle {
         name: name.clone(),
         tx,
     };
-    tokio::spawn(run(name, rx, max_depth));
+    tokio::spawn(run(name, rx, policy));
     handle
 }
 
-async fn run(name: String, mut rx: mpsc::Receiver<QueueMsg>, max_depth: usize) {
+async fn run(name: String, mut rx: mpsc::Receiver<QueueMsg>, policy: EffectivePolicy) {
     let mut ready: VecDeque<Stored> = VecDeque::new();
     let mut unacked: HashMap<u64, (Stored, SubId)> = HashMap::new();
     let mut subs: Vec<Subscriber> = Vec::new();
+    // Capacity slots held for transaction commits (counted against the depth
+    // bound; consumed by PublishReserved, released by Unreserve).
+    let mut reserved: usize = 0;
+    // Bytes of message bodies currently held (ready + unacked): the RAM
+    // bound — the depth bound alone admits depth × max-message-size.
+    let mut bytes: usize = 0;
     let mut next_msg_id: u64 = 0;
     let mut next_sub_id: SubId = 0;
     let mut rr: usize = 0;
 
     while let Some(msg) = rx.recv().await {
+        let from_reserved = matches!(msg, QueueMsg::PublishReserved { .. });
         match msg {
-            QueueMsg::Publish { body, ack } => {
-                if ready.len() + unacked.len() >= max_depth {
-                    // Refuse rather than grow without bound (broker.md §3.2).
+            QueueMsg::Publish { body, ack } | QueueMsg::PublishReserved { body, ack } => {
+                if from_reserved {
+                    reserved = reserved.saturating_sub(1);
+                }
+                // At a bound (depth or bytes): drop-head makes room
+                // (dead-lettering displaced messages); otherwise refuse —
+                // never grow without bound (broker.md §3.2).
+                let over = |ready_len: usize, unacked_len: usize, bytes_now: usize| {
+                    ready_len + unacked_len + reserved >= policy.max_len
+                        || bytes_now.saturating_add(body.len()) > policy.max_bytes
+                };
+                let mut needs_room = over(ready.len(), unacked.len(), bytes);
+                if needs_room && policy.drop_head {
+                    while needs_room {
+                        let Some(old) = ready.pop_front() else { break };
+                        bytes = bytes.saturating_sub(old.body.len());
+                        policy.dead_letter(&name, "maxlen", old.body);
+                        needs_room = over(ready.len(), unacked.len(), bytes);
+                    }
+                }
+                // A reserved publish is never refused for depth: its slot was
+                // admitted at Reserve time (`needs_room` can only persist
+                // here if the reservation was lost to a failover, or unacked
+                // messages pin the byte budget).
+                if needs_room && !from_reserved {
                     refuse_publish(&name, ack);
                     continue;
                 }
                 next_msg_id += 1;
+                bytes = bytes.saturating_add(body.len());
                 ready.push_back(Stored {
                     id: next_msg_id,
                     body,
                     failures: 0,
+                    enqueued_ms: now_ms(),
                 });
                 // In-memory transient queue: stored == settled. (A durable /
                 // quorum queue confirms here only after fsync / Raft commit.)
                 confirm_publish(ack);
+            }
+            QueueMsg::Reserve { count, reply } => {
+                // Drop-head queues always accept (a publish makes its own
+                // room), so their slots are never actually held.
+                let ok = policy.drop_head
+                    || ready.len() + unacked.len() + reserved + count as usize <= policy.max_len;
+                if ok && !policy.drop_head {
+                    reserved += count as usize;
+                }
+                let _ = reply.send(ok);
+            }
+            QueueMsg::Unreserve { count } => {
+                reserved = reserved.saturating_sub(count as usize);
             }
             QueueMsg::Subscribe {
                 conn,
@@ -245,14 +333,28 @@ async fn run(name: String, mut rx: mpsc::Receiver<QueueMsg>, max_depth: usize) {
                 }
                 if let Some((mut stored, _)) = unacked.remove(&msg_id) {
                     match outcome {
-                        SettleOutcome::Ack | SettleOutcome::Drop => {}
+                        SettleOutcome::Ack | SettleOutcome::Drop => {
+                            bytes = bytes.saturating_sub(stored.body.len());
+                        }
                         SettleOutcome::Requeue => ready.push_front(stored),
                         SettleOutcome::RequeueFailed => {
                             stored.failures += 1;
-                            ready.push_front(stored);
+                            if policy.attempts_exhausted(stored.failures) {
+                                bytes = bytes.saturating_sub(stored.body.len());
+                                policy.dead_letter(&name, "delivery-limit", stored.body);
+                            } else {
+                                ready.push_front(stored);
+                            }
                         }
                     }
                 }
+            }
+            QueueMsg::Stats { reply } => {
+                let _ = reply.send(QueueStats {
+                    ready: ready.len(),
+                    unacked: unacked.len(),
+                    consumers: subs.len(),
+                });
             }
             QueueMsg::Unsubscribe { sub } => {
                 subs.retain(|s| s.id != sub);
@@ -272,18 +374,43 @@ async fn run(name: String, mut rx: mpsc::Receiver<QueueMsg>, max_depth: usize) {
         }
 
         // Dispatch: round-robin over subscribers with demand.
-        dispatch(&name, &mut ready, &mut unacked, &mut subs, &mut rr).await;
+        dispatch(
+            &name,
+            &policy,
+            &mut ready,
+            &mut unacked,
+            &mut subs,
+            &mut rr,
+            &mut bytes,
+        )
+        .await;
     }
     tracing::debug!(queue = %name, "queue actor stopped");
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn dispatch(
     name: &str,
+    policy: &EffectivePolicy,
     ready: &mut VecDeque<Stored>,
     unacked: &mut HashMap<u64, (Stored, SubId)>,
     subs: &mut Vec<Subscriber>,
     rr: &mut usize,
+    bytes: &mut usize,
 ) {
+    // Lazy TTL: expire from the head before dispatching (RabbitMQ-classic
+    // semantics — an expired message leaves when it reaches the front).
+    if policy.ttl_ms.is_some() {
+        let now = now_ms();
+        while ready
+            .front()
+            .is_some_and(|m| policy.expired(m.enqueued_ms, now))
+        {
+            let expired = ready.pop_front().expect("non-empty");
+            *bytes = bytes.saturating_sub(expired.body.len());
+            policy.dead_letter(name, "expired", expired.body);
+        }
+    }
     while !ready.is_empty() {
         // Next subscriber with demand (round-robin); stop if none want work.
         let Some(idx) = pick_ready(subs, *rr) else {
@@ -305,9 +432,22 @@ async fn dispatch(
         if sub.conn.send(cmd).is_ok() {
             unacked.insert(msg.id, (msg, sub_id));
         } else {
-            // Connection gone: drop the subscriber, put the message back.
+            // Connection gone: drop the subscriber, put the message back —
+            // and requeue everything ELSE it held (without a clean
+            // Unsubscribe those in-flights would strand forever, MED-9).
             tracing::debug!(queue = %name, sub = sub_id, "subscriber connection closed");
             ready.push_front(msg);
+            let mut orphaned: Vec<u64> = unacked
+                .iter()
+                .filter(|(_, (_, owner))| *owner == sub_id)
+                .map(|(id, _)| *id)
+                .collect();
+            orphaned.sort_unstable();
+            for id in orphaned.into_iter().rev() {
+                if let Some((stored, _)) = unacked.remove(&id) {
+                    ready.push_front(stored);
+                }
+            }
             subs.retain(|s| s.id != sub_id);
         }
     }
@@ -339,7 +479,7 @@ mod tests {
 
     #[tokio::test]
     async fn publish_dispatch_settle_round_trip() {
-        let q = spawn("t".into(), 100);
+        let q = spawn("t".into(), EffectivePolicy::depth_only(100));
         let (conn_tx, mut conn_rx) = mpsc::unbounded_channel();
 
         let sub = subscribe(&q, &conn_tx, 7).await;
@@ -380,7 +520,7 @@ mod tests {
 
     #[tokio::test]
     async fn requeue_redelivers() {
-        let q = spawn("t".into(), 100);
+        let q = spawn("t".into(), EffectivePolicy::depth_only(100));
         let (conn_tx, mut conn_rx) = mpsc::unbounded_channel();
         let sub = subscribe(&q, &conn_tx, 1).await;
         q.tx.send(QueueMsg::Demand {
@@ -420,7 +560,7 @@ mod tests {
     /// relies on).
     #[tokio::test]
     async fn demand_grants_are_additive() {
-        let q = spawn("t".into(), 100);
+        let q = spawn("t".into(), EffectivePolicy::depth_only(100));
         let (conn_tx, mut conn_rx) = mpsc::unbounded_channel();
         let sub = subscribe(&q, &conn_tx, 1).await;
         q.tx.send(QueueMsg::Demand {
@@ -458,7 +598,7 @@ mod tests {
     /// remainder so a later publish is not dispatched against stale credit.
     #[tokio::test]
     async fn drain_drops_unmet_demand() {
-        let q = spawn("t".into(), 100);
+        let q = spawn("t".into(), EffectivePolicy::depth_only(100));
         let (conn_tx, mut conn_rx) = mpsc::unbounded_channel();
         let sub = subscribe(&q, &conn_tx, 1).await;
         // One message is ready; drain-grant credit for five.
@@ -498,7 +638,7 @@ mod tests {
 
     #[tokio::test]
     async fn competing_consumers_round_robin() {
-        let q = spawn("t".into(), 100);
+        let q = spawn("t".into(), EffectivePolicy::depth_only(100));
         let (c1_tx, mut c1_rx) = mpsc::unbounded_channel();
         let (c2_tx, mut c2_rx) = mpsc::unbounded_channel();
         let s1 = subscribe(&q, &c1_tx, 1).await;
@@ -544,9 +684,74 @@ mod tests {
         assert_eq!((got1, got2), (2, 2));
     }
 
+    /// MED-9 (issue #19): a subscriber whose connection channel drops
+    /// WITHOUT a clean Unsubscribe must have ALL its in-flight messages
+    /// requeued when the dead channel is detected — not just the one whose
+    /// send failed.
+    #[tokio::test]
+    async fn dead_subscriber_requeues_all_its_inflights() {
+        let q = spawn("t".into(), EffectivePolicy::depth_only(100));
+        let (c1_tx, mut c1_rx) = mpsc::unbounded_channel();
+        let s1 = subscribe(&q, &c1_tx, 1).await;
+        q.tx.send(QueueMsg::Demand {
+            sub: s1,
+            credit: 10,
+            drain: false,
+        })
+        .await
+        .unwrap();
+        // Two messages go in flight to s1.
+        for b in [b"m1".as_slice(), b"m2"] {
+            q.tx.send(QueueMsg::Publish {
+                body: Bytes::copy_from_slice(b),
+                ack: None,
+            })
+            .await
+            .unwrap();
+        }
+        for _ in 0..2 {
+            assert!(matches!(
+                c1_rx.recv().await.unwrap(),
+                ConnCmd::Deliver { .. }
+            ));
+        }
+        // The consumer's channel dies with NO Unsubscribe; a third publish
+        // makes the actor detect it (the send fails).
+        drop(c1_rx);
+        q.tx.send(QueueMsg::Publish {
+            body: Bytes::from_static(b"m3"),
+            ack: None,
+        })
+        .await
+        .unwrap();
+
+        // A fresh consumer must receive ALL THREE messages.
+        let (c2_tx, mut c2_rx) = mpsc::unbounded_channel();
+        let s2 = subscribe(&q, &c2_tx, 2).await;
+        q.tx.send(QueueMsg::Demand {
+            sub: s2,
+            credit: 10,
+            drain: false,
+        })
+        .await
+        .unwrap();
+        let mut got = Vec::new();
+        for _ in 0..3 {
+            let cmd = tokio::time::timeout(std::time::Duration::from_secs(5), c2_rx.recv())
+                .await
+                .expect("all in-flights requeued (m1/m2 were stranded before the fix)")
+                .expect("delivery");
+            if let ConnCmd::Deliver { body, .. } = cmd {
+                got.push(body);
+            }
+        }
+        got.sort();
+        assert_eq!(got, vec!["m1", "m2", "m3"]);
+    }
+
     #[tokio::test]
     async fn unsubscribe_requeues_unacked() {
-        let q = spawn("t".into(), 100);
+        let q = spawn("t".into(), EffectivePolicy::depth_only(100));
         let (c1_tx, mut c1_rx) = mpsc::unbounded_channel();
         let s1 = subscribe(&q, &c1_tx, 1).await;
         q.tx.send(QueueMsg::Demand {
@@ -588,7 +793,7 @@ mod tests {
     /// otherwise a stale ack would drop a message the new owner still holds.
     #[tokio::test]
     async fn stale_settle_from_former_owner_is_ignored() {
-        let q = spawn("t".into(), 100);
+        let q = spawn("t".into(), EffectivePolicy::depth_only(100));
         let (c1_tx, mut c1_rx) = mpsc::unbounded_channel();
         let s1 = subscribe(&q, &c1_tx, 1).await;
         q.tx.send(QueueMsg::Demand {
@@ -651,9 +856,161 @@ mod tests {
         assert_eq!(m3, msg_id, "message survived the stale former-owner ack");
     }
 
+    async fn reserve(q: &QueueHandle, count: u32) -> bool {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        q.tx.send(QueueMsg::Reserve { count, reply: tx })
+            .await
+            .unwrap();
+        rx.await.unwrap()
+    }
+
+    /// Reserved slots are held against ordinary publishes and consumed by
+    /// `PublishReserved` (the transaction-commit two-phase protocol).
+    #[tokio::test]
+    async fn reserve_holds_capacity_and_publish_reserved_consumes_it() {
+        let q = spawn("t".into(), EffectivePolicy::depth_only(2));
+        let (conn_tx, mut conn_rx) = mpsc::unbounded_channel();
+
+        assert!(reserve(&q, 1).await, "one of two slots reserved");
+        // First ordinary publish takes the remaining free slot...
+        q.tx.send(QueueMsg::Publish {
+            body: Bytes::from_static(b"a"),
+            ack: None,
+        })
+        .await
+        .unwrap();
+        // ...the second must be refused: the reserved slot is not available.
+        q.tx.send(QueueMsg::Publish {
+            body: Bytes::from_static(b"b"),
+            ack: Some(PublishAck {
+                conn: conn_tx.clone(),
+                channel: 0,
+                handle: 0,
+                binding_gen: 0,
+                delivery_id: 1,
+            }),
+        })
+        .await
+        .unwrap();
+        match conn_rx.recv().await.unwrap() {
+            ConnCmd::SettleIncoming { accepted, .. } => assert!(!accepted, "slot was reserved"),
+            other => panic!("expected refusal, got {other:?}"),
+        }
+        // The reserved publish lands in its held slot.
+        q.tx.send(QueueMsg::PublishReserved {
+            body: Bytes::from_static(b"c"),
+            ack: Some(PublishAck {
+                conn: conn_tx.clone(),
+                channel: 0,
+                handle: 0,
+                binding_gen: 0,
+                delivery_id: 2,
+            }),
+        })
+        .await
+        .unwrap();
+        match conn_rx.recv().await.unwrap() {
+            ConnCmd::SettleIncoming { accepted, .. } => assert!(accepted, "reserved slot consumed"),
+            other => panic!("expected confirm, got {other:?}"),
+        }
+    }
+
+    /// A reservation beyond capacity is refused; releasing one restores the
+    /// slot to ordinary publishes.
+    #[tokio::test]
+    async fn reserve_refuses_beyond_capacity_and_unreserve_releases() {
+        let q = spawn("t".into(), EffectivePolicy::depth_only(1));
+        let (conn_tx, mut conn_rx) = mpsc::unbounded_channel();
+
+        assert!(reserve(&q, 1).await, "empty queue reserves one");
+        assert!(!reserve(&q, 1).await, "second reservation exceeds capacity");
+        q.tx.send(QueueMsg::Unreserve { count: 1 }).await.unwrap();
+        // The released slot admits an ordinary publish again.
+        q.tx.send(QueueMsg::Publish {
+            body: Bytes::from_static(b"a"),
+            ack: Some(PublishAck {
+                conn: conn_tx.clone(),
+                channel: 0,
+                handle: 0,
+                binding_gen: 0,
+                delivery_id: 7,
+            }),
+        })
+        .await
+        .unwrap();
+        match conn_rx.recv().await.unwrap() {
+            ConnCmd::SettleIncoming { accepted, .. } => assert!(accepted),
+            other => panic!("expected confirm, got {other:?}"),
+        }
+    }
+
+    async fn try_publish(
+        q: &QueueHandle,
+        conn: &mpsc::UnboundedSender<ConnCmd>,
+        rx: &mut mpsc::UnboundedReceiver<ConnCmd>,
+        body: &'static [u8],
+    ) -> bool {
+        q.tx.send(QueueMsg::Publish {
+            body: Bytes::from_static(body),
+            ack: Some(PublishAck {
+                conn: conn.clone(),
+                channel: 0,
+                handle: 0,
+                binding_gen: 0,
+                delivery_id: 0,
+            }),
+        })
+        .await
+        .unwrap();
+        match rx.recv().await.unwrap() {
+            ConnCmd::SettleIncoming { accepted, .. } => accepted,
+            other => panic!("expected settle, got {other:?}"),
+        }
+    }
+
+    /// MED-6 (issue #19): the byte bound refuses publishes the depth bound
+    /// alone would admit — the depth cap × max-message-size admitted
+    /// terabytes.
+    #[tokio::test]
+    async fn byte_bound_refuses_oversized_backlog() {
+        let mut policy = EffectivePolicy::depth_only(100);
+        policy.max_bytes = 10;
+        let q = spawn("t".into(), policy);
+        let (conn_tx, mut conn_rx) = mpsc::unbounded_channel();
+
+        assert!(try_publish(&q, &conn_tx, &mut conn_rx, b"12345678").await);
+        assert!(
+            !try_publish(&q, &conn_tx, &mut conn_rx, b"1234").await,
+            "4 more bytes exceed the 10-byte bound despite depth room"
+        );
+        assert!(
+            try_publish(&q, &conn_tx, &mut conn_rx, b"12").await,
+            "2 bytes still fit"
+        );
+    }
+
+    /// Drop-head honors the byte bound too: it evicts enough of the oldest
+    /// ready messages to admit the new one.
+    #[tokio::test]
+    async fn byte_bound_drop_head_evicts_to_fit() {
+        let mut policy = EffectivePolicy::depth_only(100);
+        policy.max_bytes = 10;
+        policy.drop_head = true;
+        let q = spawn("t".into(), policy);
+        let (conn_tx, mut conn_rx) = mpsc::unbounded_channel();
+
+        assert!(try_publish(&q, &conn_tx, &mut conn_rx, b"aaaa").await);
+        assert!(try_publish(&q, &conn_tx, &mut conn_rx, b"bbbb").await);
+        // 8 bytes held; 8 more need BOTH evicted.
+        assert!(try_publish(&q, &conn_tx, &mut conn_rx, b"cccccccc").await);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        q.tx.send(QueueMsg::Stats { reply: tx }).await.unwrap();
+        assert_eq!(rx.await.unwrap().ready, 1, "both older messages evicted");
+    }
+
     #[tokio::test]
     async fn overflow_rejects_unsettled_publishes() {
-        let q = spawn("t".into(), 1);
+        let q = spawn("t".into(), EffectivePolicy::depth_only(1));
         let (conn_tx, mut conn_rx) = mpsc::unbounded_channel();
         // Fill the single slot.
         q.tx.send(QueueMsg::Publish {
