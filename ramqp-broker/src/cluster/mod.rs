@@ -20,6 +20,7 @@ pub mod fabric;
 pub mod meta;
 pub mod network;
 pub mod node;
+pub mod paging;
 pub mod queue_group;
 pub mod store;
 
@@ -31,6 +32,32 @@ use meta::{MetaCommand, MetaResponse};
 
 /// The metadata group's node id.
 pub type NodeId = u64;
+
+/// FNV-1a — deterministic across builds and platforms (used for placement
+/// scoring and for stable on-disk directory names; must never depend on
+/// `DefaultHasher`'s per-version behavior).
+pub(crate) fn fnv1a(bytes: impl IntoIterator<Item = u8>) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// The per-queue on-disk layout under a broker `data_dir`:
+/// `(spill dir, snapshot dir)`. Hash-named so any queue name is filesystem-
+/// safe.
+pub(crate) fn queue_dirs(
+    data_dir: &std::path::Path,
+    queue: &str,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    let tag = format!("{:016x}", fnv1a(queue.bytes()));
+    (
+        data_dir.join("spill").join(&tag),
+        data_dir.join("snapshots").join(&tag),
+    )
+}
 
 openraft::declare_raft_types!(
     /// Raft type configuration for the metadata group.

@@ -19,7 +19,7 @@ use openraft::BasicNode;
 use crate::cluster::NodeId;
 use crate::cluster::network::UnreachableNetwork;
 use crate::cluster::node::ClusterNode;
-use crate::cluster::queue_group::{QueueRaft, QueueStore};
+use crate::cluster::queue_group::QueueRaft;
 use crate::proxy;
 use crate::queue::{self, QueueHandle};
 use crate::quorum;
@@ -57,18 +57,20 @@ pub(crate) struct QueueRegistry {
     /// Opened lazily on the first `/durable/*` resolve.
     #[cfg(feature = "store-redb")]
     store: tokio::sync::OnceCell<crate::store::Store>,
-    /// Where the durable store lives (`None` → `/durable/*` refused).
-    #[cfg(feature = "store-redb")]
+    /// On-disk root: durable-store data (`store-redb`) and quorum-queue
+    /// paging/snapshots. `None` → `/durable/*` refused, quorum queues stay
+    /// fully in memory.
     data_dir: Option<std::path::PathBuf>,
+    /// Per-queue resident-body budget before quorum paging kicks in.
+    resident_bytes_max: usize,
 }
 
 impl QueueRegistry {
     pub fn new(
         max_depth: usize,
         max_queues: usize,
-        #[cfg_attr(not(feature = "store-redb"), allow(unused_variables))] data_dir: Option<
-            std::path::PathBuf,
-        >,
+        data_dir: Option<std::path::PathBuf>,
+        resident_bytes_max: usize,
     ) -> Self {
         QueueRegistry {
             queues: std::sync::Mutex::new(HashMap::new()),
@@ -78,8 +80,8 @@ impl QueueRegistry {
             cluster: OnceLock::new(),
             #[cfg(feature = "store-redb")]
             store: tokio::sync::OnceCell::new(),
-            #[cfg(feature = "store-redb")]
             data_dir,
+            resident_bytes_max,
         }
     }
 
@@ -171,9 +173,15 @@ impl QueueRegistry {
                                     })?;
                                 proxy::spawn(name.to_owned(), node.clone())
                             }
-                            None => spawn_quorum_group(name.to_owned(), self.node_id, self.max_depth)
-                                .await
-                                .ok_or(())?,
+                            None => spawn_quorum_group(
+                                name.to_owned(),
+                                self.node_id,
+                                self.max_depth,
+                                self.data_dir.as_deref(),
+                                self.resident_bytes_max,
+                            )
+                            .await
+                            .ok_or(())?,
                         },
                         #[cfg(feature = "store-redb")]
                         QueueKind::Durable => {
@@ -234,6 +242,8 @@ async fn spawn_quorum_group(
     name: String,
     node_id: NodeId,
     max_depth: usize,
+    data_dir: Option<&std::path::Path>,
+    resident_bytes_max: usize,
 ) -> Option<QueueHandle> {
     let config = openraft::Config {
         heartbeat_interval: 100,
@@ -242,15 +252,23 @@ async fn spawn_quorum_group(
         // Compaction: snapshot every 5k applied entries and keep only a short
         // log tail behind it, so log memory tracks queue depth rather than
         // total messages ever enqueued (broker.md §3.2 bounded-memory rule).
-        snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(5_000),
-        max_in_snapshot_log_to_keep: 1_000,
-        purge_batch_size: 1_000,
+        // Compaction cadence trades snapshot cost against log memory. A
+        // snapshot serializes the whole index (and clones it under the store
+        // lock), so at depth its cost scales with queue size — 50k applies
+        // per snapshot keeps the log tail ~15 MiB for 256 B bodies while
+        // making deep-queue snapshot stalls 10x rarer than the old 5k
+        // cadence. Incremental snapshots are the standing follow-up.
+        snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(50_000),
+        max_in_snapshot_log_to_keep: 2_000,
+        purge_batch_size: 5_000,
         ..Default::default()
     }
     .validate()
     .map_err(|e| tracing::error!(queue = %name, error = %e, "quorum config invalid"))
     .ok()?;
-    let store = QueueStore::default();
+    let store = crate::cluster::node::paged_queue_store(data_dir, &name, resident_bytes_max)
+        .map_err(|e| tracing::error!(queue = %name, error = %e, "paged store open failed"))
+        .ok()?;
     let (log_store, state_machine) = openraft::storage::Adaptor::new(store.clone());
     let raft = QueueRaft::new(
         node_id,
@@ -307,7 +325,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_is_idempotent_and_kind_scoped() {
-        let r = QueueRegistry::new(10, 0, None);
+        let r = QueueRegistry::new(10, 0, None, usize::MAX);
         let a = r.resolve("/queues/q1").await.unwrap();
         let b = r.resolve("q1").await.unwrap();
         assert!(a.tx.same_channel(&b.tx), "same transient queue");
@@ -323,7 +341,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_enforces_the_queue_cap() {
-        let r = QueueRegistry::new(10, 2, None);
+        let r = QueueRegistry::new(10, 2, None, usize::MAX);
         // Two distinct queues declare fine.
         assert!(r.resolve("/queues/a").await.is_some());
         assert!(r.resolve("/queues/b").await.is_some());

@@ -40,6 +40,7 @@ impl Broker {
             config.max_queue_depth,
             config.max_queues,
             config.data_dir.clone(),
+            config.resident_bytes_max,
         ));
         Broker {
             config: Arc::new(config),
@@ -69,6 +70,8 @@ impl Broker {
                 seeds: cluster.seeds.clone(),
                 replicas: cluster.replicas,
                 max_queue_depth: self.config.max_queue_depth,
+                data_dir: self.config.data_dir.clone(),
+                resident_bytes_max: self.config.resident_bytes_max,
             })
             .await?;
             self.registry.set_cluster(node);

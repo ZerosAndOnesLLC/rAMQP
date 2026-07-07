@@ -43,10 +43,15 @@ pub struct BrokerConfig {
     /// `None` (the default) runs standalone: `/quorum/*` queues are
     /// single-replica groups on this node.
     pub cluster: Option<ClusterMemberConfig>,
-    /// Where durable-queue data lives (`/durable/<name>` addresses; needs
-    /// the `store-redb` feature). `None` (the default) refuses durable
-    /// attaches.
+    /// Where the broker keeps on-disk state: durable-queue data
+    /// (`/durable/<name>`, needs the `store-redb` feature) and quorum-queue
+    /// paging + snapshot blobs. `None` (the default) refuses durable
+    /// attaches and keeps quorum queues fully in memory.
     pub data_dir: Option<std::path::PathBuf>,
+    /// Per-quorum-queue resident-body budget: bodies beyond this many bytes
+    /// page out to disk under `data_dir` (deep queues must not live in RAM —
+    /// broker.md §3.1/§8). Ignored without a `data_dir`.
+    pub resident_bytes_max: usize,
 }
 
 /// Cluster membership settings for one broker node.
@@ -92,6 +97,7 @@ impl Default for BrokerConfig {
             max_queues: 100_000,
             cluster: None,
             data_dir: None,
+            resident_bytes_max: 64 * 1024 * 1024,
         }
     }
 }

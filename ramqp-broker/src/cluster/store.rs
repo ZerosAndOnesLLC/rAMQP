@@ -2,14 +2,17 @@
 //!
 //! One storage implementation serves every Raft group in the broker: the
 //! metadata group ([`MetaState`]) and each per-queue group (Phase 6). Log,
-//! vote, snapshot, and applied state live in memory — sufficient for cluster
-//! formation and tests; the durable (on-disk) log is Phase 7 work, and the
-//! storage trait boundary is exactly where it slots in.
+//! vote, and applied state live in memory — sufficient for cluster
+//! formation and tests; the durable (on-disk) log is a later Phase 7 slice,
+//! and the storage trait boundary is exactly where it slots in. Snapshot
+//! *blobs* optionally live on disk (a deep paged queue's snapshot must not
+//! double its RSS — §3.1).
 
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::io::Cursor;
 use std::ops::RangeBounds;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use openraft::storage::{LogState, RaftLogReader, RaftSnapshotBuilder, RaftStorage, Snapshot};
@@ -18,16 +21,13 @@ use openraft::{
     StoredMembership, Vote,
 };
 use serde::Serialize;
-use serde::de::DeserializeOwned;
 
 use super::NodeId;
 use super::meta::{self, MetaCommand, MetaResponse, QueueSpec};
 
 /// A deterministic replicated state machine: the only broker-specific part
 /// of a Raft group.
-pub trait ReplicatedState:
-    Default + Debug + Clone + Serialize + DeserializeOwned + Send + Sync + 'static
-{
+pub trait ReplicatedState: Default + Debug + Clone + Send + Sync + 'static {
     /// The command type committed through the log.
     type Command;
     /// The response returned to the proposer.
@@ -39,6 +39,21 @@ pub trait ReplicatedState:
     /// The response used for non-app entries (blank/membership), which still
     /// consume a slot in openraft's response vector.
     fn void_response() -> Self::Response;
+
+    /// Called under the store lock immediately before the state is cloned
+    /// for a snapshot build — pin any external resources (spill segments)
+    /// the off-lock serialization will read. Balanced by
+    /// [`snapshot_bytes`](ReplicatedState::snapshot_bytes), which must
+    /// unpin on every path.
+    fn prepare_snapshot(&self) {}
+
+    /// Serialize the state for a snapshot (may read resources pinned by
+    /// [`prepare_snapshot`](ReplicatedState::prepare_snapshot); must unpin
+    /// them before returning).
+    fn snapshot_bytes(&self) -> Result<Vec<u8>, String>;
+
+    /// Restore from [`snapshot_bytes`](ReplicatedState::snapshot_bytes).
+    fn restore_snapshot(&mut self, bytes: &[u8]) -> Result<(), String>;
 }
 
 /// The metadata group's state: the replicated queue catalog.
@@ -59,15 +74,42 @@ impl ReplicatedState for MetaState {
     fn void_response() -> Self::Response {
         MetaResponse::NotFound
     }
+
+    fn snapshot_bytes(&self) -> Result<Vec<u8>, String> {
+        bincode::serialize(self).map_err(|e| e.to_string())
+    }
+
+    fn restore_snapshot(&mut self, bytes: &[u8]) -> Result<(), String> {
+        *self = bincode::deserialize(bytes).map_err(|e| e.to_string())?;
+        Ok(())
+    }
 }
 
-/// The serialized form of a state-machine snapshot.
+/// The serialized form of a state-machine snapshot: raft positions plus the
+/// state's own [`ReplicatedState::snapshot_bytes`] encoding.
 #[derive(Serialize, serde::Deserialize)]
-#[serde(bound = "S: Serialize + DeserializeOwned")]
-struct SnapshotPayload<S> {
+struct SnapshotPayload {
     last_applied: Option<LogId<NodeId>>,
     last_membership: StoredMembership<NodeId, BasicNode>,
-    state: S,
+    state_bytes: Vec<u8>,
+}
+
+/// Where a built/installed snapshot blob lives.
+#[derive(Debug, Clone)]
+enum SnapshotBlob {
+    /// In memory (small states: the metadata catalog, shallow queues).
+    Memory(Vec<u8>),
+    /// On disk (paged queues: the blob must not double the queue's RSS).
+    File(PathBuf),
+}
+
+impl SnapshotBlob {
+    fn read(&self) -> std::io::Result<Vec<u8>> {
+        match self {
+            SnapshotBlob::Memory(bytes) => Ok(bytes.clone()),
+            SnapshotBlob::File(path) => std::fs::read(path),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -83,8 +125,10 @@ struct Inner<C: RaftTypeConfig, S> {
     last_applied: Option<LogId<NodeId>>,
     last_membership: StoredMembership<NodeId, BasicNode>,
     /// The current snapshot, if one was built/installed.
-    snapshot: Option<(SnapshotMeta<NodeId, BasicNode>, Vec<u8>)>,
+    snapshot: Option<(SnapshotMeta<NodeId, BasicNode>, SnapshotBlob)>,
     snapshot_idx: u64,
+    /// When set, snapshot blobs are written here instead of held in memory.
+    snapshot_dir: Option<PathBuf>,
 }
 
 impl<C: RaftTypeConfig, S: Default> Default for Inner<C, S> {
@@ -98,6 +142,7 @@ impl<C: RaftTypeConfig, S: Default> Default for Inner<C, S> {
             last_membership: StoredMembership::default(),
             snapshot: None,
             snapshot_idx: 0,
+            snapshot_dir: None,
         }
     }
 }
@@ -131,6 +176,23 @@ struct MemStore<C: RaftTypeConfig, S> {
 impl<C: RaftTypeConfig, S> SharedStore<C, S> {
     fn lock(&self) -> MutexGuard<'_, Inner<C, S>> {
         self.0.inner.lock().expect("raft store lock")
+    }
+
+    /// A store with a given initial state and (optionally) a directory for
+    /// on-disk snapshot blobs (paged queues).
+    pub fn new_with(state: S, snapshot_dir: Option<PathBuf>) -> Self
+    where
+        S: Default,
+    {
+        let store = SharedStore(Arc::new(MemStore {
+            inner: Mutex::new(Inner::default()),
+        }));
+        {
+            let mut inner = store.lock();
+            inner.state = state;
+            inner.snapshot_dir = snapshot_dir;
+        }
+        store
     }
 
     /// Read the applied state through `f` (point-in-time, under the lock).
@@ -191,7 +253,9 @@ where
         // the same mutex serializes apply/append and every catalog/dispatch
         // read, so serializing a deep queue's state (potentially multi-second)
         // while holding it would stall the whole group and time out followers.
-        let (payload, meta) = {
+        // `prepare_snapshot` (still under the lock) pins any external
+        // resources the off-lock serialization reads.
+        let (state, last_applied, last_membership, meta, snapshot_dir) = {
             let mut inner = self.lock();
             inner.snapshot_idx += 1;
             let meta = SnapshotMeta {
@@ -206,22 +270,56 @@ where
                     inner.snapshot_idx
                 ),
             };
-            let payload = SnapshotPayload {
-                last_applied: inner.last_applied,
-                last_membership: inner.last_membership.clone(),
-                state: inner.state.clone(),
-            };
-            (payload, meta)
+            inner.state.prepare_snapshot();
+            (
+                inner.state.clone(),
+                inner.last_applied,
+                inner.last_membership.clone(),
+                meta,
+                inner.snapshot_dir.clone(),
+            )
         };
         // Serialize off the async worker (CPU-heavy for large state) and
-        // off-lock. Compact binary encoding: snapshots of binary-heavy queue
-        // state must not inflate (JSON turns 256-byte bodies into ~1 KB arrays).
-        let data = tokio::task::spawn_blocking(move || bincode::serialize(&payload))
+        // off-lock; `snapshot_bytes` unpins whatever `prepare_snapshot`
+        // pinned. Compact binary encoding throughout.
+        let idx = meta.snapshot_id.clone();
+        let built =
+            tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, SnapshotBlob), String> {
+                let state_bytes = state.snapshot_bytes()?;
+                let payload = SnapshotPayload {
+                    last_applied,
+                    last_membership,
+                    state_bytes,
+                };
+                let data = bincode::serialize(&payload).map_err(|e| e.to_string())?;
+                // Deep paged states: park the blob on disk so the snapshot does
+                // not double the queue's RSS.
+                let blob = match &snapshot_dir {
+                    Some(dir) => {
+                        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+                        let path = dir.join(format!("snapshot-{idx}.bin"));
+                        std::fs::write(&path, &data).map_err(|e| e.to_string())?;
+                        SnapshotBlob::File(path)
+                    }
+                    None => SnapshotBlob::Memory(data.clone()),
+                };
+                Ok((data, blob))
+            })
             .await
             .map_err(|e| openraft::StorageIOError::write_snapshot(None, &e))?
-            .map_err(|e| openraft::StorageIOError::write_snapshot(None, &e))?;
-        // Briefly re-lock only to publish the finished snapshot.
-        self.lock().snapshot = Some((meta.clone(), data.clone()));
+            .map_err(|e| {
+                openraft::StorageIOError::write_snapshot(None, &std::io::Error::other(e))
+            })?;
+        let (data, blob) = built;
+        // Briefly re-lock only to publish the finished snapshot (and drop
+        // the previous on-disk blob).
+        {
+            let mut inner = self.lock();
+            if let Some((_, SnapshotBlob::File(old))) = &inner.snapshot {
+                let _ = std::fs::remove_file(old);
+            }
+            inner.snapshot = Some((meta.clone(), blob));
+        }
         Ok(Snapshot {
             meta,
             snapshot: Box::new(Cursor::new(data)),
@@ -351,20 +449,49 @@ where
         snapshot: Box<Cursor<Vec<u8>>>,
     ) -> Result<(), StorageError<NodeId>> {
         let data = snapshot.into_inner();
-        let payload: SnapshotPayload<S> = bincode::deserialize(&data)
+        let payload: SnapshotPayload = bincode::deserialize(&data)
             .map_err(|e| openraft::StorageIOError::read_snapshot(Some(meta.signature()), &e))?;
         let mut inner = self.lock();
+        let mut state = S::default();
+        state.restore_snapshot(&payload.state_bytes).map_err(|e| {
+            openraft::StorageIOError::read_snapshot(
+                Some(meta.signature()),
+                &std::io::Error::other(e),
+            )
+        })?;
         inner.last_applied = payload.last_applied;
         inner.last_membership = payload.last_membership;
-        inner.state = payload.state;
-        inner.snapshot = Some((meta.clone(), data));
+        inner.state = state;
+        let blob = match &inner.snapshot_dir {
+            Some(dir) => std::fs::create_dir_all(dir)
+                .and_then(|()| {
+                    let path = dir.join(format!("snapshot-{}.bin", meta.snapshot_id));
+                    std::fs::write(&path, &data).map(|()| path)
+                })
+                .map(SnapshotBlob::File)
+                .unwrap_or(SnapshotBlob::Memory(data)),
+            None => SnapshotBlob::Memory(data),
+        };
+        if let Some((_, SnapshotBlob::File(old))) = &inner.snapshot {
+            let _ = std::fs::remove_file(old);
+        }
+        inner.snapshot = Some((meta.clone(), blob));
         Ok(())
     }
 
     async fn get_current_snapshot(&mut self) -> Result<Option<Snapshot<C>>, StorageError<NodeId>> {
-        Ok(self.lock().snapshot.clone().map(|(meta, data)| Snapshot {
-            meta,
-            snapshot: Box::new(Cursor::new(data)),
-        }))
+        let snapshot = self.lock().snapshot.clone();
+        match snapshot {
+            Some((meta, blob)) => {
+                let data = blob.read().map_err(|e| {
+                    openraft::StorageIOError::read_snapshot(Some(meta.signature()), &e)
+                })?;
+                Ok(Some(Snapshot {
+                    meta,
+                    snapshot: Box::new(Cursor::new(data)),
+                }))
+            }
+            None => Ok(None),
+        }
     }
 }

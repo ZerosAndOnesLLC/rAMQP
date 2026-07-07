@@ -305,12 +305,23 @@ fn dispatch(
         };
 
         let msg_id = *ready.first().expect("non-empty");
-        let Some(body) = store.with_state(|s| s.messages.get(&msg_id).map(|m| m.body.clone()))
-        else {
+        let Some(fetch) = store.with_state(|s| s.body_of(msg_id)) else {
             // Removed from the state machine under us (settled remove that
             // raced a reinsert): drop the stale id and continue.
             ready.remove(&msg_id);
             continue;
+        };
+        // Spilled bodies are read outside the store lock (paged deep queues).
+        let body = match fetch {
+            crate::cluster::queue_group::BodyFetch::Ready(bytes) => bytes,
+            crate::cluster::queue_group::BodyFetch::Spilled(spill, r) => match spill.read(&r) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    tracing::warn!(queue = %name, msg_id, error = %e, "spilled body unreadable; skipping");
+                    ready.remove(&msg_id);
+                    continue;
+                }
+            },
         };
         ready.remove(&msg_id);
         *rr = (idx + 1) % subs.len();

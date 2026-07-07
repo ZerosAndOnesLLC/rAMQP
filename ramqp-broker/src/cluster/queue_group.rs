@@ -22,6 +22,7 @@ use openraft::BasicNode;
 use serde::{Deserialize, Serialize};
 
 use super::NodeId;
+use super::paging::{Spill, SpillRef};
 use super::store::{ReplicatedState, SharedStore};
 
 openraft::declare_raft_types!(
@@ -76,22 +77,154 @@ pub enum QueueResponse {
     Void,
 }
 
+/// Where one stored message's bytes live right now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StoredBody {
+    /// In memory.
+    Resident(Bytes),
+    /// Paged out to this replica's spill store (broker.md §8: deep queues
+    /// keep indices resident, not bytes).
+    Spilled(SpillRef),
+}
+
+impl StoredBody {
+    /// The bytes when resident (tests/diagnostics; dispatch goes through
+    /// [`QueueState::body_of`]).
+    pub fn resident(&self) -> Option<&Bytes> {
+        match self {
+            StoredBody::Resident(bytes) => Some(bytes),
+            StoredBody::Spilled(_) => None,
+        }
+    }
+}
+
 /// One replicated message.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplicatedMessage {
-    /// The raw message bytes.
-    pub body: Bytes,
+    /// The message bytes (resident or spilled).
+    pub body: StoredBody,
     /// Failed delivery attempts (incremented by requeue settles).
     pub failures: u32,
 }
 
+/// Paging knobs for one queue's state machine.
+#[derive(Debug, Clone)]
+pub struct QueuePaging {
+    /// This replica's spill store.
+    pub spill: Spill,
+    /// Bodies stay resident until this many bytes are held; beyond it,
+    /// `apply(enqueue)` spills (FIFO-friendly: the head stays hot).
+    pub resident_max_bytes: usize,
+}
+
 /// The queue group's replicated state: the ordered message store.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+///
+/// The *replicated* part is `(next_msg_id, id → (failures, bytes))`; whether
+/// a given body is resident or spilled is a local decision each replica
+/// makes independently (bodies travel via the log, not via spill files).
+#[derive(Debug, Clone, Default)]
 pub struct QueueState {
     /// The next message id to assign.
     pub next_msg_id: u64,
     /// Messages by id (BTreeMap keeps FIFO order by assignment).
     pub messages: BTreeMap<u64, ReplicatedMessage>,
+    /// Bytes currently held resident.
+    resident_bytes: usize,
+    /// Paging configuration (`None` → never spill).
+    paging: Option<QueuePaging>,
+}
+
+/// How a body read resolves: immediately, or via a spill fetch performed
+/// outside the store lock.
+#[derive(Debug)]
+pub enum BodyFetch {
+    /// The bytes, refcount-cloned.
+    Ready(Bytes),
+    /// Read `1` from `0` after releasing the store lock.
+    Spilled(Spill, SpillRef),
+}
+
+impl QueueState {
+    /// A state machine that spills bodies beyond `resident_max_bytes`.
+    pub fn paged(spill: Spill, resident_max_bytes: usize) -> Self {
+        QueueState {
+            paging: Some(QueuePaging {
+                spill,
+                resident_max_bytes,
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// How to read one message's body (resolve [`BodyFetch::Spilled`]
+    /// *outside* the store lock).
+    pub fn body_of(&self, msg_id: u64) -> Option<BodyFetch> {
+        let message = self.messages.get(&msg_id)?;
+        Some(match &message.body {
+            StoredBody::Resident(bytes) => BodyFetch::Ready(bytes.clone()),
+            StoredBody::Spilled(r) => BodyFetch::Spilled(
+                self.paging
+                    .as_ref()
+                    .expect("spilled body implies paging")
+                    .spill
+                    .clone(),
+                *r,
+            ),
+        })
+    }
+
+    /// Diagnostics: bytes currently resident.
+    pub fn resident_bytes(&self) -> usize {
+        self.resident_bytes
+    }
+
+    fn store_body(&mut self, body: &Bytes) -> StoredBody {
+        if let Some(paging) = &self.paging
+            && self.resident_bytes + body.len() > paging.resident_max_bytes
+        {
+            match paging.spill.append(body) {
+                Ok(r) => return StoredBody::Spilled(r),
+                Err(e) => {
+                    // Spill failure: fall back to resident (correctness over
+                    // the memory bound) and say so loudly.
+                    tracing::error!(error = %e, "spill append failed; keeping body resident");
+                }
+            }
+        }
+        self.resident_bytes += body.len();
+        StoredBody::Resident(body.clone())
+    }
+
+    fn drop_body(&mut self, body: &StoredBody) {
+        match body {
+            StoredBody::Resident(bytes) => {
+                self.resident_bytes = self.resident_bytes.saturating_sub(bytes.len());
+            }
+            StoredBody::Spilled(r) => {
+                if let Some(paging) = &self.paging {
+                    paging.spill.release(r);
+                }
+            }
+        }
+    }
+}
+
+/// The portable (snapshot) form of one body.
+#[derive(Serialize, Deserialize)]
+enum PortableBody {
+    /// The bytes travel in the snapshot.
+    Inline(Vec<u8>),
+    /// The bytes live in this replica's spill store. Only meaningful on the
+    /// node that built the snapshot (compaction/restart); installing such a
+    /// snapshot on a *different* node fails loudly.
+    External(SpillRef),
+}
+
+/// The snapshot payload for [`QueueState`].
+#[derive(Serialize, Deserialize)]
+struct PortableState {
+    next_msg_id: u64,
+    messages: Vec<(u64, u32, PortableBody)>,
 }
 
 impl ReplicatedState for QueueState {
@@ -103,10 +236,11 @@ impl ReplicatedState for QueueState {
             QueueCommand::Enqueue { body } => {
                 self.next_msg_id += 1;
                 let msg_id = self.next_msg_id;
+                let stored = self.store_body(body);
                 self.messages.insert(
                     msg_id,
                     ReplicatedMessage {
-                        body: body.clone(),
+                        body: stored,
                         failures: 0,
                     },
                 );
@@ -121,7 +255,8 @@ impl ReplicatedState for QueueState {
                         }
                         None => QueueResponse::NotFound,
                     }
-                } else if self.messages.remove(msg_id).is_some() {
+                } else if let Some(removed) = self.messages.remove(msg_id) {
+                    self.drop_body(&removed.body);
                     QueueResponse::Settled
                 } else {
                     QueueResponse::NotFound
@@ -132,6 +267,79 @@ impl ReplicatedState for QueueState {
 
     fn void_response() -> Self::Response {
         QueueResponse::Void
+    }
+
+    fn prepare_snapshot(&self) {
+        // Hold spill-segment deletions while `snapshot_bytes` reads them.
+        if let Some(paging) = &self.paging {
+            paging.spill.pin();
+        }
+    }
+
+    fn snapshot_bytes(&self) -> Result<Vec<u8>, String> {
+        // Balance `prepare_snapshot` on every path.
+        struct Unpin<'a>(Option<&'a Spill>);
+        impl Drop for Unpin<'_> {
+            fn drop(&mut self) {
+                if let Some(spill) = self.0 {
+                    spill.unpin();
+                }
+            }
+        }
+        let _unpin = Unpin(self.paging.as_ref().map(|p| &p.spill));
+
+        let mut messages = Vec::with_capacity(self.messages.len());
+        for (id, m) in &self.messages {
+            let body = match &m.body {
+                StoredBody::Resident(bytes) => PortableBody::Inline(bytes.to_vec()),
+                // Keep spilled bodies external: a deep queue's snapshot must
+                // not materialize gigabytes (§3.1). Node-local by design —
+                // see PortableBody::External.
+                StoredBody::Spilled(r) => PortableBody::External(*r),
+            };
+            messages.push((*id, m.failures, body));
+        }
+        bincode::serialize(&PortableState {
+            next_msg_id: self.next_msg_id,
+            messages,
+        })
+        .map_err(|e| e.to_string())
+    }
+
+    fn restore_snapshot(&mut self, bytes: &[u8]) -> Result<(), String> {
+        let portable: PortableState = bincode::deserialize(bytes).map_err(|e| e.to_string())?;
+        // Keep this state's paging config; rebuild contents.
+        for (_, m) in std::mem::take(&mut self.messages) {
+            self.drop_body(&m.body);
+        }
+        self.resident_bytes = 0;
+        self.next_msg_id = portable.next_msg_id;
+        for (id, failures, body) in portable.messages {
+            let stored =
+                match body {
+                    PortableBody::Inline(bytes) => self.store_body(&Bytes::from(bytes)),
+                    PortableBody::External(r) => {
+                        // Valid only where the spill lives. Verify readability so
+                        // a cross-node install fails here, loudly, instead of at
+                        // dispatch time.
+                        let paging = self.paging.as_ref().ok_or(
+                            "snapshot references spilled bodies but this state has no spill",
+                        )?;
+                        paging.spill.read(&r).map_err(|e| {
+                            format!("snapshot references unreadable spill data: {e}")
+                        })?;
+                        StoredBody::Spilled(r)
+                    }
+                };
+            self.messages.insert(
+                id,
+                ReplicatedMessage {
+                    body: stored,
+                    failures,
+                },
+            );
+        }
+        Ok(())
     }
 }
 
@@ -173,6 +381,66 @@ mod tests {
         (raft, store)
     }
 
+    /// The paged state machine (broker.md §8's #1 risk): bodies beyond the
+    /// resident budget spill to disk, dispatch reads them back, settles
+    /// reclaim segment space, and snapshots round-trip locally (spilled
+    /// bodies stay external, pinned against concurrent reclamation).
+    #[test]
+    fn paged_state_bounds_resident_bytes_and_round_trips() {
+        let dir = std::env::temp_dir().join(format!("ramqp-paged-test-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let spill = Spill::open(dir.clone()).expect("spill open");
+        // Budget: two 8-byte bodies stay resident; the rest spill.
+        let mut state = QueueState::paged(spill.clone(), 16);
+
+        for i in 0..10u8 {
+            state.apply(&QueueCommand::Enqueue {
+                body: Bytes::from(vec![i; 8]),
+            });
+        }
+        assert!(
+            state.resident_bytes() <= 16,
+            "resident bytes bounded by the budget, got {}",
+            state.resident_bytes()
+        );
+        assert_eq!(state.messages.len(), 10, "index stays fully resident");
+
+        // Reads resolve both ways.
+        match state.body_of(1).expect("head") {
+            BodyFetch::Ready(bytes) => assert_eq!(&bytes[..], &[0u8; 8]),
+            other => panic!("head should be resident, got {other:?}"),
+        }
+        match state.body_of(10).expect("tail") {
+            BodyFetch::Spilled(spill, r) => {
+                assert_eq!(&spill.read(&r).expect("spill read")[..], &[9u8; 8]);
+            }
+            other => panic!("tail should be spilled, got {other:?}"),
+        }
+
+        // Snapshot with spilled bodies external; restore locally.
+        state.prepare_snapshot();
+        let bytes = state.snapshot_bytes().expect("snapshot");
+        let mut restored = QueueState::paged(spill.clone(), 16);
+        restored.restore_snapshot(&bytes).expect("restore");
+        assert_eq!(restored.messages.len(), 10);
+        match restored.body_of(10).expect("tail after restore") {
+            BodyFetch::Spilled(spill, r) => {
+                assert_eq!(&spill.read(&r).expect("read")[..], &[9u8; 8]);
+            }
+            other => panic!("tail should still be spilled, got {other:?}"),
+        }
+
+        // Settling everything releases every spilled body.
+        for id in 1..=10u64 {
+            state.apply(&QueueCommand::Settle {
+                msg_id: id,
+                requeue: false,
+            });
+        }
+        assert_eq!(state.resident_bytes(), 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[tokio::test]
     async fn enqueue_and_settle_through_the_log() {
         let (raft, store) = single_node_group().await;
@@ -193,7 +461,10 @@ mod tests {
         assert_eq!(ids, vec![1, 2, 3]);
         store.with_state(|s| {
             assert_eq!(s.messages.len(), 3);
-            assert_eq!(&s.messages[&1].body[..], b"m1");
+            assert_eq!(
+                &s.messages[&1].body.resident().expect("resident")[..],
+                b"m1"
+            );
         });
 
         // Ack removes; requeue counts a failure and keeps the message.
@@ -337,8 +608,14 @@ mod tests {
         stores[&new_leader].with_state(|s| {
             assert_eq!(s.messages.len(), 51, "50 committed + 1 post-failover");
             // Content intact, order preserved by id.
-            assert_eq!(&s.messages[&1].body[..], &0u32.to_be_bytes());
-            assert_eq!(&s.messages[&50].body[..], &49u32.to_be_bytes());
+            assert_eq!(
+                &s.messages[&1].body.resident().expect("resident")[..],
+                &0u32.to_be_bytes()
+            );
+            assert_eq!(
+                &s.messages[&50].body.resident().expect("resident")[..],
+                &49u32.to_be_bytes()
+            );
         });
     }
 
@@ -433,7 +710,7 @@ mod tests {
         fresh.with_state(|s| {
             assert_eq!(s.messages.len(), 5);
             assert_eq!(s.next_msg_id, 5);
-            assert_eq!(&s.messages[&3].body[..], &[2]);
+            assert_eq!(&s.messages[&3].body.resident().expect("resident")[..], &[2]);
         });
     }
 }

@@ -53,6 +53,11 @@ pub struct NodeSettings {
     pub replicas: u8,
     /// Per-queue depth bound handed to leader-local actors.
     pub max_queue_depth: usize,
+    /// When set, deep queues page message bodies to disk here and park
+    /// snapshot blobs there too (broker.md §8 deep-queue mitigation).
+    pub data_dir: Option<std::path::PathBuf>,
+    /// Per-queue resident-body budget before paging kicks in.
+    pub resident_bytes_max: usize,
 }
 
 /// One local member of a per-queue Raft group.
@@ -103,9 +108,15 @@ fn queue_raft_config() -> openraft::Config {
         heartbeat_interval: 100,
         election_timeout_min: 300,
         election_timeout_max: 600,
-        snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(5_000),
-        max_in_snapshot_log_to_keep: 1_000,
-        purge_batch_size: 1_000,
+        // Compaction cadence trades snapshot cost against log memory. A
+        // snapshot serializes the whole index (and clones it under the store
+        // lock), so at depth its cost scales with queue size — 50k applies
+        // per snapshot keeps the log tail ~15 MiB for 256 B bodies while
+        // making deep-queue snapshot stalls 10x rarer than the old 5k
+        // cadence. Incremental snapshots are the standing follow-up.
+        snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(50_000),
+        max_in_snapshot_log_to_keep: 2_000,
+        purge_batch_size: 5_000,
         ..Default::default()
     }
 }
@@ -367,7 +378,11 @@ impl ClusterNode {
             return Ok(());
         }
         let config = Arc::new(queue_raft_config().validate().map_err(|e| e.to_string())?);
-        let store = QueueStore::default();
+        let store = paged_queue_store(
+            self.settings.data_dir.as_deref(),
+            name,
+            self.settings.resident_bytes_max,
+        )?;
         let (log_store, state_machine) = openraft::storage::Adaptor::new(store.clone());
         let raft = QueueRaft::new(
             self.node_id,
@@ -635,15 +650,26 @@ impl ClusterNode {
     }
 }
 
-/// FNV-1a — deterministic across builds and platforms (placement recorded in
-/// the catalog must never depend on `DefaultHasher`'s per-version behavior).
-fn fnv1a(bytes: impl IntoIterator<Item = u8>) -> u64 {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in bytes {
-        hash ^= u64::from(b);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+use super::fnv1a;
+
+/// Build a queue group's store: paged (spill + on-disk snapshot blobs) when
+/// a data dir is available, plain in-memory otherwise.
+pub(crate) fn paged_queue_store(
+    data_dir: Option<&std::path::Path>,
+    queue: &str,
+    resident_bytes_max: usize,
+) -> Result<QueueStore, String> {
+    match data_dir {
+        Some(dir) => {
+            let (spill_dir, snapshot_dir) = super::queue_dirs(dir, queue);
+            let spill = super::paging::Spill::open(spill_dir)?;
+            Ok(QueueStore::new_with(
+                super::queue_group::QueueState::paged(spill, resident_bytes_max),
+                Some(snapshot_dir),
+            ))
+        }
+        None => Ok(QueueStore::default()),
     }
-    hash
 }
 
 /// Rendezvous (highest-random-weight) placement: every node ranks the same,
@@ -1219,6 +1245,8 @@ mod tests {
                 seeds: seeds.clone(),
                 replicas,
                 max_queue_depth: 10_000,
+                data_dir: None,
+                resident_bytes_max: usize::MAX,
             })
             .await
             .expect("bootstrap");
