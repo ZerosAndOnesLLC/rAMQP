@@ -31,6 +31,8 @@ pub(crate) enum QueueKind {
     Transient,
     /// Backed by a per-queue Raft group.
     Quorum,
+    /// Node-local, on-disk (`store-redb` feature; survives restarts).
+    Durable,
 }
 
 /// Resolves addresses to queue actors, declaring queues on first use.
@@ -51,17 +53,52 @@ pub(crate) struct QueueRegistry {
     node_id: NodeId,
     /// The cluster node, when this broker is clustered. Set once at bind.
     cluster: OnceLock<Arc<ClusterNode>>,
+    /// The durable store (`store-redb`), when a data dir is configured.
+    /// Opened lazily on the first `/durable/*` resolve.
+    #[cfg(feature = "store-redb")]
+    store: tokio::sync::OnceCell<crate::store::Store>,
+    /// Where the durable store lives (`None` → `/durable/*` refused).
+    #[cfg(feature = "store-redb")]
+    data_dir: Option<std::path::PathBuf>,
 }
 
 impl QueueRegistry {
-    pub fn new(max_depth: usize, max_queues: usize) -> Self {
+    pub fn new(
+        max_depth: usize,
+        max_queues: usize,
+        #[cfg_attr(not(feature = "store-redb"), allow(unused_variables))] data_dir: Option<
+            std::path::PathBuf,
+        >,
+    ) -> Self {
         QueueRegistry {
             queues: std::sync::Mutex::new(HashMap::new()),
             max_depth,
             max_queues,
             node_id: 1,
             cluster: OnceLock::new(),
+            #[cfg(feature = "store-redb")]
+            store: tokio::sync::OnceCell::new(),
+            #[cfg(feature = "store-redb")]
+            data_dir,
         }
+    }
+
+    /// The durable store, opened on first use (`None` when unconfigured or
+    /// the open failed — the attach is then refused). A failed open is NOT
+    /// cached: a transient failure (e.g. the previous instance's file lock
+    /// not yet released) is retried on the next attach.
+    #[cfg(feature = "store-redb")]
+    async fn store(&self) -> Option<crate::store::Store> {
+        let dir = self.data_dir.as_ref()?;
+        self.store
+            .get_or_try_init(|| async {
+                crate::store::Store::open(dir).map_err(|e| {
+                    tracing::error!(dir = %dir.display(), error = %e, "durable store open failed");
+                })
+            })
+            .await
+            .ok()
+            .cloned()
     }
 
     /// Attach the cluster node (idempotent; first caller wins).
@@ -76,10 +113,14 @@ impl QueueRegistry {
 
     /// Normalize an AMQP address to `(kind, queue name)`. Accepts the
     /// RabbitMQ-4.x style `/queues/<name>`, `/quorum/<name>` for replicated
-    /// queues, and bare names (with or without a leading `/`) as transient.
+    /// queues, `/durable/<name>` for on-disk local queues, and bare names
+    /// (with or without a leading `/`) as transient.
     pub fn parse_address(address: &str) -> Option<(QueueKind, &str)> {
         if let Some(name) = address.strip_prefix("/quorum/") {
             return (!name.is_empty()).then_some((QueueKind::Quorum, name));
+        }
+        if let Some(name) = address.strip_prefix("/durable/") {
+            return (!name.is_empty()).then_some((QueueKind::Durable, name));
         }
         let name = address
             .strip_prefix("/queues/")
@@ -90,10 +131,12 @@ impl QueueRegistry {
     /// Resolve an address, declaring the queue if it doesn't exist.
     pub async fn resolve(&self, address: &str) -> Option<QueueHandle> {
         let (kind, name) = Self::parse_address(address)?;
-        // Kind-qualified key: `/queues/foo` and `/quorum/foo` are distinct.
+        // Kind-qualified key: `/queues/foo`, `/quorum/foo`, and
+        // `/durable/foo` are distinct queues.
         let key = match kind {
             QueueKind::Transient => format!("t:{name}"),
             QueueKind::Quorum => format!("q:{name}"),
+            QueueKind::Durable => format!("d:{name}"),
         };
         // Bounded retry so a queue that dies on spawn can't loop forever.
         for _ in 0..3 {
@@ -132,6 +175,25 @@ impl QueueRegistry {
                                 .await
                                 .ok_or(())?,
                         },
+                        #[cfg(feature = "store-redb")]
+                        QueueKind::Durable => {
+                            let store = self.store().await.ok_or(())?;
+                            let queue_id = store.queue_id(name).map_err(|e| {
+                                tracing::error!(queue = %name, error = %e, "durable queue id failed");
+                            })?;
+                            crate::durable::spawn(name.to_owned(), store, queue_id, self.max_depth)
+                                .map_err(|e| {
+                                    tracing::error!(queue = %name, error = %e, "durable recovery failed");
+                                })?
+                        }
+                        #[cfg(not(feature = "store-redb"))]
+                        QueueKind::Durable => {
+                            tracing::warn!(
+                                queue = %name,
+                                "durable queue requested but the broker was built without `store-redb`"
+                            );
+                            return Err(());
+                        }
                     };
                     Ok::<_, ()>(h)
                 })
@@ -245,7 +307,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_is_idempotent_and_kind_scoped() {
-        let r = QueueRegistry::new(10, 0);
+        let r = QueueRegistry::new(10, 0, None);
         let a = r.resolve("/queues/q1").await.unwrap();
         let b = r.resolve("q1").await.unwrap();
         assert!(a.tx.same_channel(&b.tx), "same transient queue");
@@ -261,7 +323,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_enforces_the_queue_cap() {
-        let r = QueueRegistry::new(10, 2);
+        let r = QueueRegistry::new(10, 2, None);
         // Two distinct queues declare fine.
         assert!(r.resolve("/queues/a").await.is_some());
         assert!(r.resolve("/queues/b").await.is_some());

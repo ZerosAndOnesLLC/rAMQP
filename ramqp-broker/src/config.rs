@@ -43,6 +43,10 @@ pub struct BrokerConfig {
     /// `None` (the default) runs standalone: `/quorum/*` queues are
     /// single-replica groups on this node.
     pub cluster: Option<ClusterMemberConfig>,
+    /// Where durable-queue data lives (`/durable/<name>` addresses; needs
+    /// the `store-redb` feature). `None` (the default) refuses durable
+    /// attaches.
+    pub data_dir: Option<std::path::PathBuf>,
 }
 
 /// Cluster membership settings for one broker node.
@@ -87,6 +91,7 @@ impl Default for BrokerConfig {
             max_connections: 16_384,
             max_queues: 100_000,
             cluster: None,
+            data_dir: None,
         }
     }
 }

@@ -33,10 +33,14 @@ pub(crate) mod cluster;
 pub mod config;
 mod connection;
 mod dispatch;
+#[cfg(feature = "store-redb")]
+mod durable;
 mod proxy;
 mod queue;
 mod quorum;
 mod registry;
+#[cfg(feature = "store-redb")]
+mod store;
 
 pub use auth::{AllowAll, Authenticator, Credentials, StaticPlain};
 pub use broker::{BoundBroker, Broker, ShutdownHandle};

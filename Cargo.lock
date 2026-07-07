@@ -1544,7 +1544,7 @@ dependencies = [
 
 [[package]]
 name = "ramqp-broker"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "bincode",
  "bytes",
@@ -1552,8 +1552,10 @@ dependencies = [
  "openraft",
  "ramqp",
  "ramqp-core",
+ "redb",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -1656,6 +1658,15 @@ checksum = "22e18b0f0062d30d4230b2e85ff77fdfe4326feb054b9783a3460d8435c8ab91"
 dependencies = [
  "crossbeam-deque",
  "crossbeam-utils",
+]
+
+[[package]]
+name = "redb"
+version = "4.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8e925444704b5f17d32bf42f5b6e2df050bceebc3dcd6e71cc73dafe8092e839"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

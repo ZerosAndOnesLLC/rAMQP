@@ -39,6 +39,7 @@ impl Broker {
         let registry = Arc::new(QueueRegistry::new(
             config.max_queue_depth,
             config.max_queues,
+            config.data_dir.clone(),
         ));
         Broker {
             config: Arc::new(config),

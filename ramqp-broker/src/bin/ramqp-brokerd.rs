@@ -19,13 +19,16 @@ struct Args {
     node_id: Option<u64>,
     cluster_listen: Option<String>,
     seeds: Vec<(u64, String)>,
+    data_dir: Option<std::path::PathBuf>,
 }
 
 fn usage() -> ! {
     eprintln!(
         "usage: ramqp-brokerd [--listen <addr:port>]\n\
          \x20                    [--node-id <n> --cluster-listen <addr:port> --seed <id>=<addr> ...]\n\
-         env: RAMQP_LISTEN, RAMQP_NODE_ID, RAMQP_CLUSTER_LISTEN, RAMQP_SEEDS=1=a:7472,2=b:7472"
+         \x20                    [--data-dir <path>]\n\
+         env: RAMQP_LISTEN, RAMQP_NODE_ID, RAMQP_CLUSTER_LISTEN, RAMQP_SEEDS=1=a:7472,2=b:7472,\n\
+         \x20    RAMQP_DATA_DIR (durable queues need a build with --features store-redb)"
     );
     std::process::exit(2);
 }
@@ -45,6 +48,7 @@ fn parse_args() -> Args {
         seeds: std::env::var("RAMQP_SEEDS")
             .map(|v| v.split(',').filter_map(parse_seed).collect())
             .unwrap_or_default(),
+        data_dir: std::env::var("RAMQP_DATA_DIR").ok().map(Into::into),
     };
     let mut argv = std::env::args().skip(1);
     while let Some(arg) = argv.next() {
@@ -60,6 +64,7 @@ fn parse_args() -> Args {
             "--cluster-listen" => {
                 args.cluster_listen = Some(argv.next().unwrap_or_else(|| usage()))
             }
+            "--data-dir" => args.data_dir = Some(argv.next().unwrap_or_else(|| usage()).into()),
             "--seed" => {
                 let seed = argv
                     .next()
@@ -107,6 +112,11 @@ async fn main() -> std::io::Result<()> {
         }
     }
 
+    config.data_dir = args.data_dir.clone();
+    if args.data_dir.is_some() && !cfg!(feature = "store-redb") {
+        eprintln!("--data-dir given but this build lacks the `store-redb` feature");
+        std::process::exit(2);
+    }
     let clustered = config.cluster.is_some();
     let bound = Broker::new(config).bind(&args.listen).await?;
 

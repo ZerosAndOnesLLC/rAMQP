@@ -24,6 +24,9 @@ A **performance-first, highly-available AMQP 1.0 broker** in Rust, built on
   the replicated log** — the accepted disposition is the durability confirm.
   Pipelined commits, ready-set dispatch, snapshots + log compaction (memory
   tracks queue depth, not history).
+- **Durable queues** — `/durable/<name>` (build with `--features store-redb`,
+  run with `--data-dir <path>`): on-disk via redb, group-commit fsync (the
+  accepted disposition is the durability confirm), full restart recovery.
 - **Clustering with leader routing** — a metadata Raft group (replicated
   queue catalog + rendezvous placement) and an **inter-node fabric**: one
   multiplexed TCP connection per peer pair carrying every group's Raft

@@ -497,9 +497,9 @@ link/session → negotiate/mux/heartbeat → txn/sasl splits.
 - [x] **Bench: quorum-queue tail latency/throughput vs RabbitMQ quorum queues** (bench-compare/README): 3-node cluster over real TCP — p50 288µs leader-local / 427µs via follower (one fabric hop ≈ +140µs), p99.9 < 1ms, 140–165k msg/s vs RabbitMQ 4.3.1 quorum 2234µs p50 / 39k msg/s — with the honest caveat that our log is in-memory vs RabbitMQ's fsync (durability parity is the Phase 7 re-run) while our leg replicated ×3 vs RabbitMQ's single member. The bench also flushed out a real bug — close-time settlement drains defeated by tokio's cooperative budget requeued acked messages as duplicates on every busy close — fixed + regression-tested. Commit.
 
 ### Phase 7 — Durability & deep-queue scaling (the §8 #1 risk)
-- [ ] Durable-local store for non-replicated durable queues (free embedded backend, feature-gated).
+- [x] Durable-local store for non-replicated durable queues: `/durable/<name>` addresses backed by **redb** behind the `store-redb` feature (`data_dir` config / brokerd `--data-dir`). One DB file per node; all writes ride a single **group-commit writer** (one fsync amortizes every publish in flight across all durable queues); a publish's accepted disposition is the on-disk durability confirm. Restart recovery = the ready-set seed from a store scan — proven by a client-facing stop-the-broker/start-a-new-one test (`durable_messages_survive_a_broker_restart`); settled messages never resurrect.
 - [ ] **Paged/segmented state machine** for deep replicated queues (§8 risk mitigation; defends §3.1 memory target).
-- [ ] Restart recovery; dead-letter, TTL, max-length policies.
+- [ ] Restart recovery for **quorum** queues (on-disk Raft log/vote/snapshot behind the storage trait); dead-letter, TTL, max-length policies.
 - [ ] **Bench: tail latency held flat as queue depth grows into the millions.** Commit.
 
 ### Phase 8 — Transactions
