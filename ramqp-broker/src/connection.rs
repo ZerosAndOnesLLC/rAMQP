@@ -35,10 +35,13 @@ use ramqp_core::types::messaging::{Accepted, DeliveryState, Rejected, TargetArch
 use ramqp_core::types::performatives::{Attach, Begin, Close, End, Performative};
 use ramqp_core::types::sasl::{SaslCode, SaslFrame, SaslMechanisms, SaslOutcome};
 
+use ramqp_core::txn::{declared_state, transactional_state, txn_state};
+
 use crate::auth::{Authenticator, Credentials};
 use crate::config::BrokerConfig;
 use crate::queue::{ConnCmd, PublishAck, QueueHandle, QueueMsg, SettleOutcome, SubId};
 use crate::registry::QueueRegistry;
+use crate::txn::{StagedPublish, StagedSettle, TxnControl, TxnManager, decode_control};
 
 /// How many queue commands to coalesce under one flush (mirrors the client
 /// driver's batching; bounds per-wakeup work so reads aren't starved).
@@ -152,6 +155,8 @@ async fn handshake<S: IoStream>(
         bindings: HashMap::new(),
         next_gen: 0,
         settlements: FuturesUnordered::new(),
+        txns: TxnManager::default(),
+        txn_results: FuturesUnordered::new(),
         next_session_id: 0,
         metrics: noop_metrics(),
         link_events_tx,
@@ -234,6 +239,8 @@ enum Binding {
         /// acks are not draining runs out of credit and stops (backpressure).
         acked_since_grant: u32,
     },
+    /// Peer sender → the transaction coordinator (declare/discharge).
+    Coordinator,
     /// Peer receiver → our sender → subscribed to `queue` as `sub`.
     Consumer {
         queue: QueueHandle,
@@ -248,9 +255,27 @@ enum Binding {
     },
 }
 
+/// How a consumer's terminal state resolves a dispatched message: applied
+/// immediately, or staged under a transaction until discharge.
+enum SettleAction {
+    /// Apply now.
+    Now(SettleOutcome),
+    /// Stage under this transaction (`transactional-state` disposition).
+    Txn(ramqp_core::txn::TxnId, SettleOutcome),
+}
+
 /// The resolution of one dispatched delivery: which queue/sub/message it was
-/// and the outcome the consumer settled it with.
-type SettlementResult = (mpsc::Sender<QueueMsg>, SubId, u64, SettleOutcome);
+/// and how the consumer settled it.
+type SettlementResult = (mpsc::Sender<QueueMsg>, SubId, u64, SettleAction);
+
+/// The async half of a transaction discharge (commit): where to report the
+/// outcome once every staged operation lands.
+struct TxnDone {
+    channel: u16,
+    handle: u32,
+    delivery_id: u32,
+    ok: bool,
+}
 
 /// An established broker-side connection (post-handshake).
 struct BrokerConnection<S: IoStream> {
@@ -276,6 +301,10 @@ struct BrokerConnection<S: IoStream> {
     next_gen: u64,
     /// In-flight consumer dispatches awaiting a terminal outcome.
     settlements: FuturesUnordered<std::pin::Pin<Box<dyn Future<Output = SettlementResult> + Send>>>,
+    /// Open transactions (staged work; dropped = rolled back).
+    txns: TxnManager,
+    /// In-flight transaction commits awaiting their staged work.
+    txn_results: FuturesUnordered<std::pin::Pin<Box<dyn Future<Output = TxnDone> + Send>>>,
     next_session_id: u64,
     metrics: SharedMetrics,
     /// Shared event channel for all accepted links; drained synchronously
@@ -328,6 +357,30 @@ impl<S: IoStream> BrokerConnection<S> {
                             Ok(next) => { self.handle_cmd(next); drained += 1; }
                             Err(_) => break,
                         }
+                    }
+                    self.flush().await?;
+                }
+
+                Some(done) = self.txn_results.next() => {
+                    if let Some(session) = self.sessions.get_mut(&done.channel) {
+                        let state = if done.ok {
+                            DeliveryState::Accepted(Accepted::default())
+                        } else {
+                            DeliveryState::Rejected(Rejected {
+                                error: Some(AmqpError::new(
+                                    AmqpCondition::InternalError,
+                                    Some("transaction failed; rolled back".to_owned()),
+                                )),
+                            })
+                        };
+                        session.send_disposition(
+                            done.handle,
+                            DeliveryId(done.delivery_id),
+                            None,
+                            state,
+                            true,
+                            &mut self.transport,
+                        );
                     }
                     self.flush().await?;
                 }
@@ -397,6 +450,18 @@ impl<S: IoStream> BrokerConnection<S> {
         //   without settling): the per-item timeout stops the drain there;
         //   whatever remains requeues via the unsubscribes below
         //   (at-least-once, as before).
+        self.drain_ready_settlements().await;
+        for ((_, _), binding) in self.bindings.drain() {
+            if let Binding::Consumer { queue, sub, .. } = binding {
+                let _ = queue.tx.send(QueueMsg::Unsubscribe { sub }).await;
+            }
+        }
+    }
+
+    /// Forward every settlement whose outcome has already resolved (see the
+    /// cleanup notes on the tokio-coop trap; `unconstrained` + a per-item
+    /// timeout so genuinely pending futures stop the drain).
+    async fn drain_ready_settlements(&mut self) {
         loop {
             let next = tokio::time::timeout(
                 std::time::Duration::from_millis(20),
@@ -407,23 +472,41 @@ impl<S: IoStream> BrokerConnection<S> {
                 Ok(None) | Err(_) => break,
             }
         }
-        for ((_, _), binding) in self.bindings.drain() {
-            if let Binding::Consumer { queue, sub, .. } = binding {
-                let _ = queue.tx.send(QueueMsg::Unsubscribe { sub }).await;
-            }
-        }
     }
 
     /// Hand one resolved dispatch outcome to its queue.
     async fn forward_settlement(&mut self, result: SettlementResult) {
-        let (queue, sub, msg_id, outcome) = result;
-        let _ = queue
-            .send(QueueMsg::Settle {
-                sub,
-                msg_id,
-                outcome,
-            })
-            .await;
+        let (queue, sub, msg_id, action) = result;
+        match action {
+            SettleAction::Now(outcome) => {
+                let _ = queue
+                    .send(QueueMsg::Settle {
+                        sub,
+                        msg_id,
+                        outcome,
+                    })
+                    .await;
+            }
+            SettleAction::Txn(txn_id, outcome) => {
+                let staged = self.txns.stage_settle(
+                    &txn_id,
+                    StagedSettle {
+                        queue,
+                        sub,
+                        msg_id,
+                        outcome,
+                    },
+                );
+                if !staged {
+                    // Unknown txn or cap: leave the message in flight; the
+                    // teardown/unsubscribe path requeues it (at-least-once).
+                    tracing::warn!(
+                        msg_id,
+                        "transactional settle not staged (unknown txn or cap)"
+                    );
+                }
+            }
+        }
     }
 
     async fn flush(&mut self) -> Result<(), ConnectError> {
@@ -467,7 +550,12 @@ impl<S: IoStream> BrokerConnection<S> {
                 let Some(session) = self.sessions.get_mut(&channel) else {
                     // Session raced away: requeue on the validated queue.
                     self.settlements.push(Box::pin(async move {
-                        (queue_tx, sub, msg_id, SettleOutcome::Requeue)
+                        (
+                            queue_tx,
+                            sub,
+                            msg_id,
+                            SettleAction::Now(SettleOutcome::Requeue),
+                        )
                     }));
                     return;
                 };
@@ -483,13 +571,24 @@ impl<S: IoStream> BrokerConnection<S> {
                     self.max_frame_size,
                 );
                 self.settlements.push(Box::pin(async move {
-                    let outcome = match reply_rx.await {
-                        Ok(Ok(state)) => state_to_outcome(&state),
+                    let action = match reply_rx.await {
+                        Ok(Ok(state)) => match txn_state(&state) {
+                            // A transactional settlement: stage it under the
+                            // transaction (applied/undone at discharge).
+                            Some(ts) => SettleAction::Txn(
+                                ts.txn_id,
+                                ts.outcome
+                                    .as_ref()
+                                    .map(outcome_to_settle)
+                                    .unwrap_or(SettleOutcome::Ack),
+                            ),
+                            None => SettleAction::Now(state_to_outcome(&state)),
+                        },
                         // Link/connection died before a terminal outcome:
                         // requeue (no-op if an unsubscribe already did).
-                        Ok(Err(_)) | Err(_) => SettleOutcome::Requeue,
+                        Ok(Err(_)) | Err(_) => SettleAction::Now(SettleOutcome::Requeue),
                     };
-                    (queue_tx, sub, msg_id, outcome)
+                    (queue_tx, sub, msg_id, action)
                 }));
             }
             ConnCmd::SettleIncoming {
@@ -558,6 +657,168 @@ impl<S: IoStream> BrokerConnection<S> {
             && let Some(session) = self.sessions.get_mut(&channel)
         {
             session.grant_credit(handle, grant, &mut self.transport);
+        }
+    }
+
+    /// Handle one coordinator control message (`declare` / `discharge`).
+    ///
+    /// Declares and rollbacks answer synchronously. A commit resolves
+    /// asynchronously through `txn_results`: every staged enqueue must be
+    /// accepted by its queue (Raft-committed / fsynced for replicated and
+    /// durable queues — the coordinator inherits cluster-awareness from the
+    /// queue layer) before the discharge is answered `accepted`.
+    fn handle_txn_control(
+        &mut self,
+        channel: u16,
+        handle: u32,
+        d: ramqp_core::proto::IncomingDelivery,
+    ) {
+        let delivery_id = d.delivery_id;
+        let control = decode_control(&d.message);
+        match control {
+            Some(TxnControl::Declare) => {
+                let state = match self.txns.declare() {
+                    Some(txn_id) => declared_state(txn_id),
+                    None => DeliveryState::Rejected(Rejected {
+                        error: Some(AmqpError::new(
+                            AmqpCondition::ResourceLimitExceeded,
+                            Some("too many open transactions".to_owned()),
+                        )),
+                    }),
+                };
+                if let Some(session) = self.sessions.get_mut(&channel) {
+                    session.send_disposition(
+                        handle,
+                        delivery_id,
+                        None,
+                        state,
+                        true,
+                        &mut self.transport,
+                    );
+                    session.grant_credit(handle, 1, &mut self.transport);
+                }
+            }
+            Some(TxnControl::Discharge { txn_id, fail }) => {
+                let Some(txn) = self.txns.take(&txn_id) else {
+                    if let Some(session) = self.sessions.get_mut(&channel) {
+                        session.send_disposition(
+                            handle,
+                            delivery_id,
+                            None,
+                            DeliveryState::Rejected(Rejected {
+                                error: Some(AmqpError::new(
+                                    AmqpCondition::NotFound,
+                                    Some("unknown transaction".to_owned()),
+                                )),
+                            }),
+                            true,
+                            &mut self.transport,
+                        );
+                        session.grant_credit(handle, 1, &mut self.transport);
+                    }
+                    return;
+                };
+                let done = TxnDone {
+                    channel,
+                    handle,
+                    delivery_id: delivery_id.value(),
+                    ok: true,
+                };
+                if fail {
+                    // Roll back: staged enqueues drop; staged settlements
+                    // requeue their (still in-flight) messages.
+                    self.txn_results.push(Box::pin(async move {
+                        for settle in txn.settles {
+                            let _ = settle
+                                .queue
+                                .send(QueueMsg::Settle {
+                                    sub: settle.sub,
+                                    msg_id: settle.msg_id,
+                                    outcome: SettleOutcome::Requeue,
+                                })
+                                .await;
+                        }
+                        done
+                    }));
+                } else {
+                    // Commit: every staged enqueue must land (its queue's own
+                    // durability confirm) before the settlements apply and
+                    // the discharge is accepted.
+                    self.txn_results.push(Box::pin(async move {
+                        let mut ok = true;
+                        for publish in &txn.publishes {
+                            let (ack_tx, mut ack_rx) = mpsc::unbounded_channel::<ConnCmd>();
+                            let sent = publish
+                                .queue
+                                .send(QueueMsg::Publish {
+                                    body: publish.body.clone(),
+                                    ack: Some(PublishAck {
+                                        conn: ack_tx,
+                                        channel: 0,
+                                        handle: 0,
+                                        binding_gen: 0,
+                                        delivery_id: 0,
+                                    }),
+                                })
+                                .await
+                                .is_ok();
+                            let accepted = sent
+                                && matches!(
+                                    ack_rx.recv().await,
+                                    Some(ConnCmd::SettleIncoming { accepted: true, .. })
+                                );
+                            if !accepted {
+                                tracing::warn!(
+                                    queue = %publish.queue_name,
+                                    "transactional publish refused at commit; failing the transaction"
+                                );
+                                ok = false;
+                                break;
+                            }
+                        }
+                        // Settlements: apply on success; requeue on failure
+                        // (the consumer's work is undone with the txn).
+                        for settle in txn.settles {
+                            let outcome = if ok {
+                                settle.outcome
+                            } else {
+                                SettleOutcome::Requeue
+                            };
+                            let _ = settle
+                                .queue
+                                .send(QueueMsg::Settle {
+                                    sub: settle.sub,
+                                    msg_id: settle.msg_id,
+                                    outcome,
+                                })
+                                .await;
+                        }
+                        TxnDone { ok, ..done }
+                    }));
+                }
+                if let Some(session) = self.sessions.get_mut(&channel) {
+                    session.grant_credit(handle, 1, &mut self.transport);
+                }
+            }
+            None => {
+                tracing::warn!("undecodable coordinator control message");
+                if let Some(session) = self.sessions.get_mut(&channel) {
+                    session.send_disposition(
+                        handle,
+                        delivery_id,
+                        None,
+                        DeliveryState::Rejected(Rejected {
+                            error: Some(AmqpError::new(
+                                AmqpCondition::DecodeError,
+                                Some("expected declare or discharge".to_owned()),
+                            )),
+                        }),
+                        true,
+                        &mut self.transport,
+                    );
+                    session.grant_credit(handle, 1, &mut self.transport);
+                }
+            }
         }
     }
 
@@ -654,6 +915,39 @@ impl<S: IoStream> BrokerConnection<S> {
     /// Accept a peer-initiated attach: resolve its address to a queue, mirror
     /// the endpoint, and bind it.
     async fn accept_attach(&mut self, local: u16, remote_channel: u16, attach: Attach) {
+        // A sender targeting a COORDINATOR is a transaction control link
+        // (spec part 4) — no queue behind it; declare/discharge control
+        // messages arrive as deliveries.
+        if attach.role == Role::Sender
+            && matches!(&attach.target, Some(TargetArchetype::Coordinator(_)))
+        {
+            let session = self.sessions.get_mut(&local).expect("bound channel");
+            let accepted = session.accept_peer_attach(
+                attach,
+                CreditMode::Manual,
+                self.config.initial_credit,
+                self.config.max_message_size,
+                self.link_events_tx.clone(),
+                &mut self.transport,
+            );
+            match accepted {
+                Ok(a) => {
+                    self.bindings
+                        .insert((local, a.handle.0), Binding::Coordinator);
+                    tracing::debug!(handle = a.handle.0, "coordinator link bound");
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "coordinator attach rejected; ending session");
+                    self.end_session_with_error(
+                        local,
+                        remote_channel,
+                        AmqpError::new(AmqpCondition::ResourceLimitExceeded, Some(e.to_string())),
+                    )
+                    .await;
+                }
+            }
+            return;
+        }
         // Producer (peer sender) targets a queue; consumer (peer receiver)
         // sources from one.
         let address = match attach.role {
@@ -758,10 +1052,62 @@ impl<S: IoStream> BrokerConnection<S> {
                     let handle = d.handle.0;
                     // Clone the sender + epoch out so the bindings borrow is
                     // released before the await / the credit replenishment.
-                    let (queue_tx, epoch) = match self.bindings.get(&(channel, handle)) {
-                        Some(Binding::Producer { queue, epoch, .. }) => (queue.tx.clone(), *epoch),
+                    let (queue_tx, queue_name, epoch) = match self.bindings.get(&(channel, handle))
+                    {
+                        Some(Binding::Producer { queue, epoch, .. }) => {
+                            (queue.tx.clone(), queue.name.clone(), *epoch)
+                        }
+                        Some(Binding::Coordinator) => {
+                            // The client pipelines transactional dispositions
+                            // ahead of its discharge; their settlement
+                            // futures are resolved but may not be staged yet.
+                            // Drain them first or a discharge could take an
+                            // incomplete transaction.
+                            self.drain_ready_settlements().await;
+                            self.handle_txn_control(channel, handle, d);
+                            continue;
+                        }
                         _ => continue, // link vanished mid-flight
                     };
+                    // A transfer carrying `transactional-state` stages its
+                    // enqueue under the transaction instead of publishing.
+                    if let Some(ts) = d.state.as_ref().and_then(txn_state) {
+                        let staged = self.txns.stage_publish(
+                            &ts.txn_id,
+                            StagedPublish {
+                                queue: queue_tx,
+                                queue_name,
+                                body: d.message,
+                            },
+                        );
+                        if let Some(session) = self.sessions.get_mut(&channel) {
+                            let state = if staged {
+                                transactional_state(
+                                    ts.txn_id,
+                                    Some(ramqp_core::types::messaging::Outcome::Accepted(
+                                        Accepted::default(),
+                                    )),
+                                )
+                            } else {
+                                DeliveryState::Rejected(Rejected {
+                                    error: Some(AmqpError::new(
+                                        AmqpCondition::ResourceLimitExceeded,
+                                        Some("unknown transaction or staging cap".to_owned()),
+                                    )),
+                                })
+                            };
+                            session.send_disposition(
+                                handle,
+                                d.delivery_id,
+                                None,
+                                state,
+                                true,
+                                &mut self.transport,
+                            );
+                        }
+                        self.replenish_producer_credit(channel, handle);
+                        continue;
+                    }
                     let settled = d.settled;
                     let ack = (!settled).then(|| PublishAck {
                         conn: self.cmd_tx.clone(),
@@ -976,6 +1322,23 @@ impl<S: IoStream> BrokerConnection<S> {
             }
         })
         .await;
+    }
+}
+
+/// Map a transactional provisional outcome onto a queue settlement.
+fn outcome_to_settle(outcome: &ramqp_core::types::messaging::Outcome) -> SettleOutcome {
+    use ramqp_core::types::messaging::Outcome;
+    match outcome {
+        Outcome::Accepted(_) => SettleOutcome::Ack,
+        Outcome::Released(_) => SettleOutcome::Requeue,
+        Outcome::Modified(m) => {
+            if m.delivery_failed.unwrap_or(false) {
+                SettleOutcome::RequeueFailed
+            } else {
+                SettleOutcome::Requeue
+            }
+        }
+        Outcome::Rejected(_) => SettleOutcome::Drop,
     }
 }
 

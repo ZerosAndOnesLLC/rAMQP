@@ -6,7 +6,7 @@ shared `ramqp-core`, then adding a server crate on top. Clean-room, no external
 AMQP dependencies (same constraint as the client). Clustered from v1; single
 protocol, done excellently; **fast and light before anything else**.
 
-> **Status: building — Phases 0–7 complete.** See §11 checkboxes. The broker runs **clustered**:
+> **Status: building — Phases 0–8 complete.** See §11 checkboxes. The broker runs **clustered**:
 > a 3-node cluster forms from static seeds over the inter-node fabric (one
 > multiplexed TCP connection per peer pair carrying every Raft group + the
 > forwarded data plane), quorum queues are declared through the replicated

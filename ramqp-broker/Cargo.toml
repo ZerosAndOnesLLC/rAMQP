@@ -1,6 +1,6 @@
 [package]
 name = "ramqp-broker"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 description = "A performance-first, highly-available AMQP 1.0 broker in Rust (in development)."
 license = "MIT"
@@ -9,7 +9,7 @@ keywords = ["amqp", "amqp1", "broker", "messaging", "async"]
 categories = ["network-programming", "asynchronous"]
 
 [dependencies]
-ramqp-core = { path = "../ramqp-core", version = "0.2.1" }
+ramqp-core = { path = "../ramqp-core", version = "0.2.3", features = ["transaction"] }
 bytes = { version = "1", features = ["serde"] }
 futures-util = "0.3"
 tokio = { version = "1", features = ["sync", "io-util", "net", "rt", "rt-multi-thread", "macros", "time", "signal"] }
@@ -23,7 +23,7 @@ redb = { version = "4", optional = true }
 
 [dev-dependencies]
 # The published client, used as the interop peer for loopback tests.
-ramqp = { path = "../ramqp" }
+ramqp = { path = "../ramqp", features = ["transaction"] }
 tempfile = "3.27.0"
 tokio = { version = "1", features = ["full", "test-util"] }
 

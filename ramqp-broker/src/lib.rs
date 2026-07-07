@@ -42,6 +42,7 @@ mod quorum;
 mod registry;
 #[cfg(feature = "store-redb")]
 mod store;
+mod txn;
 
 pub use auth::{AllowAll, Authenticator, Credentials, StaticPlain};
 pub use broker::{BoundBroker, Broker, ShutdownHandle};
