@@ -139,3 +139,31 @@ jobs:
         # rapid open/close churn makes it slow but stable; the suite already
         # retries connects to absorb this.
         run: cargo test --test broker -- --ignored --test-threads=1
+
+  # Our OWN broker: run the same client interop suite against ramqp-broker that
+  # we run against RabbitMQ and Artemis — apples-to-apples proof it speaks
+  # AMQP 1.0 to the ramqp client. No external service: build the daemon, run it,
+  # point the suite at it (the broker auto-declares queues, so no pre-declare).
+  interop-ramqp-broker:
+    name: Interop (ramqp-broker)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build the broker daemon
+        run: cargo build -p ramqp-broker --bin ramqp-brokerd
+      - name: Run the client interop suite against ramqp-broker
+        env:
+          RAMQP_BROKER_URL: amqp://127.0.0.1:5672
+          RAMQP_BROKER_ADDRESS: /queues/interop
+        run: |
+          RAMQP_LISTEN=127.0.0.1:5672 target/debug/ramqp-brokerd &
+          broker=$!
+          for i in $(seq 1 30); do
+            if (exec 3<>/dev/tcp/127.0.0.1/5672) 2>/dev/null; then exec 3>&-; break; fi
+            sleep 1
+          done
+          cargo test --test broker -- --ignored --test-threads=1
+          status=$?
+          kill "$broker" 2>/dev/null || true
+          exit $status

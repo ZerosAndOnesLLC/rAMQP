@@ -6,11 +6,16 @@ shared `ramqp-core`, then adding a server crate on top. Clean-room, no external
 AMQP dependencies (same constraint as the client). Clustered from v1; single
 protocol, done excellently; **fast and light before anything else**.
 
-> **Status: building — Phases 0–4 complete, Phase 5 nearly complete** (see §11
-> checkboxes). The broker runs, the unmodified `ramqp` client produces/consumes
-> against it, first benchmark numbers vs live RabbitMQ 4.3.1 and Artemis are in
-> `bench-compare/README.md`, and a 3-node Raft metadata cluster forms over TCP.
-> This v2 supersedes the original single-node plan after the scope decisions in §2.
+> **Status: building — Phases 0–5 complete; Phase 6 mostly done** (single-replica
+> quorum queues are live; the multi-node forwarding fabric is the remaining piece).
+> See §11 checkboxes. The broker runs, the unmodified `ramqp` client
+> produces/consumes against it (transient **and** quorum queues), first benchmark
+> numbers vs live RabbitMQ 4.3.1 and Artemis are in `bench-compare/README.md`, a
+> 3-node Raft metadata cluster forms over TCP, and CI runs the client interop
+> suite against our own broker alongside RabbitMQ and Artemis. A review-driven
+> correctness/hardening/perf pass has landed (see the git history on
+> `fix/review-findings`). This v2 supersedes the original single-node plan after
+> the scope decisions in §2.
 
 ---
 
@@ -482,12 +487,12 @@ link/session → negotiate/mux/heartbeat → txn/sasl splits.
 - [x] **Static-seed bootstrap** (`cluster::bootstrap`): `ClusterConfig{node_id, raft_listen, seeds}`; lowest seed id initializes with retry-until-quorum (already-initialized → no-op, restart/race-safe); `ClusterHandle::await_membership`. Test: 3 nodes bootstrap concurrently from the same seed list, agree on a leader, converge. (Queue-declaration wiring through the catalog lands with Phase 6 quorum queues, where the catalog gains its consumer.)
 - [x] Tests: single-node group applies/deletes; **3-node cluster forms, catalog replicates to every node; leader kill → re-election → post-failover writes converge on survivors**; learner joins and catches up. (Node-*restart* durability needs the on-disk log — Phase 7.) Bench unchanged: the cluster layer is not yet on any message path.
 
-### Phase 6 — Quorum queues
-- [ ] Per-queue Raft state machine (enqueue/settle log entries + unacked map).
-- [ ] Quorum-vs-transient declaration wired through the address model.
-- [ ] Snapshots / log-compaction.
+### Phase 6 — Quorum queues 🟡 (single-replica live; multi-node fabric remaining)
+- [x] Per-queue Raft state machine (enqueue/settle log entries + unacked map).
+- [x] Quorum-vs-transient declaration wired through the address model (`/quorum/<name>`).
+- [x] Snapshots / log-compaction (bincode snapshots; `LogsSinceLast` policy; built off-lock, off the async worker).
 - [ ] **Leader routing + internal forwarding fabric** (any node serves any queue), zero-copy + batched.
-- [ ] Test: produce to a quorum queue, **kill the leader mid-stream**, consumer continues, zero loss. **Bench: quorum-queue tail latency/throughput vs RabbitMQ quorum queues.** Commit.
+- [~] Test: produce to a quorum queue, **kill the leader mid-stream**, consumer continues, zero loss — proven at single-replica group scope (`leader_death_loses_no_committed_message`); the multi-node kill-leader test and **bench: quorum-queue tail latency/throughput vs RabbitMQ quorum queues** are pending the forwarding fabric. Commit.
 
 ### Phase 7 — Durability & deep-queue scaling (the §8 #1 risk)
 - [ ] Durable-local store for non-replicated durable queues (free embedded backend, feature-gated).
@@ -500,11 +505,11 @@ link/session → negotiate/mux/heartbeat → txn/sasl splits.
 
 ### Phase 9 — Auth, limits, management
 - [ ] Pluggable authn/authz + per-address permissions; SCRAM credential store.
-- [ ] Resource limits, backpressure, slow-loris guards, multi-tenant vhosts.
+- [~] Resource limits, backpressure, slow-loris guards, multi-tenant vhosts — **partially landed ahead of schedule** via the hardening pass: connection cap (`max_connections`), auto-declare cap (`max_queues`), and the slow-loris handshake timeout are in; per-tenant vhosts and richer backpressure remain.
 - [ ] Management/admin API + Prometheus metrics export (off the hot path). Commit.
 
 ### Phase 10 — Interop, conformance, perf, docs
-- [ ] Interop matrix: our client⇄our broker; our broker⇄RabbitMQ 4.x / Artemis / Qpid clients; `fe2o3-amqp` client.
+- [~] Interop matrix: our client⇄our broker; our broker⇄RabbitMQ 4.x / Artemis / Qpid clients; `fe2o3-amqp` client — **our-client⇄our-broker is in CI** (the same `tests/broker.rs` suite that runs against RabbitMQ/Artemis, run against ramqp-broker); the cross-broker and other-client legs remain.
 - [ ] Spec conformance suite (framing, flow, settlement, error conditions).
 - [ ] **Jepsen-style HA fault injection** (partition, split-brain, failover under load — no loss/dup beyond at-least-once).
 - [ ] **Runtime-model escalation decision (§3.3): if p99.9 demands it, move to sharded-tokio/thread-per-core/io_uring — the benchmark decides.**

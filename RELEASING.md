@@ -17,11 +17,11 @@ releases work. This page is the checklist.
 `ramqp/Cargo.toml` depends on the engine like this:
 
 ```toml
-ramqp-core = { path = "../ramqp-core", version = "0.2.0" }
+ramqp-core = { path = "../ramqp-core", version = "0.2.1" }
 ```
 
 Inside the workspace, Cargo uses the `path`. **When publishing, the `path` is
-stripped and only `version = "0.2.0"` remains** — so `cargo publish -p ramqp`
+stripped and only `version = "0.2.1"` remains** — so `cargo publish -p ramqp`
 fails unless a matching `ramqp-core` already exists on crates.io. Hence:
 
 1. `cargo publish -p ramqp-core`
@@ -73,7 +73,7 @@ Other manifest facts worth knowing:
 
 First release from the workspace; one-time notes:
 
-- Publishes `ramqp-core` **0.2.0** (its first release — 0.1.0 was never
+- Publishes `ramqp-core` **0.2.1** (its first release — 0.1.0/0.2.0 were never
   published) and `ramqp` **0.8.0**.
 - `ramqp` 0.8.0 is an internal restructure: the public API is byte-compatible
   with 0.7 (enforced by `tests/public_api.rs`), so downstream upgrades are a

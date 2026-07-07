@@ -1,6 +1,6 @@
 [package]
 name = "ramqp-broker"
-version = "0.1.9"
+version = "0.1.10"
 edition = "2024"
 description = "A performance-first, highly-available AMQP 1.0 broker in Rust (in development)."
 license = "MIT"
@@ -9,7 +9,7 @@ keywords = ["amqp", "amqp1", "broker", "messaging", "async"]
 categories = ["network-programming", "asynchronous"]
 
 [dependencies]
-ramqp-core = { path = "../ramqp-core", version = "0.2.0" }
+ramqp-core = { path = "../ramqp-core", version = "0.2.1" }
 bytes = { version = "1", features = ["serde"] }
 futures-util = "0.3"
 tokio = { version = "1", features = ["sync", "io-util", "net", "rt", "rt-multi-thread", "macros", "time", "signal"] }
