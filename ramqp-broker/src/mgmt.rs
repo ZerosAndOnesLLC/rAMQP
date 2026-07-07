@@ -30,72 +30,96 @@ pub(crate) struct BrokerCounters {
     pub connections_total: AtomicUsize,
 }
 
+/// Whole-request deadline (read + respond): a socket that trickles bytes
+/// forever must not park a task indefinitely (slow-loris guard — the AMQP
+/// path has the same bound via its handshake timeout).
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Concurrent management connections; excess sockets are dropped instead of
+/// spawning unbounded tasks.
+const MAX_CONCURRENT: usize = 64;
+
 /// Serve the management endpoint until the registry (broker) goes away.
 pub(crate) fn spawn_mgmt(
     listener: TcpListener,
     registry: std::sync::Weak<QueueRegistry>,
     counters: Arc<BrokerCounters>,
 ) {
+    let permits = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT));
     tokio::spawn(async move {
         loop {
-            let Ok((mut stream, _)) = listener.accept().await else {
+            let Ok((stream, _)) = listener.accept().await else {
                 continue;
             };
             let Some(registry) = registry.upgrade() else {
                 return; // broker gone
             };
+            let Ok(permit) = permits.clone().try_acquire_owned() else {
+                continue; // at the cap: drop the socket
+            };
             let counters = counters.clone();
             tokio::spawn(async move {
-                let _ = stream.set_nodelay(true);
-                // Read the request head (bounded; GETs only).
-                let mut buf = [0u8; 4096];
-                let mut used = 0usize;
-                let path = loop {
-                    let Ok(n) = stream.read(&mut buf[used..]).await else {
-                        return;
-                    };
-                    if n == 0 {
-                        return;
-                    }
-                    used += n;
-                    if let Some(head_end) = find_head_end(&buf[..used]) {
-                        let head = String::from_utf8_lossy(&buf[..head_end]);
-                        let mut parts = head.split_whitespace();
-                        match (parts.next(), parts.next()) {
-                            (Some("GET"), Some(path)) => break path.to_owned(),
-                            _ => {
-                                let _ = respond(&mut stream, 405, "text/plain", "GET only\n").await;
-                                return;
-                            }
-                        }
-                    }
-                    if used == buf.len() {
-                        return; // oversized head
-                    }
-                };
-
-                match path.as_str() {
-                    "/metrics" => {
-                        let body = render_metrics(&registry, &counters).await;
-                        let _ = respond(
-                            &mut stream,
-                            200,
-                            "text/plain; version=0.0.4; charset=utf-8",
-                            &body,
-                        )
+                let _permit = permit;
+                let _ =
+                    tokio::time::timeout(REQUEST_TIMEOUT, handle_request(stream, registry, counters))
                         .await;
-                    }
-                    "/queues" => {
-                        let body = render_queues(&registry).await;
-                        let _ = respond(&mut stream, 200, "application/json", &body).await;
-                    }
-                    _ => {
-                        let _ = respond(&mut stream, 404, "text/plain", "not found\n").await;
-                    }
-                }
             });
         }
     });
+}
+
+/// One GET request: parse the head, render, respond.
+async fn handle_request(
+    mut stream: tokio::net::TcpStream,
+    registry: Arc<QueueRegistry>,
+    counters: Arc<BrokerCounters>,
+) {
+    let _ = stream.set_nodelay(true);
+    // Read the request head (bounded; GETs only).
+    let mut buf = [0u8; 4096];
+    let mut used = 0usize;
+    let path = loop {
+        let Ok(n) = stream.read(&mut buf[used..]).await else {
+            return;
+        };
+        if n == 0 {
+            return;
+        }
+        used += n;
+        if let Some(head_end) = find_head_end(&buf[..used]) {
+            let head = String::from_utf8_lossy(&buf[..head_end]);
+            let mut parts = head.split_whitespace();
+            match (parts.next(), parts.next()) {
+                (Some("GET"), Some(path)) => break path.to_owned(),
+                _ => {
+                    let _ = respond(&mut stream, 405, "text/plain", "GET only\n").await;
+                    return;
+                }
+            }
+        }
+        if used == buf.len() {
+            return; // oversized head
+        }
+    };
+
+    match path.as_str() {
+        "/metrics" => {
+            let body = render_metrics(&registry, &counters).await;
+            let _ = respond(
+                &mut stream,
+                200,
+                "text/plain; version=0.0.4; charset=utf-8",
+                &body,
+            )
+            .await;
+        }
+        "/queues" => {
+            let body = render_queues(&registry).await;
+            let _ = respond(&mut stream, 200, "application/json", &body).await;
+        }
+        _ => {
+            let _ = respond(&mut stream, 404, "text/plain", "not found\n").await;
+        }
+    }
 }
 
 fn find_head_end(buf: &[u8]) -> Option<usize> {
@@ -210,12 +234,42 @@ async fn render_queues(registry: &QueueRegistry) -> String {
     out
 }
 
+/// Prometheus label-value escaping (text exposition format): backslash,
+/// double-quote, and newline get their escapes; any other control character
+/// is dropped — a name with a raw `\n` would otherwise inject arbitrary
+/// sample lines into the scrape (alert spoofing).
 fn escape_label(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
 }
 
+/// JSON string escaping per RFC 8259: quotes, backslashes, and ALL control
+/// characters (a raw newline in a name yields invalid JSON).
 fn escape_json(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                out.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 fn rss_bytes() -> Option<u64> {
@@ -228,4 +282,24 @@ fn rss_bytes() -> Option<u64> {
         .parse()
         .ok()?;
     Some(kib * 1024)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// MED-18 (issue #19): a name carrying a newline must not inject
+    /// Prometheus sample lines or break the JSON document.
+    #[test]
+    fn escapes_neutralize_control_characters() {
+        let hostile = "q\"\\\ninjected_metric 1\r\x01";
+        let label = escape_label(hostile);
+        assert!(!label.contains('\n'), "no raw newline in a label: {label}");
+        assert!(!label.contains('\r'));
+        assert_eq!(label, "q\\\"\\\\\\ninjected_metric 1");
+
+        let json = escape_json(hostile);
+        assert!(!json.contains('\n') && !json.contains('\r'));
+        assert_eq!(json, "q\\\"\\\\\\ninjected_metric 1\\r\\u0001");
+    }
 }
