@@ -65,6 +65,9 @@ pub(crate) struct QueueRegistry {
     /// Cap on the number of distinct queues (0 = unbounded); bounds how many
     /// actors / Raft groups a client can auto-declare.
     max_queues: usize,
+    /// Per-vhost queue cap (0 = disabled); stops one tenant exhausting the
+    /// broker-wide `max_queues` pool.
+    max_queues_per_vhost: usize,
     /// This node's id for single-replica queue groups.
     node_id: NodeId,
     /// The cluster node, when this broker is clustered. Set once at bind.
@@ -92,6 +95,7 @@ impl QueueRegistry {
             max_depth: config.max_queue_depth,
             max_bytes: config.max_queue_bytes,
             max_queues: config.max_queues,
+            max_queues_per_vhost: config.max_queues_per_vhost,
             node_id: 1,
             cluster: OnceLock::new(),
             #[cfg(feature = "store-redb")]
@@ -197,7 +201,7 @@ impl QueueRegistry {
     /// (the documented dead-letter composition).
     pub async fn resolve(&self, address: &str) -> Option<QueueHandle> {
         let (kind, name) = Self::parse_address(address)?;
-        self.resolve_name(kind, name).await
+        self.resolve_name(kind, name, "").await
     }
 
     /// Resolve a CLIENT address within a vhost, declaring the queue if it
@@ -225,12 +229,29 @@ impl QueueRegistry {
             qualified = format!("{vhost}/{bare}");
             &qualified
         };
-        self.resolve_name(kind, name).await
+        self.resolve_name(kind, name, vhost).await
+    }
+
+    /// Count declared queues belonging to `vhost` (any kind). Keys are
+    /// `<kind>:<vhost>/<name>`, so a queue is in `vhost` when the part after
+    /// the kind prefix begins with `<vhost>/`.
+    fn count_vhost_queues(
+        map: &HashMap<String, Arc<tokio::sync::OnceCell<QueueHandle>>>,
+        vhost: &str,
+    ) -> usize {
+        let needle = format!("{vhost}/");
+        map.keys()
+            .filter(|k| {
+                k.split_once(':')
+                    .is_some_and(|(_, rest)| rest.starts_with(&needle))
+            })
+            .count()
     }
 
     /// Get-or-declare the queue actor for a normalized, namespace-qualified
-    /// name.
-    async fn resolve_name(&self, kind: QueueKind, name: &str) -> Option<QueueHandle> {
+    /// name. `vhost` (empty for the default / broker-internal callers) gates
+    /// the per-vhost cap.
+    async fn resolve_name(&self, kind: QueueKind, name: &str, vhost: &str) -> Option<QueueHandle> {
         // Kind-qualified key: `/queues/foo`, `/quorum/foo`, and
         // `/durable/foo` are distinct queues.
         let key = match kind {
@@ -245,11 +266,27 @@ impl QueueRegistry {
             // unbounded auto-declare DoS guard); existing queues still resolve.
             let cell = {
                 let mut map = self.queues.lock().expect("registry lock");
-                if !map.contains_key(&key) && self.max_queues != 0 && map.len() >= self.max_queues {
+                let is_new = !map.contains_key(&key);
+                if is_new && self.max_queues != 0 && map.len() >= self.max_queues {
                     tracing::warn!(
                         queue = %name,
                         max = self.max_queues,
                         "queue limit reached; refusing to auto-declare"
+                    );
+                    return None;
+                }
+                // Per-vhost cap: keep one tenant from exhausting the shared
+                // broker-wide pool (LOW-12). Applies to non-default vhosts;
+                // the key suffix is `<vhost>/...` for those.
+                if is_new
+                    && !vhost.is_empty()
+                    && self.max_queues_per_vhost != 0
+                    && Self::count_vhost_queues(&map, vhost) >= self.max_queues_per_vhost
+                {
+                    tracing::warn!(
+                        %vhost,
+                        max = self.max_queues_per_vhost,
+                        "per-vhost queue limit reached; refusing to auto-declare"
                     );
                     return None;
                 }
@@ -523,6 +560,26 @@ mod tests {
             secret.tx.same_channel(&dlx.tx),
             "internal qualified resolution reaches the tenant's queue"
         );
+    }
+
+    /// LOW-12 (issue #19): the per-vhost cap stops one tenant from
+    /// exhausting the shared broker-wide pool.
+    #[tokio::test]
+    async fn per_vhost_cap_isolates_tenants() {
+        let r = QueueRegistry::new(&BrokerConfig {
+            max_queue_depth: 10,
+            max_queues: 0, // global cap disabled
+            max_queues_per_vhost: 2,
+            ..Default::default()
+        });
+        // Tenant A fills its per-vhost allowance.
+        assert!(r.resolve_in("a", "/queues/q1").await.is_some());
+        assert!(r.resolve_in("a", "/queues/q2").await.is_some());
+        // A third NEW queue for tenant A is refused...
+        assert!(r.resolve_in("a", "/queues/q3").await.is_none());
+        // ...but tenant B is unaffected, and A's existing queues still resolve.
+        assert!(r.resolve_in("b", "/queues/q1").await.is_some());
+        assert!(r.resolve_in("a", "/queues/q1").await.is_some());
     }
 
     #[tokio::test]

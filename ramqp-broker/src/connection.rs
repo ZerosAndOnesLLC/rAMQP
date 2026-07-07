@@ -1095,7 +1095,14 @@ impl<S: IoStream> BrokerConnection<S> {
                     .expect("bound channel")
                     .knows_link(&attach.name)
                 {
-                    // A response to a link we initiated (none today).
+                    // A response to a link WE initiated — of which there are
+                    // none today (the broker never initiates links), so this
+                    // branch is unreachable for peer attaches. It routes to
+                    // handle_link_frame, which does NOT call authorize(): the
+                    // one attach path that skips authz. It stays safe only
+                    // because a "known" link is already bound (no new binding
+                    // or queue resolution happens here) — if the broker ever
+                    // initiates links, re-verify that invariant (LOW-13).
                     let session = self.sessions.get_mut(&local).expect("bound channel");
                     session
                         .handle_link_frame(

@@ -46,6 +46,11 @@ pub struct BrokerConfig {
     /// allocation DoS guard. At the cap, an attach to a *new* address is
     /// refused. `0` disables the cap.
     pub max_queues: usize,
+    /// Maximum distinct queues **per vhost**. Without it, `max_queues` is a
+    /// single broker-wide pool, so one tenant can exhaust it and starve every
+    /// other vhost's new-queue attaches (and DLX auto-declares). This caps
+    /// each non-default vhost independently. `0` disables the per-vhost cap.
+    pub max_queues_per_vhost: usize,
     /// Cluster membership, when this broker is one node of a cluster.
     /// `None` (the default) runs standalone: `/quorum/*` queues are
     /// single-replica groups on this node.
@@ -182,6 +187,7 @@ impl Default for BrokerConfig {
             max_queue_bytes: 1024 * 1024 * 1024,
             max_connections: 16_384,
             max_queues: 100_000,
+            max_queues_per_vhost: 10_000,
             cluster: None,
             data_dir: None,
             resident_bytes_max: 64 * 1024 * 1024,

@@ -162,6 +162,47 @@ async fn producer_send(session: &ramqp::Session, address: &str, text: &str) {
     p.send(Message::text(text)).await.expect("send");
 }
 
+/// LOW-13 (issue #19): re-attaching a link whose name was already used for a
+/// DENIED attach stays denied — the knows_link → handle_link_frame path
+/// (the one attach path that skips authorize()) must not become a bypass.
+#[tokio::test]
+async fn reattach_of_a_denied_link_name_stays_denied() {
+    #[derive(Debug)]
+    struct DenyReceive;
+    impl Authenticator for DenyReceive {
+        fn mechanisms(&self) -> &[&'static str] {
+            &["ANONYMOUS", "PLAIN"]
+        }
+        fn verify(&self, _c: Credentials<'_>) -> bool {
+            true
+        }
+        fn authorize(&self, _id: Option<&str>, _vh: &str, address: &str, op: Operation) -> bool {
+            !(address.contains("secret") && op == Operation::Receive)
+        }
+    }
+    let (addr, shutdown) = start_with(Arc::new(DenyReceive)).await;
+    let conn = ConnectionBuilder::new(format!("amqp://{addr}"))
+        .connect()
+        .await
+        .expect("connect");
+    let session = conn.begin_session().await.expect("session");
+
+    // Two consumer attaches to the same denied address; both must be refused
+    // (the second exercises any known-link routing).
+    for _ in 0..2 {
+        let mut consumer = session
+            .create_consumer("/queues/secret-box")
+            .await
+            .expect("attach completes (refusal is link-level)");
+        let denied = tokio::time::timeout(Duration::from_secs(5), consumer.recv())
+            .await
+            .expect("refusal arrives");
+        assert!(denied.is_err(), "denied consumer must not receive");
+    }
+    conn.close().await.expect("close");
+    shutdown.shutdown();
+}
+
 /// HIGH-10 (issue #19): a SCRAM user bound to a vhost cannot attach inside
 /// another vhost — authenticated no longer means unrestrained.
 #[tokio::test]
