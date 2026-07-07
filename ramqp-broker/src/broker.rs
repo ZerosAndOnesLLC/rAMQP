@@ -14,6 +14,7 @@ use crate::auth::{AllowAll, Authenticator};
 use crate::cluster::node::{ClusterNode, NodeSettings};
 use crate::config::BrokerConfig;
 use crate::connection;
+use crate::policy::{self, DeadLetterSender};
 use crate::registry::QueueRegistry;
 
 /// A broker instance under construction.
@@ -22,6 +23,7 @@ pub struct Broker {
     config: Arc<BrokerConfig>,
     auth: Arc<dyn Authenticator>,
     registry: Arc<QueueRegistry>,
+    dlx: DeadLetterSender,
 }
 
 impl std::fmt::Debug for Broker {
@@ -36,16 +38,14 @@ impl Broker {
     /// Create a broker with the given configuration (and [`AllowAll`] auth —
     /// swap it with [`Broker::with_authenticator`] for anything real).
     pub fn new(config: BrokerConfig) -> Self {
-        let registry = Arc::new(QueueRegistry::new(
-            config.max_queue_depth,
-            config.max_queues,
-            config.data_dir.clone(),
-            config.resident_bytes_max,
-        ));
+        let registry = Arc::new(QueueRegistry::new(&config));
+        let dlx = policy::spawn_dlx_router(&registry);
+        registry.set_dlx(dlx.clone());
         Broker {
             config: Arc::new(config),
             auth: Arc::new(AllowAll),
             registry,
+            dlx,
         }
     }
 
@@ -72,6 +72,8 @@ impl Broker {
                 max_queue_depth: self.config.max_queue_depth,
                 data_dir: self.config.data_dir.clone(),
                 resident_bytes_max: self.config.resident_bytes_max,
+                policies: self.config.policies.clone(),
+                dlx: Some(self.dlx.clone()),
             })
             .await?;
             self.registry.set_cluster(node);

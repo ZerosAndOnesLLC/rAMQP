@@ -20,6 +20,8 @@ use crate::cluster::NodeId;
 use crate::cluster::network::UnreachableNetwork;
 use crate::cluster::node::ClusterNode;
 use crate::cluster::queue_group::QueueRaft;
+use crate::config::{BrokerConfig, QueuePolicy};
+use crate::policy::{DeadLetterSender, EffectivePolicy};
 use crate::proxy;
 use crate::queue::{self, QueueHandle};
 use crate::quorum;
@@ -63,26 +65,42 @@ pub(crate) struct QueueRegistry {
     data_dir: Option<std::path::PathBuf>,
     /// Per-queue resident-body budget before quorum paging kicks in.
     resident_bytes_max: usize,
+    /// Queue policies (prefix-matched at declaration).
+    policies: Vec<(String, QueuePolicy)>,
+    /// The dead-letter router, wired in right after construction.
+    dlx: OnceLock<DeadLetterSender>,
 }
 
 impl QueueRegistry {
-    pub fn new(
-        max_depth: usize,
-        max_queues: usize,
-        data_dir: Option<std::path::PathBuf>,
-        resident_bytes_max: usize,
-    ) -> Self {
+    pub fn new(config: &BrokerConfig) -> Self {
         QueueRegistry {
             queues: std::sync::Mutex::new(HashMap::new()),
-            max_depth,
-            max_queues,
+            max_depth: config.max_queue_depth,
+            max_queues: config.max_queues,
             node_id: 1,
             cluster: OnceLock::new(),
             #[cfg(feature = "store-redb")]
             store: tokio::sync::OnceCell::new(),
-            data_dir,
-            resident_bytes_max,
+            data_dir: config.data_dir.clone(),
+            resident_bytes_max: config.resident_bytes_max,
+            policies: config.policies.clone(),
+            dlx: OnceLock::new(),
         }
+    }
+
+    /// Wire the dead-letter router (once, right after construction).
+    pub fn set_dlx(&self, dlx: DeadLetterSender) {
+        let _ = self.dlx.set(dlx);
+    }
+
+    /// The resolved policy for a queue.
+    fn policy_for(&self, name: &str) -> EffectivePolicy {
+        EffectivePolicy::resolve(
+            &self.policies,
+            name,
+            self.max_depth,
+            self.dlx.get().cloned(),
+        )
     }
 
     /// The durable store, opened on first use (`None` when unconfigured or
@@ -161,7 +179,9 @@ impl QueueRegistry {
             let init = cell
                 .get_or_try_init(|| async {
                     let h = match kind {
-                        QueueKind::Transient => queue::spawn(name.to_owned(), self.max_depth),
+                        QueueKind::Transient => {
+                            queue::spawn(name.to_owned(), self.policy_for(name))
+                        }
                         // Clustered: declare through the replicated catalog and
                         // serve through a leader-following proxy.
                         QueueKind::Quorum => match self.cluster.get() {
@@ -176,7 +196,7 @@ impl QueueRegistry {
                             None => spawn_quorum_group(
                                 name.to_owned(),
                                 self.node_id,
-                                self.max_depth,
+                                self.policy_for(name),
                                 self.data_dir.as_deref(),
                                 self.resident_bytes_max,
                             )
@@ -189,8 +209,13 @@ impl QueueRegistry {
                             let queue_id = store.queue_id(name).map_err(|e| {
                                 tracing::error!(queue = %name, error = %e, "durable queue id failed");
                             })?;
-                            crate::durable::spawn(name.to_owned(), store, queue_id, self.max_depth)
-                                .map_err(|e| {
+                            crate::durable::spawn(
+                                name.to_owned(),
+                                store,
+                                queue_id,
+                                self.policy_for(name),
+                            )
+                            .map_err(|e| {
                                     tracing::error!(queue = %name, error = %e, "durable recovery failed");
                                 })?
                         }
@@ -241,7 +266,7 @@ impl QueueRegistry {
 async fn spawn_quorum_group(
     name: String,
     node_id: NodeId,
-    max_depth: usize,
+    policy: EffectivePolicy,
     data_dir: Option<&std::path::Path>,
     resident_bytes_max: usize,
 ) -> Option<QueueHandle> {
@@ -293,7 +318,7 @@ async fn spawn_quorum_group(
         .map_err(|e| tracing::error!(queue = %name, error = %e, "quorum leader-wait failed"))
         .ok()?;
     // A single-replica standalone group can never be demoted.
-    Some(quorum::spawn(name, raft, store, max_depth, false))
+    Some(quorum::spawn(name, raft, store, policy, false))
 }
 
 #[cfg(test)]
@@ -325,7 +350,11 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_is_idempotent_and_kind_scoped() {
-        let r = QueueRegistry::new(10, 0, None, usize::MAX);
+        let r = QueueRegistry::new(&BrokerConfig {
+            max_queue_depth: 10,
+            max_queues: 0,
+            ..Default::default()
+        });
         let a = r.resolve("/queues/q1").await.unwrap();
         let b = r.resolve("q1").await.unwrap();
         assert!(a.tx.same_channel(&b.tx), "same transient queue");
@@ -341,7 +370,11 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_enforces_the_queue_cap() {
-        let r = QueueRegistry::new(10, 2, None, usize::MAX);
+        let r = QueueRegistry::new(&BrokerConfig {
+            max_queue_depth: 10,
+            max_queues: 2,
+            ..Default::default()
+        });
         // Two distinct queues declare fine.
         assert!(r.resolve("/queues/a").await.is_some());
         assert!(r.resolve("/queues/b").await.is_some());

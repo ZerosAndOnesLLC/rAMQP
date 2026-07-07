@@ -32,6 +32,7 @@ use tokio::sync::mpsc;
 
 use crate::cluster::queue_group::{QueueCommand, QueueRaft, QueueResponse, QueueStore};
 use crate::dispatch::{Subscriber, complete_drains, confirm_publish, pick_ready, refuse_publish};
+use crate::policy::{EffectivePolicy, now_ms};
 use crate::queue::{ConnCmd, PublishAck, QueueHandle, QueueMsg, SettleOutcome, SubId};
 
 /// The resolution of a pipelined commit.
@@ -64,7 +65,7 @@ pub(crate) fn spawn(
     name: String,
     raft: QueueRaft,
     store: QueueStore,
-    max_depth: usize,
+    policy: EffectivePolicy,
     exit_on_demotion: bool,
 ) -> QueueHandle {
     let (tx, rx) = mpsc::channel(1024);
@@ -72,7 +73,7 @@ pub(crate) fn spawn(
         name: name.clone(),
         tx,
     };
-    tokio::spawn(run(name, raft, store, rx, max_depth, exit_on_demotion));
+    tokio::spawn(run(name, raft, store, rx, policy, exit_on_demotion));
     handle
 }
 
@@ -81,7 +82,7 @@ async fn run(
     raft: QueueRaft,
     store: QueueStore,
     mut rx: mpsc::Receiver<QueueMsg>,
-    max_depth: usize,
+    policy: EffectivePolicy,
     exit_on_demotion: bool,
 ) {
     let mut subs: Vec<Subscriber> = Vec::new();
@@ -123,14 +124,15 @@ async fn run(
                 handle_msg(
                     msg,
                     &name,
+                    &policy,
                     &raft,
+                    &store,
                     &mut subs,
                     &mut inflight,
                     &mut ready,
                     &mut commits,
                     &mut publishes_pending,
                     &mut next_sub_id,
-                    max_depth,
                 );
             }
             Some(done) = commits.next() => {
@@ -166,6 +168,7 @@ async fn run(
             }
         }
 
+        expire_head(&name, &policy, &raft, &store, &mut ready, &mut commits);
         dispatch(&name, &store, &mut inflight, &mut ready, &mut subs, &mut rr);
     }
     tracing::debug!(queue = %name, "quorum queue actor stopped");
@@ -175,26 +178,42 @@ async fn run(
 fn handle_msg(
     msg: QueueMsg,
     name: &str,
+    policy: &EffectivePolicy,
     raft: &QueueRaft,
+    store: &QueueStore,
     subs: &mut Vec<Subscriber>,
     inflight: &mut HashMap<u64, SubId>,
     ready: &mut BTreeSet<u64>,
     commits: &mut FuturesUnordered<CommitFuture>,
     publishes_pending: &mut usize,
     next_sub_id: &mut SubId,
-    max_depth: usize,
 ) {
     match msg {
         QueueMsg::Publish { body, ack } => {
             // Depth bound counts everything stored or about to be.
-            if ready.len() + inflight.len() + *publishes_pending >= max_depth {
-                refuse_publish(name, ack);
-                return;
+            if ready.len() + inflight.len() + *publishes_pending >= policy.max_len {
+                // Drop-head makes room (dead-lettering the displaced
+                // message); otherwise refuse.
+                let dropped = policy.drop_head.then(|| ready.pop_first()).flatten();
+                match dropped {
+                    Some(old_id) => {
+                        dead_letter_stored(name, policy, store, old_id, "maxlen");
+                        push_remove(commits, raft, old_id);
+                    }
+                    None => {
+                        refuse_publish(name, ack);
+                        return;
+                    }
+                }
             }
             *publishes_pending += 1;
             let raft = raft.clone();
+            let enqueued_ms = now_ms();
             commits.push(Box::pin(async move {
-                let result = match raft.client_write(QueueCommand::Enqueue { body }).await {
+                let result = match raft
+                    .client_write(QueueCommand::Enqueue { body, enqueued_ms })
+                    .await
+                {
                     Ok(resp) => match resp.data {
                         QueueResponse::Enqueued { msg_id } => Ok(msg_id),
                         other => Err(format!("unexpected enqueue response: {other:?}")),
@@ -257,19 +276,31 @@ fn handle_msg(
                     ready.insert(msg_id);
                 }
                 SettleOutcome::RequeueFailed => {
-                    ready.insert(msg_id);
-                    let raft = raft.clone();
-                    commits.push(Box::pin(async move {
-                        let result = raft
-                            .client_write(QueueCommand::Settle {
-                                msg_id,
-                                requeue: true,
-                            })
-                            .await
-                            .map(|_| ())
-                            .map_err(|e| e.to_string());
-                        Committed::CountFailure { result }
-                    }));
+                    // Out of retries → dead-letter (or drop) instead of
+                    // requeueing. Failures come from applied state; this
+                    // attempt is the +1.
+                    let failed = store
+                        .with_state(|s| s.meta_of(msg_id).map(|(_, f)| f))
+                        .unwrap_or(0)
+                        + 1;
+                    if policy.attempts_exhausted(failed) {
+                        dead_letter_stored(name, policy, store, msg_id, "delivery-limit");
+                        push_remove(commits, raft, msg_id);
+                    } else {
+                        ready.insert(msg_id);
+                        let raft = raft.clone();
+                        commits.push(Box::pin(async move {
+                            let result = raft
+                                .client_write(QueueCommand::Settle {
+                                    msg_id,
+                                    requeue: true,
+                                })
+                                .await
+                                .map(|_| ())
+                                .map_err(|e| e.to_string());
+                            Committed::CountFailure { result }
+                        }));
+                    }
                 }
             }
         }
@@ -285,6 +316,68 @@ fn handle_msg(
                 }
             });
         }
+    }
+}
+
+/// Propose an ack-style removal (dead-lettered / expired / dropped-head).
+fn push_remove(commits: &mut FuturesUnordered<CommitFuture>, raft: &QueueRaft, msg_id: u64) {
+    let raft = raft.clone();
+    commits.push(Box::pin(async move {
+        let result = raft
+            .client_write(QueueCommand::Settle {
+                msg_id,
+                requeue: false,
+            })
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string());
+        Committed::Remove { msg_id, result }
+    }));
+}
+
+/// Read a message's body out of applied state and hand it to the
+/// dead-letter router.
+fn dead_letter_stored(
+    name: &str,
+    policy: &EffectivePolicy,
+    store: &QueueStore,
+    msg_id: u64,
+    reason: &str,
+) {
+    let body = match store.with_state(|s| s.body_of(msg_id)) {
+        Some(crate::cluster::queue_group::BodyFetch::Ready(bytes)) => Some(bytes),
+        Some(crate::cluster::queue_group::BodyFetch::Spilled(spill, r)) => spill.read(&r).ok(),
+        None => None,
+    };
+    if let Some(body) = body {
+        policy.dead_letter(name, reason, body);
+    }
+}
+
+/// Lazy TTL: expire ready messages from the head (dead-letter + propose
+/// removal) before dispatching.
+fn expire_head(
+    name: &str,
+    policy: &EffectivePolicy,
+    raft: &QueueRaft,
+    store: &QueueStore,
+    ready: &mut BTreeSet<u64>,
+    commits: &mut FuturesUnordered<CommitFuture>,
+) {
+    if policy.ttl_ms.is_none() {
+        return;
+    }
+    let now = now_ms();
+    while let Some(&head) = ready.first() {
+        let expired = store
+            .with_state(|s| s.meta_of(head).map(|(ms, _)| policy.expired(ms, now)))
+            .unwrap_or(true);
+        if !expired {
+            break;
+        }
+        ready.remove(&head);
+        dead_letter_stored(name, policy, store, head, "expired");
+        push_remove(commits, raft, head);
     }
 }
 

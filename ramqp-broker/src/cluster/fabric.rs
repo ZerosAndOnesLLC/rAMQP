@@ -649,6 +649,7 @@ mod tests {
             log_id: LogId::new(openraft::CommittedLeaderId::new(3, 1), 9),
             payload: EntryPayload::Normal(QueueCommand::Enqueue {
                 body: Bytes::from_static(b"\x00\x01binary body\xff"),
+                enqueued_ms: 42,
             }),
         };
         let req = AppendEntriesRequest::<QueueTypeConfig> {
@@ -662,7 +663,7 @@ mod tests {
             bincode::deserialize(&bytes).expect("deserialize");
         assert_eq!(back.entries.len(), 1);
         match &back.entries[0].payload {
-            EntryPayload::Normal(QueueCommand::Enqueue { body }) => {
+            EntryPayload::Normal(QueueCommand::Enqueue { body, .. }) => {
                 assert_eq!(&body[..], b"\x00\x01binary body\xff");
             }
             other => panic!("wrong payload: {other:?}"),

@@ -20,8 +20,9 @@ use bytes::Bytes;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use tokio::sync::{mpsc, oneshot};
 
-/// Messages: `(queue id, message id)` → `(failed-delivery count, body)`.
-const MESSAGES: TableDefinition<(u64, u64), (u32, &[u8])> = TableDefinition::new("messages");
+/// Messages: `(queue id, message id)` → `(failed-delivery count, enqueue
+/// time ms, body)`.
+const MESSAGES: TableDefinition<(u64, u64), (u32, u64, &[u8])> = TableDefinition::new("messages");
 /// Queue registry: name → queue id.
 const QUEUES: TableDefinition<&str, u64> = TableDefinition::new("queues");
 /// Single-row metadata: key → counter (`"next_queue_id"`).
@@ -36,6 +37,7 @@ pub(crate) enum StoreOp {
     Insert {
         queue: u64,
         msg_id: u64,
+        enqueued_ms: u64,
         body: Bytes,
         done: oneshot::Sender<bool>,
     },
@@ -126,9 +128,9 @@ impl Store {
         Ok(id)
     }
 
-    /// Recovery scan: every stored `(msg_id, failures)` for a queue, plus
-    /// the highest id ever seen (for the id counter).
-    pub fn scan(&self, queue: u64) -> Result<Vec<(u64, u32)>, String> {
+    /// Recovery scan: every stored `(msg_id, failures, enqueued_ms)` for a
+    /// queue.
+    pub fn scan(&self, queue: u64) -> Result<Vec<(u64, u32, u64)>, String> {
         let txn = self.db.begin_read().map_err(|e| e.to_string())?;
         let table = txn.open_table(MESSAGES).map_err(|e| e.to_string())?;
         let mut out = Vec::new();
@@ -137,7 +139,8 @@ impl Store {
             .map_err(|e| e.to_string())?
         {
             let (key, value) = entry.map_err(|e| e.to_string())?;
-            out.push((key.value().1, value.value().0));
+            let (failures, enqueued_ms, _) = value.value();
+            out.push((key.value().1, failures, enqueued_ms));
         }
         Ok(out)
     }
@@ -147,7 +150,7 @@ impl Store {
         let txn = self.db.begin_read().ok()?;
         let table = txn.open_table(MESSAGES).ok()?;
         let value = table.get((queue, msg_id)).ok()??;
-        Some(Bytes::copy_from_slice(value.value().1))
+        Some(Bytes::copy_from_slice(value.value().2))
     }
 }
 
@@ -181,11 +184,12 @@ fn apply_batch(db: &Database, batch: &[StoreOp]) -> Result<(), String> {
                 StoreOp::Insert {
                     queue,
                     msg_id,
+                    enqueued_ms,
                     body,
                     ..
                 } => {
                     table
-                        .insert((*queue, *msg_id), (0u32, body.as_ref()))
+                        .insert((*queue, *msg_id), (0u32, *enqueued_ms, body.as_ref()))
                         .map_err(|e| e.to_string())?;
                 }
                 StoreOp::Remove { queue, msg_id } => {
@@ -196,12 +200,12 @@ fn apply_batch(db: &Database, batch: &[StoreOp]) -> Result<(), String> {
                         .get((*queue, *msg_id))
                         .map_err(|e| e.to_string())?
                         .map(|v| {
-                            let (failures, body) = v.value();
-                            (failures + 1, body.to_vec())
+                            let (failures, enqueued_ms, body) = v.value();
+                            (failures + 1, enqueued_ms, body.to_vec())
                         });
-                    if let Some((failures, body)) = updated {
+                    if let Some((failures, enqueued_ms, body)) = updated {
                         table
-                            .insert((*queue, *msg_id), (failures, body.as_slice()))
+                            .insert((*queue, *msg_id), (failures, enqueued_ms, body.as_slice()))
                             .map_err(|e| e.to_string())?;
                     }
                 }
@@ -227,6 +231,7 @@ mod tests {
                 .submit(StoreOp::Insert {
                     queue: q,
                     msg_id: i,
+                    enqueued_ms: 1_000 + i,
                     body: Bytes::from(vec![i as u8; 8]),
                     done: tx,
                 })
@@ -255,6 +260,7 @@ mod tests {
             .submit(StoreOp::Insert {
                 queue: q,
                 msg_id: 4,
+                enqueued_ms: 1_004,
                 body: Bytes::from_static(b"x"),
                 done: tx,
             })
@@ -284,7 +290,7 @@ mod tests {
         assert_eq!(q2, q, "queue id is stable across restarts");
         let mut recovered = store.scan(q).expect("scan");
         recovered.sort_unstable();
-        assert_eq!(recovered, vec![(2, 1), (3, 0), (4, 0)]);
+        assert_eq!(recovered, vec![(2, 1, 1_002), (3, 0, 1_003), (4, 0, 1_004)]);
         assert_eq!(&store.body(q, 3).expect("body")[..], &[3u8; 8]);
         assert!(store.body(q, 1).is_none(), "acked message is gone");
     }

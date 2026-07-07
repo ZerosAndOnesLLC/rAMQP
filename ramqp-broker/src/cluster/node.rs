@@ -58,6 +58,10 @@ pub struct NodeSettings {
     pub data_dir: Option<std::path::PathBuf>,
     /// Per-queue resident-body budget before paging kicks in.
     pub resident_bytes_max: usize,
+    /// Queue policies (prefix-matched; leader-local enforcement).
+    pub policies: Vec<(String, crate::config::QueuePolicy)>,
+    /// The dead-letter router (None in bare-node tests).
+    pub dlx: Option<crate::policy::DeadLetterSender>,
 }
 
 /// One local member of a per-queue Raft group.
@@ -554,11 +558,17 @@ impl ClusterNode {
                 {
                     return Ok(handle.clone());
                 }
+                let policy = crate::policy::EffectivePolicy::resolve(
+                    &self.settings.policies,
+                    name,
+                    self.settings.max_queue_depth,
+                    self.settings.dlx.clone(),
+                );
                 let handle = quorum::spawn(
                     name.to_owned(),
                     member.raft.clone(),
                     member.store.clone(),
-                    self.settings.max_queue_depth,
+                    policy,
                     true, // exit when leadership is lost
                 );
                 actors.insert(name.to_owned(), handle.clone());
@@ -1247,6 +1257,8 @@ mod tests {
                 max_queue_depth: 10_000,
                 data_dir: None,
                 resident_bytes_max: usize::MAX,
+                policies: Vec::new(),
+                dlx: None,
             })
             .await
             .expect("bootstrap");

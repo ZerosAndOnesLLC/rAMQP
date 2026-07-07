@@ -28,6 +28,7 @@ use bytes::Bytes;
 use tokio::sync::mpsc;
 
 use crate::dispatch::{Subscriber, complete_drains, confirm_publish, pick_ready, refuse_publish};
+use crate::policy::{EffectivePolicy, now_ms};
 
 /// A queue's identity + mailbox, cheap to clone.
 #[derive(Debug, Clone)]
@@ -168,20 +169,22 @@ struct Stored {
     body: Bytes,
     /// Delivery attempts that failed (modified{delivery-failed}).
     failures: u32,
+    /// Enqueue time (ms since epoch), for lazy TTL expiry.
+    enqueued_ms: u64,
 }
 
 /// Spawn a queue actor; the returned handle is its only address.
-pub(crate) fn spawn(name: String, max_depth: usize) -> QueueHandle {
+pub(crate) fn spawn(name: String, policy: EffectivePolicy) -> QueueHandle {
     let (tx, rx) = mpsc::channel(1024);
     let handle = QueueHandle {
         name: name.clone(),
         tx,
     };
-    tokio::spawn(run(name, rx, max_depth));
+    tokio::spawn(run(name, rx, policy));
     handle
 }
 
-async fn run(name: String, mut rx: mpsc::Receiver<QueueMsg>, max_depth: usize) {
+async fn run(name: String, mut rx: mpsc::Receiver<QueueMsg>, policy: EffectivePolicy) {
     let mut ready: VecDeque<Stored> = VecDeque::new();
     let mut unacked: HashMap<u64, (Stored, SubId)> = HashMap::new();
     let mut subs: Vec<Subscriber> = Vec::new();
@@ -192,16 +195,25 @@ async fn run(name: String, mut rx: mpsc::Receiver<QueueMsg>, max_depth: usize) {
     while let Some(msg) = rx.recv().await {
         match msg {
             QueueMsg::Publish { body, ack } => {
-                if ready.len() + unacked.len() >= max_depth {
-                    // Refuse rather than grow without bound (broker.md §3.2).
-                    refuse_publish(&name, ack);
-                    continue;
+                if ready.len() + unacked.len() >= policy.max_len {
+                    // At the bound: drop-head makes room (dead-lettering the
+                    // displaced message); otherwise refuse — never grow
+                    // without bound (broker.md §3.2).
+                    let dropped = policy.drop_head.then(|| ready.pop_front()).flatten();
+                    match dropped {
+                        Some(old) => policy.dead_letter(&name, "maxlen", old.body),
+                        None => {
+                            refuse_publish(&name, ack);
+                            continue;
+                        }
+                    }
                 }
                 next_msg_id += 1;
                 ready.push_back(Stored {
                     id: next_msg_id,
                     body,
                     failures: 0,
+                    enqueued_ms: now_ms(),
                 });
                 // In-memory transient queue: stored == settled. (A durable /
                 // quorum queue confirms here only after fsync / Raft commit.)
@@ -249,7 +261,11 @@ async fn run(name: String, mut rx: mpsc::Receiver<QueueMsg>, max_depth: usize) {
                         SettleOutcome::Requeue => ready.push_front(stored),
                         SettleOutcome::RequeueFailed => {
                             stored.failures += 1;
-                            ready.push_front(stored);
+                            if policy.attempts_exhausted(stored.failures) {
+                                policy.dead_letter(&name, "delivery-limit", stored.body);
+                            } else {
+                                ready.push_front(stored);
+                            }
                         }
                     }
                 }
@@ -272,18 +288,31 @@ async fn run(name: String, mut rx: mpsc::Receiver<QueueMsg>, max_depth: usize) {
         }
 
         // Dispatch: round-robin over subscribers with demand.
-        dispatch(&name, &mut ready, &mut unacked, &mut subs, &mut rr).await;
+        dispatch(&name, &policy, &mut ready, &mut unacked, &mut subs, &mut rr).await;
     }
     tracing::debug!(queue = %name, "queue actor stopped");
 }
 
 async fn dispatch(
     name: &str,
+    policy: &EffectivePolicy,
     ready: &mut VecDeque<Stored>,
     unacked: &mut HashMap<u64, (Stored, SubId)>,
     subs: &mut Vec<Subscriber>,
     rr: &mut usize,
 ) {
+    // Lazy TTL: expire from the head before dispatching (RabbitMQ-classic
+    // semantics — an expired message leaves when it reaches the front).
+    if policy.ttl_ms.is_some() {
+        let now = now_ms();
+        while ready
+            .front()
+            .is_some_and(|m| policy.expired(m.enqueued_ms, now))
+        {
+            let expired = ready.pop_front().expect("non-empty");
+            policy.dead_letter(name, "expired", expired.body);
+        }
+    }
     while !ready.is_empty() {
         // Next subscriber with demand (round-robin); stop if none want work.
         let Some(idx) = pick_ready(subs, *rr) else {
@@ -339,7 +368,7 @@ mod tests {
 
     #[tokio::test]
     async fn publish_dispatch_settle_round_trip() {
-        let q = spawn("t".into(), 100);
+        let q = spawn("t".into(), EffectivePolicy::depth_only(100));
         let (conn_tx, mut conn_rx) = mpsc::unbounded_channel();
 
         let sub = subscribe(&q, &conn_tx, 7).await;
@@ -380,7 +409,7 @@ mod tests {
 
     #[tokio::test]
     async fn requeue_redelivers() {
-        let q = spawn("t".into(), 100);
+        let q = spawn("t".into(), EffectivePolicy::depth_only(100));
         let (conn_tx, mut conn_rx) = mpsc::unbounded_channel();
         let sub = subscribe(&q, &conn_tx, 1).await;
         q.tx.send(QueueMsg::Demand {
@@ -420,7 +449,7 @@ mod tests {
     /// relies on).
     #[tokio::test]
     async fn demand_grants_are_additive() {
-        let q = spawn("t".into(), 100);
+        let q = spawn("t".into(), EffectivePolicy::depth_only(100));
         let (conn_tx, mut conn_rx) = mpsc::unbounded_channel();
         let sub = subscribe(&q, &conn_tx, 1).await;
         q.tx.send(QueueMsg::Demand {
@@ -458,7 +487,7 @@ mod tests {
     /// remainder so a later publish is not dispatched against stale credit.
     #[tokio::test]
     async fn drain_drops_unmet_demand() {
-        let q = spawn("t".into(), 100);
+        let q = spawn("t".into(), EffectivePolicy::depth_only(100));
         let (conn_tx, mut conn_rx) = mpsc::unbounded_channel();
         let sub = subscribe(&q, &conn_tx, 1).await;
         // One message is ready; drain-grant credit for five.
@@ -498,7 +527,7 @@ mod tests {
 
     #[tokio::test]
     async fn competing_consumers_round_robin() {
-        let q = spawn("t".into(), 100);
+        let q = spawn("t".into(), EffectivePolicy::depth_only(100));
         let (c1_tx, mut c1_rx) = mpsc::unbounded_channel();
         let (c2_tx, mut c2_rx) = mpsc::unbounded_channel();
         let s1 = subscribe(&q, &c1_tx, 1).await;
@@ -546,7 +575,7 @@ mod tests {
 
     #[tokio::test]
     async fn unsubscribe_requeues_unacked() {
-        let q = spawn("t".into(), 100);
+        let q = spawn("t".into(), EffectivePolicy::depth_only(100));
         let (c1_tx, mut c1_rx) = mpsc::unbounded_channel();
         let s1 = subscribe(&q, &c1_tx, 1).await;
         q.tx.send(QueueMsg::Demand {
@@ -588,7 +617,7 @@ mod tests {
     /// otherwise a stale ack would drop a message the new owner still holds.
     #[tokio::test]
     async fn stale_settle_from_former_owner_is_ignored() {
-        let q = spawn("t".into(), 100);
+        let q = spawn("t".into(), EffectivePolicy::depth_only(100));
         let (c1_tx, mut c1_rx) = mpsc::unbounded_channel();
         let s1 = subscribe(&q, &c1_tx, 1).await;
         q.tx.send(QueueMsg::Demand {
@@ -653,7 +682,7 @@ mod tests {
 
     #[tokio::test]
     async fn overflow_rejects_unsettled_publishes() {
-        let q = spawn("t".into(), 1);
+        let q = spawn("t".into(), EffectivePolicy::depth_only(1));
         let (conn_tx, mut conn_rx) = mpsc::unbounded_channel();
         // Fill the single slot.
         q.tx.send(QueueMsg::Publish {

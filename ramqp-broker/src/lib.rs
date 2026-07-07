@@ -35,6 +35,7 @@ mod connection;
 mod dispatch;
 #[cfg(feature = "store-redb")]
 mod durable;
+mod policy;
 mod proxy;
 mod queue;
 mod quorum;
@@ -44,4 +45,4 @@ mod store;
 
 pub use auth::{AllowAll, Authenticator, Credentials, StaticPlain};
 pub use broker::{BoundBroker, Broker, ShutdownHandle};
-pub use config::{BrokerConfig, ClusterMemberConfig};
+pub use config::{BrokerConfig, ClusterMemberConfig, OverflowBehavior, QueuePolicy};

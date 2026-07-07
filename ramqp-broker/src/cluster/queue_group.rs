@@ -50,6 +50,10 @@ pub enum QueueCommand {
         /// single-replica path never copies the body; the wire codec for
         /// multi-node replication handles its own framing.
         body: Bytes,
+        /// Enqueue time (ms since epoch), stamped by the proposing leader —
+        /// in the log, so every replica agrees (lazy TTL expiry).
+        #[serde(default)]
+        enqueued_ms: u64,
     },
     /// Resolve a previously enqueued message.
     Settle {
@@ -105,6 +109,8 @@ pub struct ReplicatedMessage {
     pub body: StoredBody,
     /// Failed delivery attempts (incremented by requeue settles).
     pub failures: u32,
+    /// Enqueue time (ms since epoch), from the log entry.
+    pub enqueued_ms: u64,
 }
 
 /// Paging knobs for one queue's state machine.
@@ -178,6 +184,13 @@ impl QueueState {
         self.resident_bytes
     }
 
+    /// One message's policy-relevant metadata: `(enqueued_ms, failures)`.
+    pub fn meta_of(&self, msg_id: u64) -> Option<(u64, u32)> {
+        self.messages
+            .get(&msg_id)
+            .map(|m| (m.enqueued_ms, m.failures))
+    }
+
     fn store_body(&mut self, body: &Bytes) -> StoredBody {
         if let Some(paging) = &self.paging
             && self.resident_bytes + body.len() > paging.resident_max_bytes
@@ -224,7 +237,7 @@ enum PortableBody {
 #[derive(Serialize, Deserialize)]
 struct PortableState {
     next_msg_id: u64,
-    messages: Vec<(u64, u32, PortableBody)>,
+    messages: Vec<(u64, u32, u64, PortableBody)>,
 }
 
 impl ReplicatedState for QueueState {
@@ -233,7 +246,7 @@ impl ReplicatedState for QueueState {
 
     fn apply(&mut self, command: &Self::Command) -> Self::Response {
         match command {
-            QueueCommand::Enqueue { body } => {
+            QueueCommand::Enqueue { body, enqueued_ms } => {
                 self.next_msg_id += 1;
                 let msg_id = self.next_msg_id;
                 let stored = self.store_body(body);
@@ -242,6 +255,7 @@ impl ReplicatedState for QueueState {
                     ReplicatedMessage {
                         body: stored,
                         failures: 0,
+                        enqueued_ms: *enqueued_ms,
                     },
                 );
                 QueueResponse::Enqueued { msg_id }
@@ -297,7 +311,7 @@ impl ReplicatedState for QueueState {
                 // see PortableBody::External.
                 StoredBody::Spilled(r) => PortableBody::External(*r),
             };
-            messages.push((*id, m.failures, body));
+            messages.push((*id, m.failures, m.enqueued_ms, body));
         }
         bincode::serialize(&PortableState {
             next_msg_id: self.next_msg_id,
@@ -314,7 +328,7 @@ impl ReplicatedState for QueueState {
         }
         self.resident_bytes = 0;
         self.next_msg_id = portable.next_msg_id;
-        for (id, failures, body) in portable.messages {
+        for (id, failures, enqueued_ms, body) in portable.messages {
             let stored =
                 match body {
                     PortableBody::Inline(bytes) => self.store_body(&Bytes::from(bytes)),
@@ -336,6 +350,7 @@ impl ReplicatedState for QueueState {
                 ReplicatedMessage {
                     body: stored,
                     failures,
+                    enqueued_ms,
                 },
             );
         }
@@ -396,6 +411,7 @@ mod tests {
         for i in 0..10u8 {
             state.apply(&QueueCommand::Enqueue {
                 body: Bytes::from(vec![i; 8]),
+                enqueued_ms: 0,
             });
         }
         assert!(
@@ -450,6 +466,7 @@ mod tests {
             let resp = raft
                 .client_write(QueueCommand::Enqueue {
                     body: Bytes::copy_from_slice(body),
+                    enqueued_ms: 0,
                 })
                 .await
                 .expect("enqueue");
@@ -556,6 +573,7 @@ mod tests {
             let resp = rafts[&leader]
                 .client_write(QueueCommand::Enqueue {
                     body: Bytes::copy_from_slice(&i.to_be_bytes()),
+                    enqueued_ms: 0,
                 })
                 .await
                 .expect("committed enqueue");
@@ -586,6 +604,7 @@ mod tests {
         rafts[&new_leader]
             .client_write(QueueCommand::Enqueue {
                 body: Bytes::from_static(b"after failover"),
+                enqueued_ms: 0,
             })
             .await
             .expect("post-failover enqueue");
@@ -656,6 +675,7 @@ mod tests {
             let resp = raft
                 .client_write(QueueCommand::Enqueue {
                     body: Bytes::copy_from_slice(&i.to_be_bytes()),
+                    enqueued_ms: 0,
                 })
                 .await
                 .expect("enqueue");
@@ -694,6 +714,7 @@ mod tests {
         for i in 0..5u8 {
             raft.client_write(QueueCommand::Enqueue {
                 body: Bytes::copy_from_slice(&[i]),
+                enqueued_ms: 0,
             })
             .await
             .expect("enqueue");

@@ -52,6 +52,47 @@ pub struct BrokerConfig {
     /// page out to disk under `data_dir` (deep queues must not live in RAM —
     /// broker.md §3.1/§8). Ignored without a `data_dir`.
     pub resident_bytes_max: usize,
+    /// Queue policies: `(name prefix, policy)` pairs, first match wins (an
+    /// empty prefix matches every queue). Matched against the normalized
+    /// queue name (no `/queues/` etc. prefix) at declaration. The management
+    /// API (Phase 9) will supersede this interim surface.
+    pub policies: Vec<(String, QueuePolicy)>,
+}
+
+/// Per-queue behavior policies: TTL, length bounds, dead-lettering.
+#[derive(Debug, Clone, Default)]
+pub struct QueuePolicy {
+    /// Messages older than this are expired instead of delivered (checked
+    /// lazily when a message reaches the head of the queue, RabbitMQ-classic
+    /// style). Expired messages dead-letter when `dead_letter` is set,
+    /// otherwise drop.
+    pub message_ttl: Option<std::time::Duration>,
+    /// Maximum messages held (ready + unacked), overriding the broker-wide
+    /// `max_queue_depth` for matching queues.
+    pub max_length: Option<usize>,
+    /// What happens to a publish that would exceed `max_length`.
+    pub overflow: OverflowBehavior,
+    /// Where expired / dropped / delivery-exhausted messages go: any queue
+    /// address (e.g. `/queues/dead`, `/durable/dead`). Best-effort delivery
+    /// (a full or missing dead-letter queue drops). Cycles are not detected —
+    /// do not point queues' dead-letter targets at each other.
+    pub dead_letter: Option<String>,
+    /// After this many failed delivery attempts (`modified{delivery-failed}`
+    /// requeues), the message is dead-lettered (or dropped) instead of
+    /// requeued.
+    pub max_delivery_attempts: Option<u32>,
+}
+
+/// Overflow behavior at [`QueuePolicy::max_length`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum OverflowBehavior {
+    /// Refuse the new publish (`rejected`, `resource-limit-exceeded`) — the
+    /// default, matching the broker-wide depth cap.
+    #[default]
+    RejectPublish,
+    /// Make room: drop (or dead-letter) the oldest ready message and accept
+    /// the new one.
+    DropHead,
 }
 
 /// Cluster membership settings for one broker node.
@@ -98,6 +139,7 @@ impl Default for BrokerConfig {
             cluster: None,
             data_dir: None,
             resident_bytes_max: 64 * 1024 * 1024,
+            policies: Vec::new(),
         }
     }
 }
