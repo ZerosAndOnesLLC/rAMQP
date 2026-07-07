@@ -359,6 +359,12 @@ type SettlementResult = (mpsc::Sender<QueueMsg>, SubId, u64, SettleAction);
 /// outcome once every staged operation lands.
 struct TxnDone {
     channel: u16,
+    /// The identity of the session the discharge arrived on. Channels are
+    /// reused after end/begin, so the outcome is delivered only if the
+    /// session at `channel` is still THIS one — without the check a slow
+    /// commit's disposition would settle an unrelated delivery on whatever
+    /// new session inherited the channel.
+    session_id: SessionId,
     handle: u32,
     delivery_id: u32,
     outcome: DischargeOutcome,
@@ -455,7 +461,20 @@ impl<S: IoStream> BrokerConnection<S> {
                 }
 
                 Some(done) = self.txn_results.next() => {
-                    if let Some(session) = self.sessions.get_mut(&done.channel) {
+                    // Deliver the outcome only to the session the discharge
+                    // arrived on — `(channel)` may have been reused by a new
+                    // session since (see TxnDone::session_id).
+                    let session = self
+                        .sessions
+                        .get_mut(&done.channel)
+                        .filter(|s| s.session_id == done.session_id);
+                    if session.is_none() {
+                        tracing::debug!(
+                            channel = done.channel,
+                            "discharge outcome dropped: its session is gone (channel reused or ended)"
+                        );
+                    }
+                    if let Some(session) = session {
                         let state = match done.outcome {
                             DischargeOutcome::Complete => {
                                 DeliveryState::Accepted(Accepted::default())
@@ -835,6 +854,14 @@ impl<S: IoStream> BrokerConnection<S> {
                 };
                 let done = TxnDone {
                     channel,
+                    session_id: self
+                        .sessions
+                        .get(&channel)
+                        .map(|s| s.session_id)
+                        // No live session: stamp an id that can never match,
+                        // so the outcome is silently dropped (nothing to
+                        // answer) while the discharge still executes.
+                        .unwrap_or(SessionId(u64::MAX)),
                     handle,
                     delivery_id: delivery_id.value(),
                     outcome: DischargeOutcome::Complete,
