@@ -506,8 +506,8 @@ link/session → negotiate/mux/heartbeat → txn/sasl splits.
 - [x] **Restart recovery for quorum queues** (on-disk Raft log/vote/snapshot): `SharedStore` gains a write-through `RaftLogSink` — log appends, votes, truncations, purges, and snapshot pointers are durable **before** the Raft storage call returns (Raft safety), implemented on the redb store behind `store-redb` (the same group-commit writer: one fsync amortizes across queues AND groups). Recovery seeds the store at group creation (snapshot restore + log replay by openraft; the quorum actor waits for replay before seeding its ready-set); spill segments are preserved across restarts and their live counts recomputed from the restored state. Guard rails: with a data dir configured, an unopenable store fails the attach/bind loudly instead of silently starting empty (which would shadow persisted state). Proven client-facing: standalone quorum restart, and a clustered (metadata-catalog) restart — both recover unsettled messages in FIFO order, settled ones never resurrect, and the recovered queue accepts new work. **Dead-letter, TTL, max-length policies: done** — `BrokerConfig::policies` (prefix-matched `QueuePolicy`: `message_ttl`, `max_length` + `RejectPublish`/`DropHead` overflow, `dead_letter` target, `max_delivery_attempts`), enforced in all three queue actors: lazy head-of-queue TTL expiry (quorum stamps enqueue time into the log so replicas agree; durable persists it), drop-head displacement, poison-message dead-lettering after N failed attempts; one broker-wide dead-letter router (weak-ref'd, best-effort, pre-settled republish). Client-facing tests for all four behaviors incl. quorum TTL.
 - [x] **Bench: tail latency held flat as queue depth grows into the millions** (`bench-compare` `depth` bin; results in bench-compare/README): p50/p99 flat from empty to 1M deep (117→125 µs / ~250 µs); paging headline at 4 KiB bodies — **878 MiB vs 2461 MiB RSS (~3× less) at identical p50**, drain-out 248k msg/s from disk. Commit.
 
-### Phase 8 — Transactions
-- [ ] `amqp:coordinator` target + txn coordinator (commit/rollback), cluster-aware. Commit.
+### Phase 8 — Transactions ✅
+- [x] `amqp:coordinator` target + txn coordinator (commit/rollback), cluster-aware. Landed as: coordinator link acceptance (a sender attach targeting `Coordinator` binds a control link), `declare`/`discharge` control messages answered per spec part 4 (`declared{txn-id}` outcome; unknown-txn discharge → `rejected`), transactional **enqueues** (transfers carrying `transactional-state` stage instead of publishing) and transactional **settlements** (consumer dispositions carrying `transactional-state` stage their acks). Commit publishes every staged enqueue through its queue's own confirm — a Raft commit for quorum queues, an fsync for durable ones, which is exactly what makes the coordinator **cluster-aware** — then applies staged settlements; rollback drops enqueues and requeues settlements; a dropped connection rolls back implicitly (local-transactions scope). Staging is bounded (64 txns/connection, 10k ops/txn). Client grows `Consumer::settle_in_txn`; core grows `declared_state`/`txn_state`. Six client-facing tests. Commit.
 
 ### Phase 9 — Auth, limits, management ✅
 - [x] Pluggable authn/authz + per-address permissions; SCRAM credential store. Landed as: the `Authenticator` trait grows `scram_verifier` (verifier-based storage — salted+iterated, no plaintext at rest) and `authorize(identity, vhost, address, operation)`; the SASL server flow speaks SCRAM-SHA-1/-256/-512 (full RFC 5802 exchange incl. the server-final signature in the outcome's additional-data, mutual auth against the unmodified client); `StaticScram` is the built-in verifier store. Every link attach is authorized BEFORE queue resolution (an unauthorized attach cannot even auto-declare); refusals are link-level (`unauthorized-access`, session survives); the transaction coordinator authorizes as `$coordinator`.
@@ -550,28 +550,52 @@ link/session → negotiate/mux/heartbeat → txn/sasl splits.
 
 ## 14. Risks & open questions
 
-Ordered by how much they threaten the plan.
+Ordered by how much they threaten the plan. Status as of Phases 0–9 complete
++ Phase 10 core (👉 = still live, ✅ = retired by landed work).
 
-1. **Squandering the no-GC advantage (the existential risk).** Per-message `Arc`
+1. 👉 **Squandering the no-GC advantage (the existential risk).** Per-message `Arc`
    churn, allocator pressure, or unbounded buffering makes us slower than a tuned
    JVM broker — and then we have no story. Mitigation: the §3 constitution + the
-   continuous regression gate. Performance is the product; if we're not faster, we
-   have nothing.
-2. **Deep-queue tail latency.** Per-queue Raft is weakest at deep backlogs —
-   exactly our "fast at scale" claim. Paged/segmented state machine and/or off-log
-   payload replication in Phase 7. (§8)
-3. **Runtime model fork (thread-per-core vs tokio).** The latency claim may need
-   sharded/thread-per-core/io_uring; start on tokio, keep the dispatch layer
-   shard-friendly, let the benchmark force the escalation. (§3.3)
-4. **Multi-raft scaling.** openraft is single-group; thousands of quorum queues
-   need our shared-transport/batched-tick manager or the cluster melts. (§8)
-5. **Leader-routing fabric.** Internal cross-node forwarding between AMQP session
-   and queue leader is net-new infrastructure on the hot path. (§8)
-6. **HA correctness / trust.** New Raft broker = subtle bugs; trust is earned with
-   fault-testing + production references over time, not code. (§13)
-7. **Published-crate semver.** Extraction must not break `use ramqp::...`. Re-export
-   facade + `tests/public_api.rs`/`cargo semver-checks`. Treat as 0.8.0. (§6)
-8. **Persistence engine (transient-durable).** Free embedded store — `redb`
-   preferred (`sled` in limbo, `fjall` newer); confirm before adding. (§9)
-9. **Driver de-duplication.** Standalone broker driver first; lift a shared
-   `Connection<S>` engine into core only if duplication proves costly.
+   continuous regression gate. *Standing:* first-numbers are 2–3× under both
+   incumbents at every percentile and tails stay flat to 1M-deep, but the
+   **tuned-incumbent + multi-connection** re-run (§3.4) is what actually retires
+   this — still owed.
+2. ✅ **Deep-queue tail latency** — **mitigated (Phase 7).** The paged/segmented
+   state machine keeps p50 flat to 1M deep and RSS bounded (~3× win at 4 KiB
+   bodies). Residual: snapshot-build stalls at depth (p99.9 spikes) → incremental
+   snapshots is the follow-up; off-log payload replication is not yet needed. (§8)
+3. ✅ **Runtime model fork** — **decided (Phase 10): stay on tokio work-stealing**,
+   targets met without escalation (p99.9/p50 ≈ 3–5× vs the ≤10× bar). Reopens only
+   on the documented triggers (multi-connection tail blow-up, sub-linear per-core
+   scaling, a competitor tail gap traced to scheduler jitter). Dispatch stays
+   shard-partitioned so escalation is cheap. (§3.3)
+4. 👉 **Multi-raft scaling.** The shared-transport fabric (one connection per peer
+   pair, all groups multiplexed) is in and correct at test scale; **batched
+   ticks/heartbeats across thousands of groups** is not yet implemented — the
+   thousands-of-quorum-queues load test is owed before this is retired. (§8)
+5. ✅ **Leader-routing fabric** — **built (Phase 6).** Any node serves any queue via
+   leader-following proxies; kill-leader zero-loss proven at three scopes. (§8)
+6. 👉 **HA correctness / trust.** In-process fault injection (kill-leader,
+   rolling-kill to the availability boundary, follower-loss) is green and flushed
+   out three real bugs; **process-level partition/split-brain under sustained
+   load** (Jepsen-grade) and production references remain the trust-earning work.
+   (§13)
+7. ✅ **Published-crate semver** — **held.** `tests/public_api.rs` locks the
+   re-export surface; the one client addition this cycle (`Consumer::settle_in_txn`)
+   is additive + feature-gated. Client stays 0.8.0.
+8. ✅ **Persistence engine** — **resolved: `redb` 4.x** (one DB/node, group-commit
+   writer shared by durable queues + the on-disk Raft log). (§9)
+9. ✅ **Driver de-duplication** — standalone broker driver kept; the duplication
+   never grew costly enough to lift a shared `Connection<S>` into core.
+
+**New open items surfaced by the build (follow-ups, not blockers):**
+- **Incremental snapshots** — a deep queue's snapshot still clones+serializes the
+  full index (the p99.9 spikes in the depth bench).
+- **Spill-segment shipping** — a paged quorum queue's snapshot keeps bodies
+  external (node-local), so follower catch-up *via snapshot* is unsupported;
+  log-replay catch-up works.
+- **Fabric authentication** — inter-node RPCs are currently unauthenticated (bind
+  the fabric to a trusted network); a fabric-level auth/mTLS story is owed before a
+  hostile-network deployment.
+- **Management surface** — read-only today (`/metrics`, `/queues`); queue
+  delete + a richer admin protocol are the next slice.
