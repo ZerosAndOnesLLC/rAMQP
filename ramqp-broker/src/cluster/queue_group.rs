@@ -250,6 +250,13 @@ enum PortableBody {
 struct PortableState {
     next_msg_id: u64,
     messages: Vec<(u64, u32, u64, PortableBody)>,
+    /// The identity of the spill store the `External` refs point into
+    /// (`0` when nothing is external). Restore rejects refs from a foreign
+    /// spill — on another replica the same `(segment, offset)` names
+    /// different bytes, and reading them "successfully" would silently
+    /// corrupt every spilled body.
+    #[serde(default)]
+    spill_id: u64,
 }
 
 impl ReplicatedState for QueueState {
@@ -329,19 +336,19 @@ impl ReplicatedState for QueueState {
             };
             messages.push((*id, m.failures, m.enqueued_ms, body));
         }
+        let mut spill_id = 0;
         if spilled {
+            let spill = &self.paging.as_ref().expect("spilled body implies paging").spill;
             // The snapshot's External refs make the segment bytes the only
             // copy once the log purges behind it — they must be durable
             // BEFORE the snapshot pointer is.
-            self.paging
-                .as_ref()
-                .expect("spilled body implies paging")
-                .spill
-                .sync_all()?;
+            spill.sync_all()?;
+            spill_id = spill.id();
         }
         bincode::serialize(&PortableState {
             next_msg_id: self.next_msg_id,
             messages,
+            spill_id,
         })
         .map_err(|e| e.to_string())
     }
@@ -359,12 +366,22 @@ impl ReplicatedState for QueueState {
                 match body {
                     PortableBody::Inline(bytes) => self.store_body(&Bytes::from(bytes)),
                     PortableBody::External(r) => {
-                        // Valid only where the spill lives. Verify readability so
-                        // a cross-node install fails here, loudly, instead of at
-                        // dispatch time.
+                        // Valid only where the spill lives. The identity check
+                        // is what keeps a cross-node install from silently
+                        // reading garbage: another replica's spill can hold
+                        // the same (segment, offset) with different bytes.
                         let paging = self.paging.as_ref().ok_or(
                             "snapshot references spilled bodies but this state has no spill",
                         )?;
+                        if paging.spill.id() != portable.spill_id {
+                            return Err(format!(
+                                "snapshot references spill store {:016x} but this replica's is \
+                                 {:016x} — deep-queue snapshots are node-local and cannot be \
+                                 installed on another replica",
+                                portable.spill_id,
+                                paging.spill.id()
+                            ));
+                        }
                         paging.spill.read(&r).map_err(|e| {
                             format!("snapshot references unreadable spill data: {e}")
                         })?;
@@ -732,6 +749,99 @@ mod tests {
         // The applied state is empty (everything settled) regardless of
         // how much log was kept.
         store.with_state(|s| assert!(s.messages.is_empty()));
+    }
+
+    /// HIGH-1 regression (issue #19): installing a snapshot must not rebuild
+    /// the state from `QueueState::default()` — that silently discarded the
+    /// paging config, so the replica never spilled again (unbounded RSS).
+    #[tokio::test]
+    async fn install_snapshot_preserves_the_paging_config() {
+        use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
+
+        let (raft, source) = single_node_group().await;
+        for i in 0..5u8 {
+            raft.client_write(QueueCommand::Enqueue {
+                body: Bytes::copy_from_slice(&[i]),
+                enqueued_ms: 0,
+            })
+            .await
+            .expect("enqueue");
+        }
+        let snapshot = source.clone().build_snapshot().await.expect("snapshot");
+
+        // The target replica pages beyond a tiny resident budget.
+        let dir = std::env::temp_dir().join(format!("ramqp-install-paged-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let spill = Spill::open(dir.clone()).expect("spill open");
+        let mut target = QueueStore::new_with(QueueState::paged(spill.clone(), 16), None);
+        target
+            .install_snapshot(&snapshot.meta, snapshot.snapshot)
+            .await
+            .expect("install");
+        target.with_state(|s| assert_eq!(s.messages.len(), 5, "snapshot content installed"));
+
+        // Paging must still be live: a body pushing past the budget spills.
+        let entry = Entry::<QueueTypeConfig> {
+            log_id: LogId::new(CommittedLeaderId::new(1, 1), 100),
+            payload: EntryPayload::Normal(QueueCommand::Enqueue {
+                body: Bytes::from(vec![7u8; 100]),
+                enqueued_ms: 0,
+            }),
+        };
+        target
+            .apply_to_state_machine(&[entry])
+            .await
+            .expect("apply");
+        target.with_state(|s| {
+            assert!(
+                s.resident_bytes() <= 16,
+                "paging survived the install: resident bytes stay bounded, got {}",
+                s.resident_bytes()
+            );
+            assert!(
+                matches!(s.body_of(6), Some(BodyFetch::Spilled(..))),
+                "the oversized body must have spilled"
+            );
+        });
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A snapshot whose `External` refs point into ANOTHER replica's spill
+    /// store must be rejected loudly — the same (segment, offset) names
+    /// different bytes there, and accepting it would silently corrupt every
+    /// spilled body.
+    #[tokio::test]
+    async fn install_snapshot_rejects_foreign_spill_refs() {
+        let base = std::env::temp_dir().join(format!("ramqp-foreign-spill-{}", std::process::id()));
+        std::fs::remove_dir_all(&base).ok();
+        let spill_a = Spill::open(base.join("a")).expect("spill a");
+        let spill_b = Spill::open(base.join("b")).expect("spill b");
+
+        // Source state on replica A: tiny budget, bodies spill into A's store.
+        let mut state_a = QueueState::paged(spill_a.clone(), 8);
+        for i in 0..4u8 {
+            state_a.apply(&QueueCommand::Enqueue {
+                body: Bytes::from(vec![i; 16]),
+                enqueued_ms: 0,
+            });
+        }
+        state_a.prepare_snapshot();
+        let bytes = state_a.snapshot_bytes().expect("snapshot");
+
+        // Replica B has its own spill (same segment ids, different bytes).
+        let mut state_b = QueueState::paged(spill_b.clone(), 8);
+        state_b.apply(&QueueCommand::Enqueue {
+            body: Bytes::from(vec![0xEE; 64]),
+            enqueued_ms: 0,
+        });
+        let err = state_b
+            .restore_snapshot(&bytes)
+            .expect_err("foreign spill refs must be rejected");
+        assert!(
+            err.contains("node-local"),
+            "the error must name the cross-replica cause, got: {err}"
+        );
+        std::fs::remove_dir_all(&base).ok();
     }
 
     #[tokio::test]

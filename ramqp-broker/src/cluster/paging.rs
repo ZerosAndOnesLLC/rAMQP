@@ -49,6 +49,8 @@ struct Segment {
 
 struct Inner {
     dir: PathBuf,
+    /// This spill store's persistent identity (see [`Spill::id`]).
+    id: u64,
     next_segment: u64,
     current: Option<u64>,
     segments: HashMap<u64, Segment>,
@@ -89,6 +91,31 @@ impl Spill {
     /// reach them. New appends always roll a fresh segment.
     pub fn open_preserving(dir: PathBuf) -> Result<Spill, String> {
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        // A persistent identity for this spill store: snapshots stamp it next
+        // to their SpillRefs so a snapshot built against ANOTHER replica's
+        // spill (same segment ids, different bytes) is rejected at restore
+        // instead of silently serving garbage.
+        let id_path = dir.join("spill.id");
+        let id = match std::fs::read_to_string(&id_path)
+            .ok()
+            .and_then(|s| u64::from_str_radix(s.trim(), 16).ok())
+        {
+            Some(id) => id,
+            None => {
+                let nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0);
+                let id = super::fnv1a(
+                    nanos
+                        .to_be_bytes()
+                        .into_iter()
+                        .chain(u64::from(std::process::id()).to_be_bytes()),
+                );
+                std::fs::write(&id_path, format!("{id:016x}")).map_err(|e| e.to_string())?;
+                id
+            }
+        };
         let mut segments = HashMap::new();
         let mut next_segment = 0u64;
         for entry in std::fs::read_dir(&dir).map_err(|e| e.to_string())? {
@@ -120,6 +147,7 @@ impl Spill {
         Ok(Spill {
             inner: Arc::new(Mutex::new(Inner {
                 dir,
+                id,
                 next_segment,
                 current: None,
                 segments,
@@ -127,6 +155,12 @@ impl Spill {
                 deferred_delete: Vec::new(),
             })),
         })
+    }
+
+    /// This spill store's persistent identity (stamped into snapshots so
+    /// foreign `SpillRef`s are rejected at restore).
+    pub fn id(&self) -> u64 {
+        self.inner.lock().expect("spill lock").id
     }
 
     /// Set recovered segments' live reference counts (from the restored

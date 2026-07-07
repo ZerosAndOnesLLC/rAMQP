@@ -678,18 +678,24 @@ where
         let data = snapshot.into_inner();
         let payload: SnapshotPayload = bincode::deserialize(&data)
             .map_err(|e| openraft::StorageIOError::read_snapshot(Some(meta.signature()), &e))?;
-        let mut state = S::default();
-        state.restore_snapshot(&payload.state_bytes).map_err(|e| {
-            openraft::StorageIOError::read_snapshot(
-                Some(meta.signature()),
-                &std::io::Error::other(e),
-            )
-        })?;
         let (blob, persist, old_blob) = {
             let mut inner = self.lock();
+            // Restore INTO the existing state, never into `S::default()`:
+            // the snapshot does not carry node-local configuration (a paged
+            // queue's spill store), so a default-rebuilt state would silently
+            // drop paging — unbounded RSS from then on — and leak the old
+            // state's spill segments without releasing them. The in-place
+            // restore releases old bodies as it replaces them. On failure the
+            // member goes Fatal (openraft) with a partially-cleared state;
+            // restart recovers from disk.
+            inner.state.restore_snapshot(&payload.state_bytes).map_err(|e| {
+                openraft::StorageIOError::read_snapshot(
+                    Some(meta.signature()),
+                    &std::io::Error::other(e),
+                )
+            })?;
             inner.last_applied = payload.last_applied;
             inner.last_membership = payload.last_membership;
-            inner.state = state;
             let blob = match &inner.snapshot_dir {
                 Some(dir) => {
                     let path = dir.join(format!("snapshot-{}.bin", meta.snapshot_id));
