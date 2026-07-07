@@ -47,6 +47,13 @@ pub struct BrokerConfig {
     /// (`/durable/<name>`, needs the `store-redb` feature) and quorum-queue
     /// paging + snapshot blobs. `None` (the default) refuses durable
     /// attaches and keeps quorum queues fully in memory.
+    ///
+    /// **Clustered** with `None`, Raft hard state (votes, log) is in-memory
+    /// only: a node restart violates Raft's durability assumptions — the
+    /// restarted voter can vote twice in one term, and committed messages
+    /// can be silently lost. The broker warns loudly at bootstrap; use a
+    /// data dir (with `store-redb`) for any cluster that must survive
+    /// restarts.
     pub data_dir: Option<std::path::PathBuf>,
     /// Per-quorum-queue resident-body budget: bodies beyond this many bytes
     /// page out to disk under `data_dir` (deep queues must not live in RAM —

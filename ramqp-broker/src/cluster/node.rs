@@ -139,6 +139,20 @@ impl ClusterNode {
     /// member, and (on the lowest seed id) form the cluster in the
     /// background. Returns as soon as the node is serving.
     pub async fn bootstrap(settings: NodeSettings) -> std::io::Result<Arc<ClusterNode>> {
+        // Raft's safety argument assumes votes and log entries survive a
+        // restart. Without persistence a restarted voter rejoins EMPTY: it
+        // can re-grant a vote in a term it already voted in, electing a
+        // leader without entries the old quorum committed — silent loss of
+        // acknowledged messages. Supported for tests/ephemeral clusters,
+        // but never silently.
+        if settings.persist.is_none() {
+            tracing::warn!(
+                "clustered node has NO on-disk Raft persistence (no data_dir / store-redb): \
+                 a node restart can silently lose committed messages (a restarted voter may \
+                 vote twice in the same term); configure data_dir with the store-redb feature \
+                 for durable clustering"
+            );
+        }
         let peers = Arc::new(fabric::Peers::default());
         let raft_config = Arc::new(
             meta_raft_config()

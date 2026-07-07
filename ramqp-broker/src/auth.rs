@@ -57,7 +57,13 @@ pub trait Authenticator: Send + Sync + 'static {
     }
     /// May `identity` (the authenticated username; `None` for anonymous)
     /// perform `operation` on `address` within `vhost`? Called at link
-    /// attach — never per message. Defaults to allow.
+    /// attach — never per message.
+    ///
+    /// **The default allows everything.** Authentication alone provides no
+    /// access control: the vhost is client-asserted (`open.hostname`), so
+    /// without an `authorize` override (or vhost grants on the static
+    /// authenticators) any authenticated user can select any vhost and any
+    /// queue.
     fn authorize(
         &self,
         identity: Option<&str>,
@@ -67,6 +73,29 @@ pub trait Authenticator: Send + Sync + 'static {
     ) -> bool {
         let _ = (identity, vhost, address, operation);
         true
+    }
+}
+
+/// Per-user vhost grants shared by the static authenticators: a user with a
+/// grant list may only attach within those vhosts; a user without one may
+/// use any vhost (the backward-compatible default — grant every user for
+/// real tenant isolation).
+#[derive(Debug, Default)]
+struct VhostGrants {
+    grants: HashMap<String, Vec<String>>,
+}
+
+impl VhostGrants {
+    fn grant(&mut self, username: impl Into<String>, vhosts: &[&str]) {
+        self.grants
+            .insert(username.into(), vhosts.iter().map(|v| (*v).to_owned()).collect());
+    }
+
+    fn allows(&self, identity: Option<&str>, vhost: &str) -> bool {
+        match identity.and_then(|u| self.grants.get(u)) {
+            Some(allowed) => allowed.iter().any(|v| v == vhost),
+            None => true,
+        }
     }
 }
 
@@ -88,6 +117,7 @@ impl Authenticator for AllowAll {
 #[derive(Debug, Default)]
 pub struct StaticPlain {
     users: HashMap<String, String>,
+    vhosts: VhostGrants,
 }
 
 impl StaticPlain {
@@ -99,6 +129,13 @@ impl StaticPlain {
     /// Add a user (builder-style).
     pub fn with_user(mut self, username: impl Into<String>, password: impl Into<String>) -> Self {
         self.users.insert(username.into(), password.into());
+        self
+    }
+
+    /// Restrict `username` to these vhosts (builder-style). Users without a
+    /// grant may use ANY vhost — grant every user for tenant isolation.
+    pub fn with_user_vhosts(mut self, username: impl Into<String>, vhosts: &[&str]) -> Self {
+        self.vhosts.grant(username, vhosts);
         self
     }
 }
@@ -125,6 +162,16 @@ impl Authenticator for StaticPlain {
             }
         }
     }
+
+    fn authorize(
+        &self,
+        identity: Option<&str>,
+        vhost: &str,
+        _address: &str,
+        _operation: Operation,
+    ) -> bool {
+        self.vhosts.allows(identity, vhost)
+    }
 }
 
 /// Constant-time string comparison (no early exit on the first differing
@@ -146,6 +193,7 @@ fn ct_str_eq(a: &str, b: &str) -> bool {
 #[derive(Debug, Default)]
 pub struct StaticScram {
     users: HashMap<String, ScramVerifier>,
+    vhosts: VhostGrants,
 }
 
 impl StaticScram {
@@ -175,6 +223,13 @@ impl StaticScram {
         self.users.insert(username.into(), verifier);
         self
     }
+
+    /// Restrict `username` to these vhosts (builder-style). Users without a
+    /// grant may use ANY vhost — grant every user for tenant isolation.
+    pub fn with_user_vhosts(mut self, username: impl Into<String>, vhosts: &[&str]) -> Self {
+        self.vhosts.grant(username, vhosts);
+        self
+    }
 }
 
 impl Authenticator for StaticScram {
@@ -191,6 +246,16 @@ impl Authenticator for StaticScram {
             .then(|| self.users.get(username).cloned())
             .flatten()
     }
+
+    fn authorize(
+        &self,
+        identity: Option<&str>,
+        vhost: &str,
+        _address: &str,
+        _operation: Operation,
+    ) -> bool {
+        self.vhosts.allows(identity, vhost)
+    }
 }
 
 #[cfg(test)]
@@ -205,6 +270,28 @@ mod tests {
             passwd: "y"
         }));
         assert!(AllowAll.allow_unauthenticated());
+    }
+
+    /// HIGH-10 (issue #19): the static authenticators can bind users to
+    /// vhosts, so authentication comes with usable access control instead
+    /// of a client-asserted vhost.
+    #[test]
+    fn vhost_grants_gate_authorization() {
+        let auth = StaticPlain::new()
+            .with_user("alice", "pw")
+            .with_user("bob", "pw")
+            .with_user_vhosts("alice", &["tenant-a"]);
+        // Granted vhost: allowed; any other: refused.
+        assert!(auth.authorize(Some("alice"), "tenant-a", "/queues/x", Operation::Send));
+        assert!(!auth.authorize(Some("alice"), "tenant-b", "/queues/x", Operation::Send));
+        assert!(!auth.authorize(Some("alice"), "", "/queues/x", Operation::Receive));
+        // No grant recorded: any vhost (the backward-compatible default).
+        assert!(auth.authorize(Some("bob"), "tenant-b", "/queues/x", Operation::Send));
+
+        let scram = StaticScram::new().with_user_vhosts("carol", &["tenant-c", ""]);
+        assert!(scram.authorize(Some("carol"), "", "/queues/x", Operation::Send));
+        assert!(scram.authorize(Some("carol"), "tenant-c", "/queues/x", Operation::Send));
+        assert!(!scram.authorize(Some("carol"), "tenant-a", "/queues/x", Operation::Send));
     }
 
     #[test]

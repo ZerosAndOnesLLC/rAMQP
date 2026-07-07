@@ -162,6 +162,48 @@ async fn producer_send(session: &ramqp::Session, address: &str, text: &str) {
     p.send(Message::text(text)).await.expect("send");
 }
 
+/// HIGH-10 (issue #19): a SCRAM user bound to a vhost cannot attach inside
+/// another vhost — authenticated no longer means unrestrained.
+#[tokio::test]
+async fn vhost_grants_confine_authenticated_users() {
+    let auth = Arc::new(
+        StaticScram::new()
+            .with_user("tenant-user", "pw")
+            .with_user_vhosts("tenant-user", &["tenant-a"]),
+    );
+    let (addr, shutdown) = start_with(auth).await;
+    let connect_vhost = |vhost: &str| {
+        let mut config = ramqp::Config::default();
+        config.connection.hostname = Some(format!("vhost:{vhost}"));
+        ConnectionBuilder::new(format!("amqp://{addr}"))
+            .config(config)
+            .sasl(scram_profile("tenant-user", "pw"))
+    };
+
+    // Inside the granted vhost: full service.
+    let conn = connect_vhost("tenant-a").connect().await.expect("granted");
+    let sess = conn.begin_session().await.expect("sess");
+    producer_send(&sess, "/queues/mine", "ok").await;
+    conn.close().await.expect("close");
+
+    // In any other vhost the attach is refused (surfaces on first use).
+    let conn = connect_vhost("tenant-b")
+        .connect()
+        .await
+        .expect("authn still succeeds");
+    let sess = conn.begin_session().await.expect("sess");
+    let mut denied = sess
+        .create_consumer("/queues/mine")
+        .await
+        .expect("attach completes");
+    let refusal = tokio::time::timeout(Duration::from_secs(5), denied.recv())
+        .await
+        .expect("refusal arrives");
+    assert!(refusal.is_err(), "foreign-vhost attach must be refused");
+    conn.close().await.expect("close");
+    shutdown.shutdown();
+}
+
 /// HIGH-6 (issue #19): the storage key is `<vhost>/<name>`, so a client
 /// must not be able to cross the separator — a default-vhost attach to
 /// `/queues/tenant-a/secret` would otherwise land on tenant-a's `secret`
