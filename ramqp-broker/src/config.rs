@@ -96,7 +96,9 @@ pub struct QueuePolicy {
     pub overflow: OverflowBehavior,
     /// Where expired / dropped / delivery-exhausted messages go: any queue
     /// address (e.g. `/queues/dead`, `/durable/dead`). Best-effort delivery
-    /// (a full or missing dead-letter queue drops). Cycles are not detected —
+    /// (a full or missing dead-letter queue drops). A queue whose resolved
+    /// target is itself (e.g. the DLX queue matching a catch-all prefix)
+    /// has dead-lettering disabled; longer cycles (a→b→a) are NOT detected —
     /// do not point queues' dead-letter targets at each other.
     pub dead_letter: Option<String>,
     /// After this many failed delivery attempts (`modified{delivery-failed}`

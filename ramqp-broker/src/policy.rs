@@ -168,15 +168,36 @@ impl EffectivePolicy {
             .find(|(prefix, _)| queue.starts_with(prefix.as_str()))
             .map(|(_, p)| p);
         match matched {
-            Some(p) => EffectivePolicy {
-                ttl_ms: p.message_ttl.map(|d| d.as_millis() as u64),
-                max_len: p.max_length.unwrap_or(global_max_depth),
-                max_bytes: p.max_length_bytes.unwrap_or(global_bytes),
-                drop_head: p.overflow == OverflowBehavior::DropHead,
-                dead_letter: p.dead_letter.clone(),
-                max_attempts: p.max_delivery_attempts,
-                dlx,
-            },
+            Some(p) => {
+                // A queue must never dead-letter into ITSELF: the documented
+                // catch-all "" prefix matches the DLX queue too, so its
+                // expiring messages would re-publish into it with a fresh
+                // timestamp — unbounded retention, or (with drop-head at
+                // capacity) a router↔actor livelock with zero client
+                // traffic. Longer operator-configured cycles (a→b→a) remain
+                // the operator's responsibility.
+                let dead_letter = p.dead_letter.clone().filter(|target| {
+                    let is_self = crate::registry::QueueRegistry::parse_address(target)
+                        .is_some_and(|(_, target_name)| target_name == queue);
+                    if is_self {
+                        tracing::warn!(
+                            queue,
+                            %target,
+                            "dead-letter target is the queue itself; disabled for this queue"
+                        );
+                    }
+                    !is_self
+                });
+                EffectivePolicy {
+                    ttl_ms: p.message_ttl.map(|d| d.as_millis() as u64),
+                    max_len: p.max_length.unwrap_or(global_max_depth),
+                    max_bytes: p.max_length_bytes.unwrap_or(global_bytes),
+                    drop_head: p.overflow == OverflowBehavior::DropHead,
+                    dead_letter,
+                    max_attempts: p.max_delivery_attempts,
+                    dlx,
+                }
+            }
             None => EffectivePolicy {
                 max_bytes: global_bytes,
                 ..Self::depth_only(global_max_depth)
@@ -256,4 +277,35 @@ pub(crate) fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// MED-3 (issue #19): the catch-all policy prefix matches the DLX queue
+    /// itself — its dead-letter target must be disabled there or expiring
+    /// messages re-publish into it forever.
+    #[test]
+    fn self_dead_letter_targets_are_disabled() {
+        let policies = vec![(
+            String::new(), // catch-all
+            crate::config::QueuePolicy {
+                message_ttl: Some(std::time::Duration::from_secs(1)),
+                dead_letter: Some("/queues/dead".to_owned()),
+                ..Default::default()
+            },
+        )];
+        let work = EffectivePolicy::resolve(&policies, "work", 100, 0, None);
+        assert_eq!(
+            work.dead_letter.as_deref(),
+            Some("/queues/dead"),
+            "ordinary queues keep the target"
+        );
+        let dlx = EffectivePolicy::resolve(&policies, "dead", 100, 0, None);
+        assert_eq!(
+            dlx.dead_letter, None,
+            "the DLX queue itself must not dead-letter into itself"
+        );
+    }
 }

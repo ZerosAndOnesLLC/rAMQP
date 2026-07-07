@@ -37,6 +37,18 @@ pub(crate) enum QueueKind {
     Durable,
 }
 
+/// Why one queue's initialization aborted.
+enum InitAbort {
+    /// Initialization genuinely failed: evict the cell, refuse the attach.
+    Failed,
+    /// A concurrent initializer's failure evicted this cell while we waited
+    /// on it — succeeding now would set an ORPHANED cell, and the next
+    /// attach would declare a second live actor for the same queue
+    /// (split-brain; duplicate delivery for durable queues). Retry on a
+    /// fresh cell instead.
+    Orphaned,
+}
+
 /// Resolves addresses to queue actors, declaring queues on first use.
 ///
 /// The map is guarded by a *std* mutex held only for the O(1) get-or-insert of
@@ -246,6 +258,18 @@ impl QueueRegistry {
             // Initialize outside the lock; the cell serializes same-key inits.
             let init = cell
                 .get_or_try_init(|| async {
+                    // A concurrent initializer may have failed and evicted
+                    // this cell while we waited on it (see InitAbort::
+                    // Orphaned). Checked under the map lock: either the
+                    // eviction already happened (we see it here) or it will
+                    // be skipped (its `get().is_none()` guard fails once we
+                    // set a value).
+                    {
+                        let map = self.queues.lock().expect("registry lock");
+                        if !map.get(&key).is_some_and(|c| Arc::ptr_eq(c, &cell)) {
+                            return Err(InitAbort::Orphaned);
+                        }
+                    }
                     let h = match kind {
                         QueueKind::Transient => {
                             queue::spawn(name.to_owned(), self.policy_for(name))
@@ -254,11 +278,10 @@ impl QueueRegistry {
                         // serve through a leader-following proxy.
                         QueueKind::Quorum => match self.cluster.get() {
                             Some(node) => {
-                                node.declare_quorum(name)
-                                    .await
-                                    .map_err(|e| {
-                                        tracing::warn!(queue = %name, error = %e, "quorum declare failed");
-                                    })?;
+                                node.declare_quorum(name).await.map_err(|e| {
+                                    tracing::warn!(queue = %name, error = %e, "quorum declare failed");
+                                    InitAbort::Failed
+                                })?;
                                 proxy::spawn(name.to_owned(), node.clone())
                             }
                             None => {
@@ -275,7 +298,7 @@ impl QueueRegistry {
                                         queue = %name,
                                         "durable store not openable yet; refusing quorum declare"
                                     );
-                                    return Err(());
+                                    return Err(InitAbort::Failed);
                                 }
                                 spawn_quorum_group(
                                     name.to_owned(),
@@ -286,14 +309,15 @@ impl QueueRegistry {
                                     persist,
                                 )
                                 .await
-                                .ok_or(())?
+                                .ok_or(InitAbort::Failed)?
                             }
                         },
                         #[cfg(feature = "store-redb")]
                         QueueKind::Durable => {
-                            let store = self.store().await.ok_or(())?;
+                            let store = self.store().await.ok_or(InitAbort::Failed)?;
                             let queue_id = store.queue_id(name).map_err(|e| {
                                 tracing::error!(queue = %name, error = %e, "durable queue id failed");
+                                InitAbort::Failed
                             })?;
                             crate::durable::spawn(
                                 name.to_owned(),
@@ -302,8 +326,9 @@ impl QueueRegistry {
                                 self.policy_for(name),
                             )
                             .map_err(|e| {
-                                    tracing::error!(queue = %name, error = %e, "durable recovery failed");
-                                })?
+                                tracing::error!(queue = %name, error = %e, "durable recovery failed");
+                                InitAbort::Failed
+                            })?
                         }
                         #[cfg(not(feature = "store-redb"))]
                         QueueKind::Durable => {
@@ -311,17 +336,19 @@ impl QueueRegistry {
                                 queue = %name,
                                 "durable queue requested but the broker was built without `store-redb`"
                             );
-                            return Err(());
+                            return Err(InitAbort::Failed);
                         }
                     };
-                    Ok::<_, ()>(h)
+                    Ok::<_, InitAbort>(h)
                 })
                 .await;
             let handle = match init {
                 Ok(h) => h,
+                // Our cell was evicted while we waited: retry on a fresh one.
+                Err(InitAbort::Orphaned) => continue,
                 // Init failed: drop the empty cell so it neither counts against
                 // the cap nor serves a poisoned entry; the next attach retries.
-                Err(()) => {
+                Err(InitAbort::Failed) => {
                     let mut map = self.queues.lock().expect("registry lock");
                     if map
                         .get(&key)
