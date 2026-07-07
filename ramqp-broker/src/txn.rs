@@ -101,6 +101,10 @@ pub(crate) struct StagedSettle {
 pub(crate) struct Txn {
     pub publishes: Vec<StagedPublish>,
     pub settles: Vec<StagedSettle>,
+    /// Set when a staged operation had to be refused (the staging cap): part
+    /// of the transaction's work is missing, so a commit would be silently
+    /// partial — discharge must fail and roll back instead.
+    pub rollback_only: bool,
 }
 
 impl Txn {
@@ -148,16 +152,29 @@ impl TxnManager {
         }
     }
 
-    /// Stage a settlement under `txn_id`; on `false` the settlement is
-    /// dropped and the message stays in flight (requeued by teardown —
-    /// at-least-once).
-    pub fn stage_settle(&mut self, txn_id: &TxnId, settle: StagedSettle) -> bool {
+    /// Stage a settlement under `txn_id`. A refusal hands the settle back so
+    /// the caller can requeue the message — leaving it in flight would
+    /// strand it invisibly (no redelivery timer; only connection teardown
+    /// would ever release it). A refusal at the cap also poisons the
+    /// transaction ([`Txn::rollback_only`]): its staged work is incomplete,
+    /// so the discharge must fail rather than commit silently partial work.
+    pub fn stage_settle(&mut self, txn_id: &TxnId, settle: StagedSettle) -> SettleStage {
         match self.txns.get_mut(txn_id) {
             Some(txn) if txn.staged() < MAX_STAGED => {
                 txn.settles.push(settle);
-                true
+                SettleStage::Staged
             }
-            _ => false,
+            Some(txn) => {
+                txn.rollback_only = true;
+                SettleStage::Refused {
+                    settle,
+                    known_txn: true,
+                }
+            }
+            None => SettleStage::Refused {
+                settle,
+                known_txn: false,
+            },
         }
     }
 
@@ -165,6 +182,19 @@ impl TxnManager {
     pub fn take(&mut self, txn_id: &TxnId) -> Option<Txn> {
         self.txns.remove(txn_id)
     }
+}
+
+/// How [`TxnManager::stage_settle`] resolved.
+pub(crate) enum SettleStage {
+    /// Staged; applied or undone at discharge.
+    Staged,
+    /// Not staged — the caller must requeue the message. `known_txn` says
+    /// whether the transaction exists (cap reached, now rollback-only) or
+    /// was already discharged (the disposition raced the discharge frame).
+    Refused {
+        settle: StagedSettle,
+        known_txn: bool,
+    },
 }
 
 /// How a discharge resolved (reported to the client as its disposition).
@@ -348,6 +378,7 @@ mod tests {
         let txn = Txn {
             publishes: vec![staged(&healthy, b"one"), staged(&full, b"two")],
             settles: Vec::new(),
+            rollback_only: false,
         };
         let outcome = execute_commit(txn).await;
         assert_eq!(outcome, DischargeOutcome::RolledBack);
@@ -393,10 +424,50 @@ mod tests {
                 },
             ],
             settles: Vec::new(),
+            rollback_only: false,
         };
         let outcome = execute_commit(txn).await;
         assert_eq!(outcome, DischargeOutcome::RolledBack);
         assert_eq!(stats(&healthy).await.ready, 0, "nothing landed");
+    }
+
+    /// A settle refused at the staging cap poisons the transaction
+    /// (rollback-only) and is handed back for requeueing; a settle for an
+    /// already-discharged transaction is handed back too (HIGH-5).
+    #[tokio::test]
+    async fn refused_settles_are_returned_and_poison_the_txn() {
+        let (queue_tx, _queue_rx) = mpsc::channel(1);
+        let mk_settle = || StagedSettle {
+            queue: queue_tx.clone(),
+            sub: 1,
+            msg_id: 1,
+            outcome: SettleOutcome::Ack,
+        };
+
+        let mut txns = TxnManager::default();
+        let id = txns.declare().expect("declare");
+        // Fill the transaction to its cap.
+        for _ in 0..super::MAX_STAGED {
+            assert!(matches!(
+                txns.stage_settle(&id, mk_settle()),
+                SettleStage::Staged
+            ));
+        }
+        // One more: refused, known txn, and the txn is now rollback-only.
+        match txns.stage_settle(&id, mk_settle()) {
+            SettleStage::Refused { known_txn: true, .. } => {}
+            _ => panic!("expected a known-txn refusal at the cap"),
+        }
+        let txn = txns.take(&id).expect("take");
+        assert!(txn.rollback_only, "cap refusal must poison the transaction");
+
+        // A settle for a discharged (unknown) transaction is refused too.
+        match txns.stage_settle(&id, mk_settle()) {
+            SettleStage::Refused {
+                known_txn: false, ..
+            } => {}
+            _ => panic!("expected an unknown-txn refusal"),
+        }
     }
 
     /// The happy path: all enqueues land, in staging order per queue.
@@ -407,6 +478,7 @@ mod tests {
         let txn = Txn {
             publishes: vec![staged(&a, b"1"), staged(&b, b"2"), staged(&a, b"3")],
             settles: Vec::new(),
+            rollback_only: false,
         };
         let outcome = execute_commit(txn).await;
         assert_eq!(outcome, DischargeOutcome::Complete);

@@ -631,13 +631,27 @@ impl<S: IoStream> BrokerConnection<S> {
                         outcome,
                     },
                 );
-                if !staged {
-                    // Unknown txn or cap: leave the message in flight; the
-                    // teardown/unsubscribe path requeues it (at-least-once).
+                if let crate::txn::SettleStage::Refused { settle, known_txn } = staged {
+                    // The settle cannot ride the transaction: the txn is at
+                    // its cap (now rollback-only — its discharge will fail)
+                    // or was already discharged (the disposition raced the
+                    // discharge frame). Requeue instead of leaving the
+                    // message stranded in flight with no redelivery path —
+                    // a duplicate is recoverable (at-least-once), an
+                    // invisible message is not.
                     tracing::warn!(
                         msg_id,
-                        "transactional settle not staged (unknown txn or cap)"
+                        known_txn,
+                        "transactional settle refused; requeueing the message"
                     );
+                    let _ = settle
+                        .queue
+                        .send(QueueMsg::Settle {
+                            sub: settle.sub,
+                            msg_id: settle.msg_id,
+                            outcome: SettleOutcome::Requeue,
+                        })
+                        .await;
                 }
             }
         }
@@ -877,6 +891,13 @@ impl<S: IoStream> BrokerConnection<S> {
                         // requeue their (still in-flight) messages.
                         crate::txn::execute_rollback(txn).await;
                         DischargeOutcome::Complete
+                    } else if txn.rollback_only {
+                        // A staged operation was refused (staging cap): the
+                        // transaction's work is incomplete, so committing it
+                        // would be silently partial. Roll back and tell the
+                        // client the commit failed.
+                        crate::txn::execute_rollback(txn).await;
+                        DischargeOutcome::RolledBack
                     } else {
                         // Commit: reserve on every queue, then land every
                         // staged enqueue (its queue's own durability confirm)

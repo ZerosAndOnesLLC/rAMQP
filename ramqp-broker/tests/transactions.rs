@@ -360,6 +360,53 @@ async fn unknown_transaction_discharge_is_rejected() {
     shutdown.shutdown();
 }
 
+/// A transactional settlement that races its own discharge (the disposition
+/// arrives after the discharge frame) must requeue the message, not strand
+/// it invisibly in the unacked map (HIGH-5 from issue #19).
+#[tokio::test]
+async fn settle_after_discharge_requeues_instead_of_stranding() {
+    let (addr, shutdown) = start().await;
+    let conn = ConnectionBuilder::new(format!("amqp://{addr}"))
+        .connect()
+        .await
+        .expect("connect");
+    let session = conn.begin_session().await.expect("session");
+    let ctl = session
+        .create_transaction_controller()
+        .await
+        .expect("controller");
+    let producer = session
+        .create_producer("/queues/txn-late-settle")
+        .await
+        .expect("producer");
+    producer.send(Message::text("m")).await.expect("send");
+    let mut consumer = session
+        .create_consumer("/queues/txn-late-settle")
+        .await
+        .expect("consumer");
+    let d = consumer.recv().await.expect("delivery");
+
+    // Discharge the transaction FIRST, then send the transactional settle —
+    // by the time the disposition reaches the broker the txn is gone.
+    let txn_id = ctl.declare().await.expect("declare");
+    ctl.commit(txn_id.clone()).await.expect("commit");
+    consumer
+        .settle_in_txn(&d, txn_id, Outcome::Accepted(Accepted::default()))
+        .await
+        .expect("late transactional settle");
+
+    // The broker must requeue the message (at-least-once), not strand it.
+    let again = tokio::time::timeout(Duration::from_secs(5), consumer.recv())
+        .await
+        .expect("requeued redelivery in time")
+        .expect("redelivery");
+    assert_eq!(text_of(&again), "m", "the late-settled message redelivers");
+    consumer.accept(&again).await.expect("accept");
+
+    conn.close().await.expect("close");
+    shutdown.shutdown();
+}
+
 /// A dropped connection rolls its transactions back implicitly.
 #[tokio::test]
 async fn connection_close_rolls_back_open_transactions() {
