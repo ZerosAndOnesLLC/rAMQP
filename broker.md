@@ -6,16 +6,20 @@ shared `ramqp-core`, then adding a server crate on top. Clean-room, no external
 AMQP dependencies (same constraint as the client). Clustered from v1; single
 protocol, done excellently; **fast and light before anything else**.
 
-> **Status: building — Phases 0–6 complete.** See §11 checkboxes. The broker runs **clustered**:
+> **Status: building — Phases 0–7 complete.** See §11 checkboxes. The broker runs **clustered**:
 > a 3-node cluster forms from static seeds over the inter-node fabric (one
 > multiplexed TCP connection per peer pair carrying every Raft group + the
 > forwarded data plane), quorum queues are declared through the replicated
 > catalog with rendezvous placement, **any node serves any queue** through
 > leader-following proxies, and killing the leader node mid-stream loses zero
 > accepted messages — proven end-to-end with the unmodified `ramqp` client.
-> First benchmark numbers vs live RabbitMQ 4.3.1 and Artemis are in
-> `bench-compare/README.md`, and CI runs the client interop suite against our
-> own broker alongside RabbitMQ and Artemis. This v2 supersedes the original
+> **Durability is in**: `/durable/*` queues on redb with group-commit fsync,
+> paged deep quorum queues (flat p50 to 1M+ deep, ~3× less RSS at 4 KiB bodies),
+> TTL/max-length/dead-letter policies, and an on-disk Raft log — quorum queues
+> and the catalog survive full broker restarts. Benchmarks (vs live RabbitMQ
+> 4.3.1 and Artemis, incl. quorum-vs-quorum and the deep-queue matrix) are in
+> `bench-compare/README.md`; CI runs the client interop suite against our own
+> broker alongside RabbitMQ and Artemis. This v2 supersedes the original
 > single-node plan after the scope decisions in §2.
 
 ---
