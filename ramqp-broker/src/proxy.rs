@@ -157,7 +157,7 @@ impl Proxy {
 
                 msg = rx.recv() => {
                     let Some(msg) = msg else { break };
-                    self.handle_msg(msg).await;
+                    if !self.handle_msg(msg).await { break }
                 }
 
                 Some(done) = self.pubs.next() => {
@@ -347,7 +347,10 @@ impl Proxy {
         Ok(())
     }
 
-    async fn handle_msg(&mut self, msg: QueueMsg) {
+    /// Process one mailbox message; returns `false` when the proxy should
+    /// close (a rebind exhausted its deadline — staying alive but permanently
+    /// unbound would starve consumers silently, LOW-7).
+    async fn handle_msg(&mut self, msg: QueueMsg) -> bool {
         match msg {
             QueueMsg::Publish { body, ack } => {
                 self.publish(body, ack, false, 0).await;
@@ -421,16 +424,19 @@ impl Proxy {
                     tracing::debug!(queue = %self.name, error = %e, "subscribe bind failed; rebinding");
                     self.subs.insert(key, sub);
                     let _ = reply.send(u64::from(key));
-                    let _ = self.rebind().await;
-                    return;
+                    // A failed rebind means no leader within the deadline:
+                    // close so the registry evicts and re-declares, rather
+                    // than lingering unbound with no way to re-trigger a bind
+                    // (LOW-7). rebind() migrates every sub, including this one.
+                    return self.rebind().await;
                 }
                 self.subs.insert(key, sub);
                 let _ = reply.send(u64::from(key));
             }
             QueueMsg::Demand { sub, credit, drain } => {
-                let Ok(key) = u32::try_from(sub) else { return };
+                let Ok(key) = u32::try_from(sub) else { return true };
                 let Some(record) = self.subs.get_mut(&key) else {
-                    return;
+                    return true;
                 };
                 record.outstanding = record.outstanding.saturating_add(credit);
                 match (&record.down, &self.downstream) {
@@ -460,9 +466,9 @@ impl Proxy {
                 msg_id,
                 outcome,
             } => {
-                let Ok(key) = u32::try_from(sub) else { return };
+                let Ok(key) = u32::try_from(sub) else { return true };
                 let Some(record) = self.subs.get(&key) else {
-                    return;
+                    return true;
                 };
                 match (&record.down, &self.downstream) {
                     (Some(DownSub::Local { sub }), Some(Downstream::Local { queue })) => {
@@ -497,9 +503,9 @@ impl Proxy {
                 }
             }
             QueueMsg::Unsubscribe { sub } => {
-                let Ok(key) = u32::try_from(sub) else { return };
+                let Ok(key) = u32::try_from(sub) else { return true };
                 let Some(record) = self.subs.remove(&key) else {
-                    return;
+                    return true;
                 };
                 match (&record.down, &self.downstream) {
                     (Some(DownSub::Local { sub }), Some(Downstream::Local { queue })) => {
@@ -513,6 +519,7 @@ impl Proxy {
                 }
             }
         }
+        true
     }
 
     /// Bind one (new) subscriber to the current downstream.
@@ -816,15 +823,17 @@ mod tests {
         // One consumer bound through the proxy.
         let (conn_tx, _conn_rx) = mpsc::unbounded_channel();
         let (reply_tx, reply_rx) = oneshot::channel();
-        proxy
-            .handle_msg(QueueMsg::Subscribe {
-                conn: conn_tx,
-                channel: 0,
-                handle: 1,
-                binding_gen: 1,
-                reply: reply_tx,
-            })
-            .await;
+        assert!(
+            proxy
+                .handle_msg(QueueMsg::Subscribe {
+                    conn: conn_tx,
+                    channel: 0,
+                    handle: 1,
+                    binding_gen: 1,
+                    reply: reply_tx,
+                })
+                .await
+        );
         reply_rx.await.expect("subscribed");
 
         let actor = node

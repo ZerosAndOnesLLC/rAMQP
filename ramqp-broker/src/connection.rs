@@ -904,6 +904,12 @@ impl<S: IoStream> BrokerConnection<S> {
         let control = decode_control(&d.message);
         match control {
             Some(TxnControl::Declare) => {
+                // Confirm the session is live FIRST: declaring before that
+                // would allocate a MAX_TXNS slot that leaks until connection
+                // close if the session is already gone (LOW-14).
+                if !self.sessions.contains_key(&channel) {
+                    return;
+                }
                 let state = match self.txns.declare() {
                     Some(txn_id) => declared_state(txn_id),
                     None => DeliveryState::Rejected(Rejected {
@@ -1261,7 +1267,20 @@ impl<S: IoStream> BrokerConnection<S> {
                     .is_ok();
                 let Ok(sub) = reply_rx.await else {
                     debug_assert!(!subscribed, "queue died between send and reply");
-                    tracing::warn!(queue = %queue.name, "queue actor unavailable");
+                    // The actor died after we accepted the attach: end the
+                    // session with an error so the consumer learns its link
+                    // is dead instead of waiting forever on a zombie link
+                    // that ignores flow/drain (LOW-8).
+                    tracing::warn!(queue = %queue.name, "queue actor unavailable; ending session");
+                    self.end_session_with_error(
+                        local,
+                        remote_channel,
+                        AmqpError::new(
+                            AmqpCondition::InternalError,
+                            Some(format!("queue {} became unavailable", queue.name)),
+                        ),
+                    )
+                    .await;
                     return;
                 };
                 Binding::Consumer {
