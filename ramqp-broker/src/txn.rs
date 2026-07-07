@@ -52,8 +52,11 @@ const MAX_STAGED_BYTES: usize = 64 * 1024 * 1024;
 /// A decoded coordinator control message.
 #[derive(Debug)]
 pub(crate) enum TxnControl {
-    /// Begin a transaction.
-    Declare,
+    /// Begin a transaction. `global_id` is set when the client requested a
+    /// distributed transaction — which this broker (local transactions
+    /// only) does not support and must reject rather than silently treat as
+    /// a local declare (LOW-15).
+    Declare { global_id: bool },
     /// End one: `fail == false` → commit, `true` → roll back.
     Discharge { txn_id: TxnId, fail: bool },
 }
@@ -63,8 +66,10 @@ pub(crate) enum TxnControl {
 pub(crate) fn decode_control(body: &[u8]) -> Option<TxnControl> {
     // Strip the amqp-value section header: DESCRIBED byte + descriptor.
     // The content is itself a described type; try both shapes.
-    if from_slice::<AmqpValue<Declare>>(body).is_ok() {
-        return Some(TxnControl::Declare);
+    if let Ok(v) = from_slice::<AmqpValue<Declare>>(body) {
+        return Some(TxnControl::Declare {
+            global_id: v.0.global_id.is_some(),
+        });
     }
     if let Ok(v) = from_slice::<AmqpValue<Discharge>>(body) {
         return Some(TxnControl::Discharge {
@@ -148,24 +153,26 @@ impl TxnManager {
         Some(id)
     }
 
-    /// Stage an enqueue under `txn_id`; `false` if the txn is unknown or a
-    /// staging limit (op count or bytes) is reached — the publish must then
-    /// be rejected. A limit refusal on a known transaction also poisons it
-    /// (rollback-only): its staged work is incomplete, so a commit would be
-    /// silently partial even though the producer saw the rejection.
-    pub fn stage_publish(&mut self, txn_id: &TxnId, publish: StagedPublish) -> bool {
+    /// Stage an enqueue under `txn_id`. A limit refusal on a known
+    /// transaction also poisons it (rollback-only): its staged work is
+    /// incomplete, so a commit would be silently partial even though the
+    /// producer saw the rejection. The result distinguishes an unknown txn
+    /// (`amqp:transaction:unknown-id`) from a staging-limit refusal
+    /// (`amqp:resource-limit-exceeded`) so the disposition is spec-accurate
+    /// (LOW-15).
+    pub fn stage_publish(&mut self, txn_id: &TxnId, publish: StagedPublish) -> PublishStage {
         let over_bytes = self.staged_bytes + publish.body.len() > MAX_STAGED_BYTES;
         match self.txns.get_mut(txn_id) {
             Some(txn) if !over_bytes && txn.staged() < MAX_STAGED => {
                 self.staged_bytes += publish.body.len();
                 txn.publishes.push(publish);
-                true
+                PublishStage::Staged
             }
             Some(txn) => {
                 txn.rollback_only = true;
-                false
+                PublishStage::Capped
             }
-            None => false,
+            None => PublishStage::UnknownTxn,
         }
     }
 
@@ -212,6 +219,17 @@ impl TxnManager {
         self.staged_bytes = 0;
         self.txns.drain().map(|(_, txn)| txn).collect()
     }
+}
+
+/// How [`TxnManager::stage_publish`] resolved.
+pub(crate) enum PublishStage {
+    /// Staged under the transaction.
+    Staged,
+    /// The transaction does not exist (→ `amqp:transaction:unknown-id`).
+    UnknownTxn,
+    /// A staging limit was reached; the txn is now rollback-only
+    /// (→ `amqp:resource-limit-exceeded`).
+    Capped,
 }
 
 /// How [`TxnManager::stage_settle`] resolved.
@@ -516,9 +534,12 @@ mod tests {
 
         let mut txns = TxnManager::default();
         let id = txns.declare().expect("declare");
-        assert!(txns.stage_publish(&id, mk(&big)), "first half fits");
         assert!(
-            !txns.stage_publish(&id, mk(&big)),
+            matches!(txns.stage_publish(&id, mk(&big)), PublishStage::Staged),
+            "first half fits"
+        );
+        assert!(
+            matches!(txns.stage_publish(&id, mk(&big)), PublishStage::Capped),
             "second half exceeds the byte budget"
         );
         let txn = txns.take(&id).expect("take");
@@ -527,9 +548,14 @@ mod tests {
         // The discharge released the budget: a fresh txn can stage again.
         let id2 = txns.declare().expect("declare 2");
         assert!(
-            txns.stage_publish(&id2, mk(&big)),
+            matches!(txns.stage_publish(&id2, mk(&big)), PublishStage::Staged),
             "budget freed by the previous discharge"
         );
+        // An unknown transaction is distinguished from a cap refusal.
+        assert!(matches!(
+            txns.stage_publish(&Bytes::from_static(b"nope"), mk(&big)),
+            PublishStage::UnknownTxn
+        ));
     }
 
     /// MED-14 (issue #19): a coordinator link detach drains every open

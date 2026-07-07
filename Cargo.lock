@@ -1544,7 +1544,7 @@ dependencies = [
 
 [[package]]
 name = "ramqp-broker"
-version = "0.8.23"
+version = "0.8.24"
 dependencies = [
  "bincode",
  "bytes",
@@ -1563,7 +1563,7 @@ dependencies = [
 
 [[package]]
 name = "ramqp-core"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "base64",
  "bytes",

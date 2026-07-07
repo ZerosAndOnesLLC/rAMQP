@@ -30,7 +30,8 @@ use ramqp_core::transport::IoStream;
 use ramqp_core::transport::frame::{Frame, FrameBody, FramedTransport};
 use ramqp_core::transport::header::{ProtocolHeader, accept as accept_header};
 use ramqp_core::types::definitions::{
-    AmqpError as AmqpCondition, ConnectionError, Error as AmqpError, ErrorCondition, Role,
+    AmqpError as AmqpCondition, ConnectionError, Error as AmqpError, ErrorCondition,
+    Role, TransactionError,
 };
 use ramqp_core::types::messaging::{Accepted, DeliveryState, Rejected, TargetArchetype};
 use ramqp_core::types::performatives::{Attach, Begin, Close, End, Performative};
@@ -903,21 +904,34 @@ impl<S: IoStream> BrokerConnection<S> {
         let delivery_id = d.delivery_id;
         let control = decode_control(&d.message);
         match control {
-            Some(TxnControl::Declare) => {
+            Some(TxnControl::Declare { global_id }) => {
                 // Confirm the session is live FIRST: declaring before that
                 // would allocate a MAX_TXNS slot that leaks until connection
                 // close if the session is already gone (LOW-14).
                 if !self.sessions.contains_key(&channel) {
                     return;
                 }
-                let state = match self.txns.declare() {
-                    Some(txn_id) => declared_state(txn_id),
-                    None => DeliveryState::Rejected(Rejected {
+                let state = if global_id {
+                    // A global-id declare requests a DISTRIBUTED transaction;
+                    // this coordinator advertises local transactions only —
+                    // reject it instead of silently making a local txn
+                    // (LOW-15).
+                    DeliveryState::Rejected(Rejected {
                         error: Some(AmqpError::new(
-                            AmqpCondition::ResourceLimitExceeded,
-                            Some("too many open transactions".to_owned()),
+                            AmqpCondition::NotImplemented,
+                            Some("distributed transactions (global-id) are not supported".to_owned()),
                         )),
-                    }),
+                    })
+                } else {
+                    match self.txns.declare() {
+                        Some(txn_id) => declared_state(txn_id),
+                        None => DeliveryState::Rejected(Rejected {
+                            error: Some(AmqpError::new(
+                                AmqpCondition::ResourceLimitExceeded,
+                                Some("too many open transactions".to_owned()),
+                            )),
+                        }),
+                    }
                 };
                 if let Some(session) = self.sessions.get_mut(&channel) {
                     session.send_disposition(
@@ -940,7 +954,10 @@ impl<S: IoStream> BrokerConnection<S> {
                             None,
                             DeliveryState::Rejected(Rejected {
                                 error: Some(AmqpError::new(
-                                    AmqpCondition::NotFound,
+                                    // Spec part 4: an unknown txn-id is
+                                    // amqp:transaction:unknown-id, not the
+                                    // generic amqp:not-found (LOW-15).
+                                    TransactionError::UnknownId,
                                     Some("unknown transaction".to_owned()),
                                 )),
                             }),
@@ -1334,20 +1351,26 @@ impl<S: IoStream> BrokerConnection<S> {
                             },
                         );
                         if let Some(session) = self.sessions.get_mut(&channel) {
-                            let state = if staged {
-                                transactional_state(
+                            use crate::txn::PublishStage;
+                            let state = match staged {
+                                PublishStage::Staged => transactional_state(
                                     ts.txn_id,
                                     Some(ramqp_core::types::messaging::Outcome::Accepted(
                                         Accepted::default(),
                                     )),
-                                )
-                            } else {
-                                DeliveryState::Rejected(Rejected {
+                                ),
+                                PublishStage::UnknownTxn => DeliveryState::Rejected(Rejected {
+                                    error: Some(AmqpError::new(
+                                        TransactionError::UnknownId,
+                                        Some("unknown transaction".to_owned()),
+                                    )),
+                                }),
+                                PublishStage::Capped => DeliveryState::Rejected(Rejected {
                                     error: Some(AmqpError::new(
                                         AmqpCondition::ResourceLimitExceeded,
-                                        Some("unknown transaction or staging cap".to_owned()),
+                                        Some("transaction staging cap reached".to_owned()),
                                     )),
-                                })
+                                }),
                             };
                             session.send_disposition(
                                 handle,
