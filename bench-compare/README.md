@@ -147,3 +147,44 @@ cargo run -p ramqp-bench-compare --release --bin latency                  # ours
 LAT_URL=amqp://guest:guest@localhost:5672 LAT_ADDRESS=/queues/bench-lat \
     cargo run -p ramqp-bench-compare --release --bin latency              # any broker
 ```
+
+## Quorum-queue numbers — ramqp-broker Phase 6 (2026-07-06)
+
+Same harness, same machine, 256 B payloads: replicated (`/quorum/*`) queues
+after the Phase 6 forwarding fabric landed. The 3-node cluster runs three
+`ramqp-brokerd` processes over real loopback TCP (fabric + Raft replication,
+replication factor 3); "via follower" attaches the client to a node that does
+NOT lead the queue's Raft group, so every message crosses the internal
+forwarding fabric to the leader and back.
+
+| 256 B, defaults | transient (in-proc) | quorum ×1 (in-proc) | **quorum ×3, leader node** | **quorum ×3, via follower** | RabbitMQ 4.3.1 quorum |
+|---|---|---|---|---|---|
+| p50 latency      | 92 µs  | 120 µs | **288 µs** | **427 µs** | 2234 µs |
+| p90              | 118 µs | 143 µs | **347 µs** | **489 µs** | 2639 µs |
+| p99              | 162 µs | 245 µs | **429 µs** | **626 µs** | 3963 µs |
+| p99.9            | 259 µs | 396 µs | **633 µs** | **815 µs** | 7496 µs |
+| blast throughput | 286k msg/s | 157k msg/s | **141k msg/s** | **157–165k msg/s** | 39k msg/s |
+| broker memory    | 28 MiB¹ | 218 MiB¹ | 451 MiB leader / ~190 MiB per follower² | — | 226 MiB³ |
+
+¹ whole-process RSS including client+harness (in-process broker).
+² per-`ramqp-brokerd` VmRSS after three consecutive 50k blasts; dominated by
+the in-memory Raft log + snapshot copies (high-water, not steady-state — the
+on-disk log and paged state machine are Phase 7).
+³ `docker stats` container memory after the run.
+
+**Read honestly:** the headline asymmetry — our quorum queue commits its Raft
+log **in memory** while RabbitMQ's quorum queue fsyncs to disk — makes the
+latency gap partly a durability gap; the disk-backed comparison is redo-work
+for Phase 7. Also: RabbitMQ ran as a single-node cluster (its quorum queue
+had one member, no replication RTT) while ours replicated to 3 members over
+loopback TCP — that asymmetry favors *RabbitMQ*. Untuned defaults, WSL2,
+docker NAT on the RabbitMQ leg. What the numbers do establish: the
+consensus-per-publish path (commit-backed accepts) plus the forwarding fabric
+keeps tails flat — p99.9/p50 ≈ 2× on every leg (§3.1 target ≤10×) — and one
+fabric hop costs ~140 µs p50 on this machine.
+
+Found by this bench (worth the price of admission): a broker-side bug where
+the close-time settlement drain polled tokio oneshots with an exhausted
+cooperative budget, silently requeuing hundreds of already-acked messages per
+busy connection close (duplicates for the next consumer). Fixed + regression-
+tested (`blast::close_after_blast_leaves_nothing_to_redeliver`).
