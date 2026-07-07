@@ -15,8 +15,8 @@
 //! Scope (deliberate): **local transactions**, one connection's worth —
 //! transactions die (roll back) with their connection, per the local-
 //! transactions capability the coordinator advertises. Staging is bounded
-//! (`MAX_TXNS`, `MAX_STAGED`) so a transaction cannot become an unbounded
-//! buffer (§3.2).
+//! in ops (`MAX_TXNS`, `MAX_STAGED`) *and* bytes (`MAX_STAGED_BYTES`, per
+//! connection) so a transaction cannot become an unbounded buffer (§3.2).
 //!
 //! # Commit atomicity
 //! A commit runs in two phases: capacity slots are **reserved** on every
@@ -43,6 +43,11 @@ use crate::queue::{ConnCmd, PublishAck, QueueMsg, SettleOutcome, SubId};
 const MAX_TXNS: usize = 64;
 /// Staged operations (enqueues + settlements) per transaction.
 const MAX_STAGED: usize = 10_000;
+/// Staged publish BYTES per connection, across all its transactions. The
+/// op-count caps alone still admit 64 × 10k × max-message-size — hundreds
+/// of GiB of pinned bodies from one authorized client; this is the actual
+/// memory bound (§3.2).
+const MAX_STAGED_BYTES: usize = 64 * 1024 * 1024;
 
 /// A decoded coordinator control message.
 #[derive(Debug)]
@@ -118,6 +123,9 @@ impl Txn {
 pub(crate) struct TxnManager {
     next_id: u64,
     txns: std::collections::HashMap<TxnId, Txn>,
+    /// Total bytes of staged publish bodies across all open transactions
+    /// (bounded by [`MAX_STAGED_BYTES`]).
+    staged_bytes: usize,
 }
 
 impl std::fmt::Debug for TxnManager {
@@ -140,15 +148,24 @@ impl TxnManager {
         Some(id)
     }
 
-    /// Stage an enqueue under `txn_id`; `false` if the txn is unknown or at
-    /// its staging cap (the publish must then be rejected).
+    /// Stage an enqueue under `txn_id`; `false` if the txn is unknown or a
+    /// staging limit (op count or bytes) is reached — the publish must then
+    /// be rejected. A limit refusal on a known transaction also poisons it
+    /// (rollback-only): its staged work is incomplete, so a commit would be
+    /// silently partial even though the producer saw the rejection.
     pub fn stage_publish(&mut self, txn_id: &TxnId, publish: StagedPublish) -> bool {
+        let over_bytes = self.staged_bytes + publish.body.len() > MAX_STAGED_BYTES;
         match self.txns.get_mut(txn_id) {
-            Some(txn) if txn.staged() < MAX_STAGED => {
+            Some(txn) if !over_bytes && txn.staged() < MAX_STAGED => {
+                self.staged_bytes += publish.body.len();
                 txn.publishes.push(publish);
                 true
             }
-            _ => false,
+            Some(txn) => {
+                txn.rollback_only = true;
+                false
+            }
+            None => false,
         }
     }
 
@@ -178,9 +195,13 @@ impl TxnManager {
         }
     }
 
-    /// Close a transaction, taking its staged work.
+    /// Close a transaction, taking its staged work (its bytes leave the
+    /// staging budget).
     pub fn take(&mut self, txn_id: &TxnId) -> Option<Txn> {
-        self.txns.remove(txn_id)
+        let txn = self.txns.remove(txn_id)?;
+        let bytes: usize = txn.publishes.iter().map(|p| p.body.len()).sum();
+        self.staged_bytes = self.staged_bytes.saturating_sub(bytes);
+        Some(txn)
     }
 }
 
@@ -468,6 +489,38 @@ mod tests {
             } => {}
             _ => panic!("expected an unknown-txn refusal"),
         }
+    }
+
+    /// HIGH-4 (issue #19): staged publish BYTES are bounded per connection —
+    /// the op-count caps alone admitted hundreds of GiB of pinned bodies.
+    /// A byte refusal poisons the transaction, and discharge frees the
+    /// budget.
+    #[tokio::test]
+    async fn staged_publish_bytes_are_bounded_and_released() {
+        let (queue_tx, _queue_rx) = mpsc::channel(1);
+        let big = Bytes::from(vec![0u8; super::MAX_STAGED_BYTES / 2 + 1]);
+        let mk = |body: &Bytes| StagedPublish {
+            queue: queue_tx.clone(),
+            queue_name: "q".into(),
+            body: body.clone(),
+        };
+
+        let mut txns = TxnManager::default();
+        let id = txns.declare().expect("declare");
+        assert!(txns.stage_publish(&id, mk(&big)), "first half fits");
+        assert!(
+            !txns.stage_publish(&id, mk(&big)),
+            "second half exceeds the byte budget"
+        );
+        let txn = txns.take(&id).expect("take");
+        assert!(txn.rollback_only, "byte refusal must poison the txn");
+
+        // The discharge released the budget: a fresh txn can stage again.
+        let id2 = txns.declare().expect("declare 2");
+        assert!(
+            txns.stage_publish(&id2, mk(&big)),
+            "budget freed by the previous discharge"
+        );
     }
 
     /// The happy path: all enqueues land, in staging order per queue.

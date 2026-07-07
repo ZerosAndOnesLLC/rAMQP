@@ -106,11 +106,24 @@ pub enum OverflowBehavior {
 /// forwarding) on `listen`; the founding members are the static `seeds`
 /// list, identical on every node. The lowest seed id forms the cluster;
 /// formation is idempotent, so restarts and start-order races are safe.
+///
+/// # Security
+/// The fabric port carries **no authentication and no encryption**: any
+/// host that can open a TCP connection to it can publish to, consume from,
+/// and acknowledge every queue this node leads, rewrite the replicated
+/// queue catalog, and inject Raft RPCs into every group (a forged
+/// high-term vote alone is a cluster-wide liveness DoS). Until fabric
+/// auth/TLS lands, the fabric MUST run on an isolated, trusted network —
+/// a private VLAN/VPC, a WireGuard mesh, or strict firewall rules limiting
+/// the port to the cluster's own nodes. The broker logs a warning at
+/// startup when the fabric binds a non-loopback address.
 #[derive(Debug, Clone)]
 pub struct ClusterMemberConfig {
     /// This node's id (must appear in `seeds`, unique per node).
     pub node_id: u64,
-    /// The fabric listen address (e.g. `0.0.0.0:7472`).
+    /// The fabric listen address (e.g. `0.0.0.0:7472`). See the
+    /// struct-level **Security** note: this port must only be reachable
+    /// from the cluster's own nodes.
     pub listen: String,
     /// All founding members: `(node id, fabric address as peers reach it)`.
     pub seeds: Vec<(u64, String)>,

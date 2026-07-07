@@ -11,6 +11,10 @@
 //! Env equivalents: `RAMQP_LISTEN`, `RAMQP_NODE_ID`, `RAMQP_CLUSTER_LISTEN`,
 //! `RAMQP_SEEDS` (comma-separated `id=addr` pairs). Real configuration (TLS,
 //! auth backends, policies) arrives with Phase 9.
+//!
+//! **Security:** the `--cluster-listen` fabric port is unauthenticated and
+//! unencrypted — it must only be reachable from the cluster's own nodes
+//! (isolated network / firewall). See `ClusterMemberConfig`'s security note.
 
 use ramqp_broker::{Broker, BrokerConfig, ClusterMemberConfig};
 

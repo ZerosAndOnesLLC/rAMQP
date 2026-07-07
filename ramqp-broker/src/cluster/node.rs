@@ -169,6 +169,21 @@ impl ClusterNode {
 
         let listener = TcpListener::bind(&settings.listen).await?;
         let fabric_addr = listener.local_addr()?;
+        // The fabric speaks unauthenticated, unencrypted frames: any host
+        // with TCP reach can publish/consume/settle on every queue this node
+        // leads, rewrite the replicated catalog, and feed forged Raft RPCs
+        // into every group (a high-term Vote alone is a cluster-wide
+        // liveness DoS). Until fabric auth/TLS lands it MUST be confined to
+        // an isolated, trusted network — say so loudly on any other bind.
+        if !fabric_addr.ip().is_loopback() {
+            tracing::warn!(
+                addr = %fabric_addr,
+                "cluster fabric is listening on a non-loopback address with NO authentication \
+                 or encryption — any host that can reach this port has full control of this \
+                 node's queues, catalog, and Raft groups; run the fabric only on an isolated \
+                 trusted network (firewall/VPC/WireGuard)"
+            );
+        }
         let (shutdown, shutdown_rx) = watch::channel(false);
 
         let node = Arc::new(ClusterNode {
