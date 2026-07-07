@@ -186,9 +186,9 @@ impl Store {
         Ok(id)
     }
 
-    /// Recovery scan: every stored `(msg_id, failures, enqueued_ms)` for a
-    /// queue.
-    pub fn scan(&self, queue: u64) -> Result<Vec<(u64, u32, u64)>, String> {
+    /// Recovery scan: every stored `(msg_id, failures, enqueued_ms,
+    /// body length)` for a queue.
+    pub fn scan(&self, queue: u64) -> Result<Vec<(u64, u32, u64, usize)>, String> {
         let txn = self.db.begin_read().map_err(|e| e.to_string())?;
         let table = txn.open_table(MESSAGES).map_err(|e| e.to_string())?;
         let mut out = Vec::new();
@@ -197,8 +197,8 @@ impl Store {
             .map_err(|e| e.to_string())?
         {
             let (key, value) = entry.map_err(|e| e.to_string())?;
-            let (failures, enqueued_ms, _) = value.value();
-            out.push((key.value().1, failures, enqueued_ms));
+            let (failures, enqueued_ms, body) = value.value();
+            out.push((key.value().1, failures, enqueued_ms, body.len()));
         }
         Ok(out)
     }
@@ -592,7 +592,10 @@ mod tests {
         assert_eq!(q2, q, "queue id is stable across restarts");
         let mut recovered = store.scan(q).expect("scan");
         recovered.sort_unstable();
-        assert_eq!(recovered, vec![(2, 1, 1_002), (3, 0, 1_003), (4, 0, 1_004)]);
+        assert_eq!(
+            recovered,
+            vec![(2, 1, 1_002, 8), (3, 0, 1_003, 8), (4, 0, 1_004, 1)]
+        );
         assert_eq!(&store.body(q, 3).expect("body")[..], &[3u8; 8]);
         assert!(store.body(q, 1).is_none(), "acked message is gone");
     }

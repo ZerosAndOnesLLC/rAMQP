@@ -776,6 +776,7 @@ mod tests {
             seeds: vec![(1, addr)],
             replicas: 1,
             max_queue_depth: 10_000,
+            max_queue_bytes: 0,
             data_dir: None,
             resident_bytes_max: usize::MAX,
             policies: Vec::new(),

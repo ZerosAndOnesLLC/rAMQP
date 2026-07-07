@@ -84,6 +84,7 @@ impl Broker {
                 seeds: cluster.seeds.clone(),
                 replicas: cluster.replicas,
                 max_queue_depth: self.config.max_queue_depth,
+                max_queue_bytes: self.config.max_queue_bytes,
                 data_dir: self.config.data_dir.clone(),
                 resident_bytes_max: self.config.resident_bytes_max,
                 policies: self.config.policies.clone(),

@@ -41,6 +41,9 @@ enum Committed {
     Publish {
         ack: Option<PublishAck>,
         result: Result<u64, String>,
+        /// Body bytes this proposal pinned (released from the pending
+        /// budget on resolution).
+        len: usize,
     },
     /// An ack/drop removal proposal finished.
     Remove {
@@ -110,6 +113,9 @@ async fn run(
     // In-flight commit proposals (publishes + settles), pipelined.
     let mut commits: FuturesUnordered<CommitFuture> = FuturesUnordered::new();
     let mut publishes_pending: usize = 0;
+    // Bytes pinned by in-flight enqueue proposals (applied bodies are
+    // counted by the state machine's own resident_bytes).
+    let mut pending_bytes: usize = 0;
     // Capacity slots held for transaction commits.
     let mut reserved: usize = 0;
     let mut next_sub_id: SubId = 0;
@@ -149,14 +155,16 @@ async fn run(
                     &mut ready,
                     &mut commits,
                     &mut publishes_pending,
+                    &mut pending_bytes,
                     &mut reserved,
                     &mut next_sub_id,
                 );
             }
             Some(done) = commits.next() => {
                 match done {
-                    Committed::Publish { ack, result } => {
+                    Committed::Publish { ack, result, len } => {
                         publishes_pending -= 1;
+                        pending_bytes = pending_bytes.saturating_sub(len);
                         match result {
                             Ok(msg_id) => {
                                 // Committed to the Raft log: confirm to the producer.
@@ -204,6 +212,7 @@ fn handle_msg(
     ready: &mut BTreeSet<u64>,
     commits: &mut FuturesUnordered<CommitFuture>,
     publishes_pending: &mut usize,
+    pending_bytes: &mut usize,
     reserved: &mut usize,
     next_sub_id: &mut SubId,
 ) {
@@ -232,7 +241,26 @@ fn handle_msg(
                     }
                 }
             }
+            // Byte bound: RESIDENT bytes (spilled bodies excluded — paged
+            // queues are disk-bounded) plus in-flight proposals. No
+            // synchronous drop-head is possible here (a removal must commit
+            // through Raft before resident bytes fall), so over-bytes always
+            // refuses. Reserved (transaction) publishes were admitted at
+            // Reserve time; their overshoot is bounded by the per-connection
+            // staging budget.
+            let resident = store.with_state(|s| s.resident_bytes());
+            if !from_reserved
+                && resident
+                    .saturating_add(*pending_bytes)
+                    .saturating_add(body.len())
+                    > policy.max_bytes
+            {
+                refuse_publish(name, ack);
+                return;
+            }
             *publishes_pending += 1;
+            let len = body.len();
+            *pending_bytes = pending_bytes.saturating_add(len);
             let raft = raft.clone();
             let enqueued_ms = now_ms();
             commits.push(Box::pin(async move {
@@ -246,7 +274,7 @@ fn handle_msg(
                     },
                     Err(e) => Err(e.to_string()),
                 };
-                Committed::Publish { ack, result }
+                Committed::Publish { ack, result, len }
             }));
         }
         QueueMsg::Reserve { count, reply } => {

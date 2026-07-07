@@ -119,6 +119,9 @@ pub(crate) struct EffectivePolicy {
     /// Effective depth bound (policy `max_length`, else the broker-wide
     /// `max_queue_depth`).
     pub max_len: usize,
+    /// Effective byte bound on held bodies (`usize::MAX` = unbounded):
+    /// policy `max_length_bytes`, else the broker-wide `max_queue_bytes`.
+    pub max_bytes: usize,
     /// `true` → drop the oldest ready message to admit a new one at the
     /// bound; `false` → reject the publish.
     pub drop_head: bool,
@@ -131,11 +134,13 @@ pub(crate) struct EffectivePolicy {
 }
 
 impl EffectivePolicy {
-    /// The no-policy default: only the broker-wide depth bound.
+    /// The no-policy default: only the broker-wide depth bound (bytes
+    /// unbounded — unit-test convenience).
     pub fn depth_only(max_len: usize) -> Self {
         EffectivePolicy {
             ttl_ms: None,
             max_len,
+            max_bytes: usize::MAX,
             drop_head: false,
             dead_letter: None,
             max_attempts: None,
@@ -144,13 +149,20 @@ impl EffectivePolicy {
     }
 
     /// Resolve the first matching policy (prefix match on the normalized
-    /// queue name) against the broker config.
+    /// queue name) against the broker config. `global_max_bytes == 0`
+    /// disables the byte bound.
     pub fn resolve(
         config_policies: &[(String, QueuePolicy)],
         queue: &str,
         global_max_depth: usize,
+        global_max_bytes: usize,
         dlx: Option<DeadLetterSender>,
     ) -> Self {
+        let global_bytes = if global_max_bytes == 0 {
+            usize::MAX
+        } else {
+            global_max_bytes
+        };
         let matched = config_policies
             .iter()
             .find(|(prefix, _)| queue.starts_with(prefix.as_str()))
@@ -159,12 +171,16 @@ impl EffectivePolicy {
             Some(p) => EffectivePolicy {
                 ttl_ms: p.message_ttl.map(|d| d.as_millis() as u64),
                 max_len: p.max_length.unwrap_or(global_max_depth),
+                max_bytes: p.max_length_bytes.unwrap_or(global_bytes),
                 drop_head: p.overflow == OverflowBehavior::DropHead,
                 dead_letter: p.dead_letter.clone(),
                 max_attempts: p.max_delivery_attempts,
                 dlx,
             },
-            None => Self::depth_only(global_max_depth),
+            None => EffectivePolicy {
+                max_bytes: global_bytes,
+                ..Self::depth_only(global_max_depth)
+            },
         }
     }
 

@@ -53,6 +53,8 @@ pub struct NodeSettings {
     pub replicas: u8,
     /// Per-queue depth bound handed to leader-local actors.
     pub max_queue_depth: usize,
+    /// Per-queue byte bound handed to leader-local actors (0 = disabled).
+    pub max_queue_bytes: usize,
     /// When set, deep queues page message bodies to disk here and park
     /// snapshot blobs there too (broker.md §8 deep-queue mitigation).
     pub data_dir: Option<std::path::PathBuf>,
@@ -620,6 +622,7 @@ impl ClusterNode {
                     &self.settings.policies,
                     name,
                     self.settings.max_queue_depth,
+                    self.settings.max_queue_bytes,
                     self.settings.dlx.clone(),
                 );
                 let handle = quorum::spawn(
@@ -1395,6 +1398,7 @@ mod tests {
                 seeds: seeds.clone(),
                 replicas,
                 max_queue_depth: 10_000,
+                max_queue_bytes: 0,
                 data_dir: None,
                 resident_bytes_max: usize::MAX,
                 policies: Vec::new(),

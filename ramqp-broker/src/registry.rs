@@ -48,6 +48,8 @@ pub(crate) enum QueueKind {
 pub(crate) struct QueueRegistry {
     queues: std::sync::Mutex<HashMap<String, Arc<tokio::sync::OnceCell<QueueHandle>>>>,
     max_depth: usize,
+    /// Broker-wide per-queue byte bound (0 = disabled).
+    max_bytes: usize,
     /// Cap on the number of distinct queues (0 = unbounded); bounds how many
     /// actors / Raft groups a client can auto-declare.
     max_queues: usize,
@@ -76,6 +78,7 @@ impl QueueRegistry {
         QueueRegistry {
             queues: std::sync::Mutex::new(HashMap::new()),
             max_depth: config.max_queue_depth,
+            max_bytes: config.max_queue_bytes,
             max_queues: config.max_queues,
             node_id: 1,
             cluster: OnceLock::new(),
@@ -99,6 +102,7 @@ impl QueueRegistry {
             &self.policies,
             name,
             self.max_depth,
+            self.max_bytes,
             self.dlx.get().cloned(),
         )
     }

@@ -232,6 +232,9 @@ async fn run(name: String, mut rx: mpsc::Receiver<QueueMsg>, policy: EffectivePo
     // Capacity slots held for transaction commits (counted against the depth
     // bound; consumed by PublishReserved, released by Unreserve).
     let mut reserved: usize = 0;
+    // Bytes of message bodies currently held (ready + unacked): the RAM
+    // bound — the depth bound alone admits depth × max-message-size.
+    let mut bytes: usize = 0;
     let mut next_msg_id: u64 = 0;
     let mut next_sub_id: SubId = 0;
     let mut rr: usize = 0;
@@ -243,24 +246,32 @@ async fn run(name: String, mut rx: mpsc::Receiver<QueueMsg>, policy: EffectivePo
                 if from_reserved {
                     reserved = reserved.saturating_sub(1);
                 }
-                if ready.len() + unacked.len() + reserved >= policy.max_len {
-                    // At the bound: drop-head makes room (dead-lettering the
-                    // displaced message); otherwise refuse — never grow
-                    // without bound (broker.md §3.2).
-                    let dropped = policy.drop_head.then(|| ready.pop_front()).flatten();
-                    match dropped {
-                        Some(old) => policy.dead_letter(&name, "maxlen", old.body),
-                        // A reserved publish is never refused: its slot was
-                        // admitted at Reserve time (the check above can only
-                        // trip here if the reservation was lost to a failover).
-                        None if from_reserved => {}
-                        None => {
-                            refuse_publish(&name, ack);
-                            continue;
-                        }
+                // At a bound (depth or bytes): drop-head makes room
+                // (dead-lettering displaced messages); otherwise refuse —
+                // never grow without bound (broker.md §3.2).
+                let over = |ready_len: usize, unacked_len: usize, bytes_now: usize| {
+                    ready_len + unacked_len + reserved >= policy.max_len
+                        || bytes_now.saturating_add(body.len()) > policy.max_bytes
+                };
+                let mut needs_room = over(ready.len(), unacked.len(), bytes);
+                if needs_room && policy.drop_head {
+                    while needs_room {
+                        let Some(old) = ready.pop_front() else { break };
+                        bytes = bytes.saturating_sub(old.body.len());
+                        policy.dead_letter(&name, "maxlen", old.body);
+                        needs_room = over(ready.len(), unacked.len(), bytes);
                     }
                 }
+                // A reserved publish is never refused for depth: its slot was
+                // admitted at Reserve time (`needs_room` can only persist
+                // here if the reservation was lost to a failover, or unacked
+                // messages pin the byte budget).
+                if needs_room && !from_reserved {
+                    refuse_publish(&name, ack);
+                    continue;
+                }
                 next_msg_id += 1;
+                bytes = bytes.saturating_add(body.len());
                 ready.push_back(Stored {
                     id: next_msg_id,
                     body,
@@ -322,11 +333,14 @@ async fn run(name: String, mut rx: mpsc::Receiver<QueueMsg>, policy: EffectivePo
                 }
                 if let Some((mut stored, _)) = unacked.remove(&msg_id) {
                     match outcome {
-                        SettleOutcome::Ack | SettleOutcome::Drop => {}
+                        SettleOutcome::Ack | SettleOutcome::Drop => {
+                            bytes = bytes.saturating_sub(stored.body.len());
+                        }
                         SettleOutcome::Requeue => ready.push_front(stored),
                         SettleOutcome::RequeueFailed => {
                             stored.failures += 1;
                             if policy.attempts_exhausted(stored.failures) {
+                                bytes = bytes.saturating_sub(stored.body.len());
                                 policy.dead_letter(&name, "delivery-limit", stored.body);
                             } else {
                                 ready.push_front(stored);
@@ -360,11 +374,21 @@ async fn run(name: String, mut rx: mpsc::Receiver<QueueMsg>, policy: EffectivePo
         }
 
         // Dispatch: round-robin over subscribers with demand.
-        dispatch(&name, &policy, &mut ready, &mut unacked, &mut subs, &mut rr).await;
+        dispatch(
+            &name,
+            &policy,
+            &mut ready,
+            &mut unacked,
+            &mut subs,
+            &mut rr,
+            &mut bytes,
+        )
+        .await;
     }
     tracing::debug!(queue = %name, "queue actor stopped");
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn dispatch(
     name: &str,
     policy: &EffectivePolicy,
@@ -372,6 +396,7 @@ async fn dispatch(
     unacked: &mut HashMap<u64, (Stored, SubId)>,
     subs: &mut Vec<Subscriber>,
     rr: &mut usize,
+    bytes: &mut usize,
 ) {
     // Lazy TTL: expire from the head before dispatching (RabbitMQ-classic
     // semantics — an expired message leaves when it reaches the front).
@@ -382,6 +407,7 @@ async fn dispatch(
             .is_some_and(|m| policy.expired(m.enqueued_ms, now))
         {
             let expired = ready.pop_front().expect("non-empty");
+            *bytes = bytes.saturating_sub(expired.body.len());
             policy.dead_letter(name, "expired", expired.body);
         }
     }
@@ -838,6 +864,70 @@ mod tests {
             ConnCmd::SettleIncoming { accepted, .. } => assert!(accepted),
             other => panic!("expected confirm, got {other:?}"),
         }
+    }
+
+    async fn try_publish(
+        q: &QueueHandle,
+        conn: &mpsc::UnboundedSender<ConnCmd>,
+        rx: &mut mpsc::UnboundedReceiver<ConnCmd>,
+        body: &'static [u8],
+    ) -> bool {
+        q.tx.send(QueueMsg::Publish {
+            body: Bytes::from_static(body),
+            ack: Some(PublishAck {
+                conn: conn.clone(),
+                channel: 0,
+                handle: 0,
+                binding_gen: 0,
+                delivery_id: 0,
+            }),
+        })
+        .await
+        .unwrap();
+        match rx.recv().await.unwrap() {
+            ConnCmd::SettleIncoming { accepted, .. } => accepted,
+            other => panic!("expected settle, got {other:?}"),
+        }
+    }
+
+    /// MED-6 (issue #19): the byte bound refuses publishes the depth bound
+    /// alone would admit — the depth cap × max-message-size admitted
+    /// terabytes.
+    #[tokio::test]
+    async fn byte_bound_refuses_oversized_backlog() {
+        let mut policy = EffectivePolicy::depth_only(100);
+        policy.max_bytes = 10;
+        let q = spawn("t".into(), policy);
+        let (conn_tx, mut conn_rx) = mpsc::unbounded_channel();
+
+        assert!(try_publish(&q, &conn_tx, &mut conn_rx, b"12345678").await);
+        assert!(
+            !try_publish(&q, &conn_tx, &mut conn_rx, b"1234").await,
+            "4 more bytes exceed the 10-byte bound despite depth room"
+        );
+        assert!(
+            try_publish(&q, &conn_tx, &mut conn_rx, b"12").await,
+            "2 bytes still fit"
+        );
+    }
+
+    /// Drop-head honors the byte bound too: it evicts enough of the oldest
+    /// ready messages to admit the new one.
+    #[tokio::test]
+    async fn byte_bound_drop_head_evicts_to_fit() {
+        let mut policy = EffectivePolicy::depth_only(100);
+        policy.max_bytes = 10;
+        policy.drop_head = true;
+        let q = spawn("t".into(), policy);
+        let (conn_tx, mut conn_rx) = mpsc::unbounded_channel();
+
+        assert!(try_publish(&q, &conn_tx, &mut conn_rx, b"aaaa").await);
+        assert!(try_publish(&q, &conn_tx, &mut conn_rx, b"bbbb").await);
+        // 8 bytes held; 8 more need BOTH evicted.
+        assert!(try_publish(&q, &conn_tx, &mut conn_rx, b"cccccccc").await);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        q.tx.send(QueueMsg::Stats { reply: tx }).await.unwrap();
+        assert_eq!(rx.await.unwrap().ready, 1, "both older messages evicted");
     }
 
     #[tokio::test]

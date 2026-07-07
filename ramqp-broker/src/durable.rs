@@ -29,6 +29,7 @@ struct Committed {
     ack: Option<PublishAck>,
     msg_id: u64,
     enqueued_ms: u64,
+    len: usize,
     ok: bool,
 }
 
@@ -56,23 +57,29 @@ async fn run(
     name: String,
     store: Store,
     queue_id: u64,
-    recovered: Vec<(u64, u32, u64)>,
+    recovered: Vec<(u64, u32, u64, usize)>,
     mut rx: mpsc::Receiver<QueueMsg>,
     policy: EffectivePolicy,
 ) {
     let mut subs: Vec<Subscriber> = Vec::new();
-    // In-flight → (owner, enqueue time) so a requeue re-arms lazy TTL.
-    let mut inflight: HashMap<u64, (SubId, u64)> = HashMap::new();
-    // Dispatchable ids in FIFO (id) order → enqueue time (for lazy TTL),
+    // In-flight → (owner, enqueue time, body length) so a requeue re-arms
+    // lazy TTL and settles release the byte budget.
+    let mut inflight: HashMap<u64, (SubId, u64, usize)> = HashMap::new();
+    // Dispatchable ids in FIFO (id) order → (enqueue time, body length),
     // seeded by the recovery scan.
-    let mut ready: BTreeMap<u64, u64> = recovered.iter().map(|(id, _, ms)| (*id, *ms)).collect();
+    let mut ready: BTreeMap<u64, (u64, usize)> = recovered
+        .iter()
+        .map(|(id, _, ms, len)| (*id, (*ms, *len)))
+        .collect();
     // Failed-attempt counters (only entries with failures).
     let mut failures: HashMap<u64, u32> = recovered
         .iter()
-        .filter(|(_, f, _)| *f > 0)
-        .map(|(id, f, _)| (*id, *f))
+        .filter(|(_, f, _, _)| *f > 0)
+        .map(|(id, f, _, _)| (*id, *f))
         .collect();
-    let mut next_msg_id: u64 = recovered.iter().map(|(id, _, _)| *id).max().unwrap_or(0);
+    let mut next_msg_id: u64 = recovered.iter().map(|(id, _, _, _)| *id).max().unwrap_or(0);
+    // Bytes of message bodies held (ready + inflight + pending publishes).
+    let mut bytes: usize = recovered.iter().map(|(_, _, _, len)| *len).sum();
     let mut commits: FuturesUnordered<CommitFuture> = FuturesUnordered::new();
     let mut publishes_pending: usize = 0;
     // Capacity slots held for transaction commits.
@@ -98,35 +105,40 @@ async fn run(
                         if from_reserved {
                             reserved = reserved.saturating_sub(1);
                         }
-                        if ready.len() + inflight.len() + publishes_pending + reserved
-                            >= policy.max_len
-                        {
-                            // Drop-head makes room (dead-lettering the
-                            // displaced message); otherwise refuse.
-                            let dropped = policy
-                                .drop_head
-                                .then(|| ready.pop_first())
-                                .flatten();
-                            match dropped {
-                                Some((old_id, _)) => {
-                                    failures.remove(&old_id);
-                                    dead_letter_then_remove(
-                                        &name, &policy, &store, queue_id, old_id, "maxlen",
-                                    )
-                                    .await;
-                                }
-                                // A reserved publish is never refused: its
-                                // slot was admitted at Reserve time.
-                                None if from_reserved => {}
-                                None => {
-                                    refuse_publish(&name, ack);
-                                    continue;
-                                }
+                        // At a bound (depth or bytes): drop-head makes room
+                        // (dead-lettering displaced messages); otherwise
+                        // refuse.
+                        let over = |ready_len: usize, bytes_now: usize| {
+                            ready_len + inflight.len() + publishes_pending + reserved
+                                >= policy.max_len
+                                || bytes_now.saturating_add(body.len()) > policy.max_bytes
+                        };
+                        let mut needs_room = over(ready.len(), bytes);
+                        if needs_room && policy.drop_head {
+                            while needs_room {
+                                let Some((old_id, (_, old_len))) = ready.pop_first() else {
+                                    break;
+                                };
+                                bytes = bytes.saturating_sub(old_len);
+                                failures.remove(&old_id);
+                                dead_letter_then_remove(
+                                    &name, &policy, &store, queue_id, old_id, "maxlen",
+                                )
+                                .await;
+                                needs_room = over(ready.len(), bytes);
                             }
+                        }
+                        // A reserved publish is never refused for depth: its
+                        // slot was admitted at Reserve time.
+                        if needs_room && !from_reserved {
+                            refuse_publish(&name, ack);
+                            continue;
                         }
                         next_msg_id += 1;
                         let msg_id = next_msg_id;
                         publishes_pending += 1;
+                        let len = body.len();
+                        bytes = bytes.saturating_add(len);
                         let enqueued_ms = now_ms();
                         let (done_tx, done_rx) = oneshot::channel();
                         // Bounded writer channel: a saturated disk
@@ -143,7 +155,7 @@ async fn run(
                             .is_ok();
                         commits.push(Box::pin(async move {
                             let ok = submitted && done_rx.await.unwrap_or(false);
-                            Committed { ack, msg_id, enqueued_ms, ok }
+                            Committed { ack, msg_id, enqueued_ms, len, ok }
                         }));
                     }
                     QueueMsg::Reserve { count, reply } => {
@@ -173,25 +185,29 @@ async fn run(
                         }
                     }
                     QueueMsg::Settle { sub, msg_id, outcome } => {
-                        if inflight.get(&msg_id).map(|(owner, _)| owner) != Some(&sub) {
+                        if inflight.get(&msg_id).map(|(owner, _, _)| owner) != Some(&sub) {
                             continue;
                         }
-                        let enqueue_time = inflight.remove(&msg_id).map(|(_, ms)| ms);
+                        let Some((_, enqueue_time, len)) = inflight.remove(&msg_id) else {
+                            continue;
+                        };
                         match outcome {
                             SettleOutcome::Ack | SettleOutcome::Drop => {
                                 failures.remove(&msg_id);
+                                bytes = bytes.saturating_sub(len);
                                 let _ = store
                                     .submit(StoreOp::Remove { queue: queue_id, msg_id })
                                     .await;
                             }
                             SettleOutcome::Requeue => {
-                                ready.insert(msg_id, enqueue_time.unwrap_or_else(now_ms));
+                                ready.insert(msg_id, (enqueue_time, len));
                             }
                             SettleOutcome::RequeueFailed => {
                                 let count = failures.entry(msg_id).or_insert(0);
                                 *count += 1;
                                 if policy.attempts_exhausted(*count) {
                                     failures.remove(&msg_id);
+                                    bytes = bytes.saturating_sub(len);
                                     dead_letter_then_remove(
                                         &name,
                                         &policy,
@@ -202,7 +218,7 @@ async fn run(
                                     )
                                     .await;
                                 } else {
-                                    ready.insert(msg_id, enqueue_time.unwrap_or_else(now_ms));
+                                    ready.insert(msg_id, (enqueue_time, len));
                                     let _ = store
                                         .submit(StoreOp::Fail { queue: queue_id, msg_id })
                                         .await;
@@ -219,17 +235,17 @@ async fn run(
                     }
                     QueueMsg::Unsubscribe { sub } => {
                         subs.retain(|s| s.id != sub);
-                        let mut requeued: Vec<(u64, u64)> = Vec::new();
-                        inflight.retain(|msg_id, (owner, ms)| {
+                        let mut requeued: Vec<(u64, u64, usize)> = Vec::new();
+                        inflight.retain(|msg_id, (owner, ms, len)| {
                             if *owner == sub {
-                                requeued.push((*msg_id, *ms));
+                                requeued.push((*msg_id, *ms, *len));
                                 false
                             } else {
                                 true
                             }
                         });
-                        for (id, ms) in requeued {
-                            ready.insert(id, ms);
+                        for (id, ms, len) in requeued {
+                            ready.insert(id, (ms, len));
                         }
                     }
                 }
@@ -237,9 +253,10 @@ async fn run(
             Some(done) = commits.next() => {
                 publishes_pending -= 1;
                 if done.ok {
-                    ready.insert(done.msg_id, done.enqueued_ms);
+                    ready.insert(done.msg_id, (done.enqueued_ms, done.len));
                     confirm_publish(done.ack);
                 } else {
+                    bytes = bytes.saturating_sub(done.len);
                     tracing::warn!(queue = %name, "durable publish not committed");
                     refuse_publish(&name, done.ack);
                 }
@@ -256,6 +273,7 @@ async fn run(
             &mut failures,
             &mut subs,
             &mut rr,
+            &mut bytes,
         )
         .await;
     }
@@ -306,21 +324,23 @@ async fn dispatch(
     policy: &EffectivePolicy,
     store: &Store,
     queue_id: u64,
-    inflight: &mut HashMap<u64, (SubId, u64)>,
-    ready: &mut BTreeMap<u64, u64>,
+    inflight: &mut HashMap<u64, (SubId, u64, usize)>,
+    ready: &mut BTreeMap<u64, (u64, usize)>,
     failures: &mut HashMap<u64, u32>,
     subs: &mut Vec<Subscriber>,
     rr: &mut usize,
+    bytes: &mut usize,
 ) {
     // Lazy TTL: expire from the head before dispatching.
     if policy.ttl_ms.is_some() {
         let now = now_ms();
-        while let Some((&id, &ms)) = ready.first_key_value() {
+        while let Some((&id, &(ms, len))) = ready.first_key_value() {
             if !policy.expired(ms, now) {
                 break;
             }
             ready.remove(&id);
             failures.remove(&id);
+            *bytes = bytes.saturating_sub(len);
             dead_letter_then_remove(name, policy, store, queue_id, id, "expired").await;
         }
     }
@@ -329,7 +349,7 @@ async fn dispatch(
             return;
         };
 
-        let (&msg_id, &enqueued_ms) = ready.first_key_value().expect("non-empty");
+        let (&msg_id, &(enqueued_ms, len)) = ready.first_key_value().expect("non-empty");
         let Some(body) = store.body(queue_id, msg_id) else {
             // Removed under us (settled remove racing a reinsert): drop the
             // stale id and continue.
@@ -350,10 +370,10 @@ async fn dispatch(
             body,
         };
         if sub.conn.send(cmd).is_ok() {
-            inflight.insert(msg_id, (sub_id, enqueued_ms));
+            inflight.insert(msg_id, (sub_id, enqueued_ms, len));
         } else {
             tracing::debug!(queue = %name, sub = sub_id, "subscriber connection closed");
-            ready.insert(msg_id, enqueued_ms);
+            ready.insert(msg_id, (enqueued_ms, len));
             subs.retain(|s| s.id != sub_id);
         }
     }

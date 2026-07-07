@@ -26,6 +26,13 @@ pub struct BrokerConfig {
     /// publishes (`rejected`, `resource-limit-exceeded`). Bounded always —
     /// an unbounded queue is an OOM (broker.md §3.2).
     pub max_queue_depth: usize,
+    /// Maximum BYTES of message bodies a queue holds (ready + unacked)
+    /// before refusing publishes. The depth bound alone admits
+    /// `max_queue_depth × max_message_size` (~16 TiB at the defaults) — this
+    /// is the actual memory bound for transient and in-memory quorum queues
+    /// (and the disk bound for durable ones). Overridden per queue by
+    /// [`QueuePolicy::max_length_bytes`]. `0` disables (not recommended).
+    pub max_queue_bytes: usize,
     /// Maximum number of concurrently established connections. Once reached,
     /// further accepted sockets are closed immediately (rather than spawning
     /// unbounded per-connection state) — a network-facing DoS guard. Each
@@ -82,6 +89,9 @@ pub struct QueuePolicy {
     /// Maximum messages held (ready + unacked), overriding the broker-wide
     /// `max_queue_depth` for matching queues.
     pub max_length: Option<usize>,
+    /// Maximum bytes of message bodies held (ready + unacked), overriding
+    /// the broker-wide `max_queue_bytes` for matching queues.
+    pub max_length_bytes: Option<usize>,
     /// What happens to a publish that would exceed `max_length`.
     pub overflow: OverflowBehavior,
     /// Where expired / dropped / delivery-exhausted messages go: any queue
@@ -159,6 +169,7 @@ impl Default for BrokerConfig {
             initial_credit: 512,
             max_message_size: Some(16 * 1024 * 1024),
             max_queue_depth: 1_000_000,
+            max_queue_bytes: 1024 * 1024 * 1024,
             max_connections: 16_384,
             max_queues: 100_000,
             cluster: None,
