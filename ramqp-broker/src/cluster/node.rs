@@ -603,7 +603,7 @@ impl ClusterNode {
                     Bytes::new(),
                 )
                 .await
-                && let Ok(Some(leader)) = bincode::deserialize::<Option<NodeId>>(&body)
+                && let Ok(Some(leader)) = crate::serde_bin::from_slice::<Option<NodeId>>(&body)
             {
                 return Some(leader);
             }
@@ -742,12 +742,13 @@ impl ClusterNode {
             .conn()
             .await
             .map_err(|e| MetaWriteError::Other(e.to_string()))?;
-        let body = bincode::serialize(cmd).map_err(|e| MetaWriteError::Other(e.to_string()))?;
+        let body =
+            crate::serde_bin::to_vec(cmd).map_err(|e| MetaWriteError::Other(e.to_string()))?;
         let reply = conn
             .call(RequestKind::MetaWrite, Bytes::from(body))
             .await
             .map_err(MetaWriteError::Other)?;
-        bincode::deserialize::<Result<MetaResponse, MetaWriteError>>(&reply)
+        crate::serde_bin::from_slice::<Result<MetaResponse, MetaWriteError>>(&reply)
             .map_err(|e| MetaWriteError::Other(e.to_string()))?
     }
 
@@ -830,7 +831,7 @@ pub(crate) fn rendezvous_placement(name: &str, nodes: &[NodeId], want: usize) ->
     placement
 }
 
-/// The generic fabric-backed Raft network: serializes RPCs with bincode and
+/// The generic fabric-backed Raft network: serializes RPCs with serde_bin and
 /// rides the shared per-peer connection, tagged with the group id.
 #[derive(Debug, Clone)]
 pub(crate) struct FabricNetworkFactory {
@@ -880,7 +881,7 @@ impl FabricRaftConn {
                 &std::io::Error::other(msg),
             ))
         };
-        let body = bincode::serialize(rpc).map_err(|e| unreachable(e.to_string()))?;
+        let body = crate::serde_bin::to_vec(rpc).map_err(|e| unreachable(e.to_string()))?;
         let conn = self
             .peer
             .conn()
@@ -894,7 +895,7 @@ impl FabricRaftConn {
             .await
             .map_err(unreachable)?;
         let result: Result<Resp, E> =
-            bincode::deserialize(&reply).map_err(|e| unreachable(e.to_string()))?;
+            crate::serde_bin::from_slice(&reply).map_err(|e| unreachable(e.to_string()))?;
         result.map_err(|e| {
             openraft::error::RPCError::RemoteError(openraft::error::RemoteError::new(
                 self.target,
@@ -1107,15 +1108,15 @@ async fn handle_request(
             let node = node.clone();
             let writer = writer.clone();
             tokio::spawn(async move {
-                let result: Result<MetaResponse, MetaWriteError> = match bincode::deserialize(&body)
-                {
-                    Ok(cmd) => node.local_meta_write(&cmd).await,
-                    Err(e) => Err(MetaWriteError::Other(e.to_string())),
-                };
+                let result: Result<MetaResponse, MetaWriteError> =
+                    match crate::serde_bin::from_slice(&body) {
+                        Ok(cmd) => node.local_meta_write(&cmd).await,
+                        Err(e) => Err(MetaWriteError::Other(e.to_string())),
+                    };
                 send_reply(
                     &writer,
                     corr,
-                    bincode::serialize(&result).map_err(|e| e.to_string()),
+                    crate::serde_bin::to_vec(&result).map_err(|e| e.to_string()),
                 );
             });
         }
@@ -1141,7 +1142,7 @@ async fn handle_request(
             send_reply(
                 writer,
                 corr,
-                bincode::serialize(&leader).map_err(|e| e.to_string()),
+                crate::serde_bin::to_vec(&leader).map_err(|e| e.to_string()),
             );
         }
         RequestKind::Publish { queue } => {
@@ -1183,7 +1184,7 @@ async fn handle_request(
                 send_reply(
                     &writer,
                     corr,
-                    bincode::serialize(&ok).map_err(|e| e.to_string()),
+                    crate::serde_bin::to_vec(&ok).map_err(|e| e.to_string()),
                 );
             });
         }
@@ -1206,7 +1207,7 @@ async fn handle_request(
                 send_reply(
                     &writer,
                     corr,
-                    bincode::serialize(&outcome).map_err(|e| e.to_string()),
+                    crate::serde_bin::to_vec(&outcome).map_err(|e| e.to_string()),
                 );
             });
         }
@@ -1259,21 +1260,21 @@ where
     match kind {
         RaftKind::AppendEntries => {
             let rpc: openraft::raft::AppendEntriesRequest<C> =
-                bincode::deserialize(body).map_err(|e| e.to_string())?;
+                crate::serde_bin::from_slice(body).map_err(|e| e.to_string())?;
             let result = raft.append_entries(rpc).await;
-            bincode::serialize(&result).map_err(|e| e.to_string())
+            crate::serde_bin::to_vec(&result).map_err(|e| e.to_string())
         }
         RaftKind::Vote => {
             let rpc: openraft::raft::VoteRequest<NodeId> =
-                bincode::deserialize(body).map_err(|e| e.to_string())?;
+                crate::serde_bin::from_slice(body).map_err(|e| e.to_string())?;
             let result = raft.vote(rpc).await;
-            bincode::serialize(&result).map_err(|e| e.to_string())
+            crate::serde_bin::to_vec(&result).map_err(|e| e.to_string())
         }
         RaftKind::InstallSnapshot => {
             let rpc: openraft::raft::InstallSnapshotRequest<C> =
-                bincode::deserialize(body).map_err(|e| e.to_string())?;
+                crate::serde_bin::from_slice(body).map_err(|e| e.to_string())?;
             let result = raft.install_snapshot(rpc).await;
-            bincode::serialize(&result).map_err(|e| e.to_string())
+            crate::serde_bin::to_vec(&result).map_err(|e| e.to_string())
         }
     }
 }
@@ -1435,7 +1436,7 @@ fn send_publish_status(writer: &mpsc::UnboundedSender<OutFrame>, corr: u64, stat
     send_reply(
         writer,
         corr,
-        bincode::serialize(&status).map_err(|e| e.to_string()),
+        crate::serde_bin::to_vec(&status).map_err(|e| e.to_string()),
     );
 }
 

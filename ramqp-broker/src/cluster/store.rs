@@ -83,11 +83,11 @@ impl ReplicatedState for MetaState {
     }
 
     fn snapshot_bytes(&self) -> Result<Vec<u8>, String> {
-        bincode::serialize(self).map_err(|e| e.to_string())
+        crate::serde_bin::to_vec(self).map_err(|e| e.to_string())
     }
 
     fn restore_snapshot(&mut self, bytes: &[u8]) -> Result<(), String> {
-        *self = bincode::deserialize(bytes).map_err(|e| e.to_string())?;
+        *self = crate::serde_bin::from_slice(bytes).map_err(|e| e.to_string())?;
         Ok(())
     }
 }
@@ -131,7 +131,7 @@ pub enum SnapshotPersist {
 /// through here **before** the storage call returns. Restart recovery loads
 /// the same data back via [`RaftLogRecovery`].
 ///
-/// Entries and votes are pre-encoded (bincode) by the caller so the sink is
+/// Entries and votes are pre-encoded (serde_bin) by the caller so the sink is
 /// type-erased and one implementation serves every group.
 pub trait RaftLogSink: Send + Sync + std::fmt::Debug {
     /// Durably append `(index, encoded entry)` pairs; returns once fsynced.
@@ -326,21 +326,25 @@ impl<C: RaftTypeConfig, S> SharedStore<C, S> {
         {
             let mut inner = store.lock();
             if let Some(vote) = &recovery.vote {
-                inner.vote =
-                    Some(bincode::deserialize(vote).map_err(|e| format!("vote decode: {e}"))?);
+                inner.vote = Some(
+                    crate::serde_bin::from_slice(vote).map_err(|e| format!("vote decode: {e}"))?,
+                );
             }
             if let Some(purged) = &recovery.purged {
-                inner.last_purged =
-                    Some(bincode::deserialize(purged).map_err(|e| format!("purge decode: {e}"))?);
+                inner.last_purged = Some(
+                    crate::serde_bin::from_slice(purged)
+                        .map_err(|e| format!("purge decode: {e}"))?,
+                );
             }
             for (index, bytes) in &recovery.entries {
-                let entry: C::Entry = bincode::deserialize(bytes)
+                let entry: C::Entry = crate::serde_bin::from_slice(bytes)
                     .map_err(|e| format!("log entry {index} decode: {e}"))?;
                 inner.log.insert(*index, entry);
             }
             if let Some((meta_bytes, recovered_blob)) = &recovery.snapshot {
-                let meta: SnapshotMeta<NodeId, BasicNode> = bincode::deserialize(meta_bytes)
-                    .map_err(|e| format!("snapshot meta decode: {e}"))?;
+                let meta: SnapshotMeta<NodeId, BasicNode> =
+                    crate::serde_bin::from_slice(meta_bytes)
+                        .map_err(|e| format!("snapshot meta decode: {e}"))?;
                 let (data, blob) = match recovered_blob {
                     SnapshotPersist::Inline(bytes) => {
                         (bytes.clone(), SnapshotBlob::Memory(bytes.clone()))
@@ -351,7 +355,7 @@ impl<C: RaftTypeConfig, S> SharedStore<C, S> {
                         (data, SnapshotBlob::File(path.clone()))
                     }
                 };
-                let payload: SnapshotPayload = bincode::deserialize(&data)
+                let payload: SnapshotPayload = crate::serde_bin::from_slice(&data)
                     .map_err(|e| format!("snapshot payload decode: {e}"))?;
                 inner
                     .state
@@ -474,7 +478,7 @@ where
                     last_membership,
                     state_bytes,
                 };
-                let data = bincode::serialize(&payload).map_err(|e| e.to_string())?;
+                let data = crate::serde_bin::to_vec(&payload).map_err(|e| e.to_string())?;
                 // Deep paged states: park the blob on disk so the snapshot does
                 // not double the queue's RSS. Written durably — this blob may
                 // become the ONLY copy of the state once the log purges.
@@ -505,7 +509,7 @@ where
         // durable snapshot would be silent total state loss on restart),
         // file blobs by path (recovery must never point at a deleted file).
         if let Some(sink) = self.persist() {
-            let encoded = bincode::serialize(&meta)
+            let encoded = crate::serde_bin::to_vec(&meta)
                 .map_err(|e| openraft::StorageIOError::write_snapshot(None, &e))?;
             let persist_blob = match &blob {
                 SnapshotBlob::Memory(bytes) => SnapshotPersist::Inline(bytes.clone()),
@@ -551,8 +555,8 @@ where
 
     async fn save_vote(&mut self, vote: &Vote<NodeId>) -> Result<(), StorageError<NodeId>> {
         if let Some(sink) = self.persist() {
-            let encoded =
-                bincode::serialize(vote).map_err(|e| openraft::StorageIOError::write_vote(&e))?;
+            let encoded = crate::serde_bin::to_vec(vote)
+                .map_err(|e| openraft::StorageIOError::write_vote(&e))?;
             sink.save_vote(encoded)
                 .await
                 .map_err(|e| openraft::StorageIOError::write_vote(&std::io::Error::other(e)))?;
@@ -596,7 +600,7 @@ where
             for entry in &entries {
                 encoded.push((
                     entry.get_log_id().index,
-                    bincode::serialize(entry)
+                    crate::serde_bin::to_vec(entry)
                         .map_err(|e| openraft::StorageIOError::write_logs(&e))?,
                 ));
             }
@@ -630,7 +634,7 @@ where
 
     async fn purge_logs_upto(&mut self, log_id: LogId<NodeId>) -> Result<(), StorageError<NodeId>> {
         if let Some(sink) = self.persist() {
-            let marker = bincode::serialize(&log_id)
+            let marker = crate::serde_bin::to_vec(&log_id)
                 .map_err(|e| openraft::StorageIOError::write_logs(&e))?;
             sink.purge_upto(log_id.index, marker)
                 .await
@@ -693,7 +697,7 @@ where
         snapshot: Box<Cursor<Vec<u8>>>,
     ) -> Result<(), StorageError<NodeId>> {
         let data = snapshot.into_inner();
-        let payload: SnapshotPayload = bincode::deserialize(&data)
+        let payload: SnapshotPayload = crate::serde_bin::from_slice(&data)
             .map_err(|e| openraft::StorageIOError::read_snapshot(Some(meta.signature()), &e))?;
         let (blob, persist, old_blob) = {
             let mut inner = self.lock();
@@ -747,7 +751,7 @@ where
         };
         // Record the installed snapshot durably (recovery restarts from it).
         if let Some(sink) = persist {
-            let encoded = bincode::serialize(meta)
+            let encoded = crate::serde_bin::to_vec(meta)
                 .map_err(|e| openraft::StorageIOError::write_snapshot(None, &e))?;
             let persist_blob = match &blob {
                 SnapshotBlob::Memory(bytes) => SnapshotPersist::Inline(bytes.clone()),

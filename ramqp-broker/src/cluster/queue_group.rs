@@ -346,7 +346,7 @@ impl ReplicatedState for QueueState {
             spill.sync_all()?;
             spill_id = spill.id();
         }
-        bincode::serialize(&PortableState {
+        crate::serde_bin::to_vec(&PortableState {
             next_msg_id: self.next_msg_id,
             messages,
             spill_id,
@@ -355,7 +355,8 @@ impl ReplicatedState for QueueState {
     }
 
     fn restore_snapshot(&mut self, bytes: &[u8]) -> Result<(), String> {
-        let portable: PortableState = bincode::deserialize(bytes).map_err(|e| e.to_string())?;
+        let portable: PortableState =
+            crate::serde_bin::from_slice(bytes).map_err(|e| e.to_string())?;
         // Keep this state's paging config; rebuild contents.
         for (_, m) in std::mem::take(&mut self.messages) {
             self.drop_body(&m.body);

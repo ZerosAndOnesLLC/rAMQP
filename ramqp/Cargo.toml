@@ -1,6 +1,6 @@
 [package]
 name = "ramqp"
-version = "0.8.0"
+version = "0.8.1"
 edition = "2024"
 description = "Async AMQP 1.0 client for Rust on tokio — connects to RabbitMQ 4.x, ActiveMQ Artemis, and other AMQP 1.0 brokers."
 license = "MIT"
@@ -34,7 +34,7 @@ tracing = "0.1"
 [features]
 default = []
 # TLS backends
-rustls = ["dep:tokio-rustls", "dep:rustls", "dep:webpki-roots", "dep:rustls-pemfile"]
+rustls = ["dep:tokio-rustls", "dep:rustls", "dep:webpki-roots"]
 native-tls = ["dep:tokio-native-tls", "dep:native-tls"]
 # WebSocket transport
 ws = ["dep:tokio-tungstenite", "dep:http"]
@@ -57,10 +57,6 @@ features = ["ring", "std", "tls12"]
 
 [dependencies.webpki-roots]
 version = "1"
-optional = true
-
-[dependencies.rustls-pemfile]
-version = "2"
 optional = true
 
 [dependencies.tokio-native-tls]

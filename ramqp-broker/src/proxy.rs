@@ -376,7 +376,9 @@ impl Proxy {
                             .call(RequestKind::Reserve { queue, count }, Bytes::new())
                             .await
                         {
-                            Ok(body) => bincode::deserialize::<bool>(&body).unwrap_or(false),
+                            Ok(body) => {
+                                crate::serde_bin::from_slice::<bool>(&body).unwrap_or(false)
+                            }
                             Err(_) => false,
                         };
                         let _ = reply.send(ok);
@@ -648,7 +650,7 @@ impl Proxy {
                     };
                     let reply = conn.call(req, body.clone()).await;
                     let outcome = match reply.and_then(|b| {
-                        bincode::deserialize::<PublishStatus>(&b).map_err(|e| e.to_string())
+                        crate::serde_bin::from_slice::<PublishStatus>(&b).map_err(|e| e.to_string())
                     }) {
                         Ok(PublishStatus::Accepted) => PubOutcome::Accepted,
                         Ok(PublishStatus::Rejected) => PubOutcome::Rejected,
