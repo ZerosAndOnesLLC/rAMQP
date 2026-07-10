@@ -1534,7 +1534,7 @@ dependencies = [
 
 [[package]]
 name = "ramqp-broker"
-version = "0.8.27"
+version = "0.8.28"
 dependencies = [
  "bytes",
  "futures-util",
