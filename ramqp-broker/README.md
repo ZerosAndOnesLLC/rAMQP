@@ -72,6 +72,26 @@ bound.run().await
 # }
 ```
 
+## Testing
+
+Beyond the in-tree suite (`cargo test --all-features`), a re-runnable battery
+lives in [`scripts/`](scripts) — the same checks build over build, so
+regressions in correctness, memory, HA, interop, or robustness surface before a
+release. It is **not** wired into CI; run it by hand:
+
+```sh
+ramqp-broker/scripts/run-all.sh --quick   # gates + full suite (fast)
+ramqp-broker/scripts/run-all.sh           # + soak, chaos, interop, robustness, fuzz
+```
+
+Stages: static gates, the suite under a flake-repeat loop, a soak/leak detector
+(RSS-flat + no-throughput-decay under churn), chaos (rolling `kill -9` of cluster
+nodes with a zero-accepted-loss verifier, plus durable crash recovery), an
+interop matrix (`ramqp` and `fe2o3-amqp` clients × ramqp-broker / RabbitMQ /
+Artemis), robustness floods, and `cargo-fuzz` on the wire decoders. Performance
+(`scripts/bench.sh`) and coverage (`scripts/cov.sh`) are manual and never gate.
+See [`scripts/README.md`](scripts/README.md).
+
 ## Numbers
 
 Untuned first numbers vs RabbitMQ 4.3.1 and Artemis on the same machine —

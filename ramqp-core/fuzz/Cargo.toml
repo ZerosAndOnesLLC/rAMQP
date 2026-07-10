@@ -1,0 +1,37 @@
+# Fuzz targets for ramqp-core's untrusted-wire decoders. Its own `[workspace]`
+# table decouples it from the parent workspace, so a normal `cargo build` /
+# `cargo check --all-targets` at the repo root never pulls in libfuzzer or the
+# nightly sanitizer toolchain. Run via `scripts/60-fuzz.sh` (needs nightly +
+# cargo-fuzz).
+[package]
+name = "ramqp-core-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+bytes = "1"
+ramqp-core = { path = ".." }
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "decode_frame"
+path = "fuzz_targets/decode_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "value"
+path = "fuzz_targets/value.rs"
+test = false
+doc = false
+bench = false

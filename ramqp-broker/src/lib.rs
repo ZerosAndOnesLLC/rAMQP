@@ -41,6 +41,7 @@ mod proxy;
 mod queue;
 mod quorum;
 mod registry;
+mod serde_bin;
 #[cfg(feature = "store-redb")]
 mod store;
 mod txn;

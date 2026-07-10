@@ -73,26 +73,29 @@ pub async fn connect_rustls(
         .map_err(|e| ConnectError::new(ErrorKind::Tls).with_source(e))
 }
 
-/// Parse a PEM blob into a chain of DER certificates.
+/// Parse a PEM blob into a chain of DER certificates. Uses `rustls-pki-types`'
+/// built-in PEM support (the same crate that owns `CertificateDer`), so there is
+/// no separate PEM-parsing dependency.
 #[cfg(feature = "rustls")]
 fn load_certs(
     pem: &[u8],
 ) -> Result<Vec<tokio_rustls::rustls::pki_types::CertificateDer<'static>>, ConnectError> {
-    let mut reader = std::io::Cursor::new(pem);
-    rustls_pemfile::certs(&mut reader)
+    use tokio_rustls::rustls::pki_types::CertificateDer;
+    use tokio_rustls::rustls::pki_types::pem::PemObject;
+    CertificateDer::pem_slice_iter(pem)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| ConnectError::new(ErrorKind::Tls).with_source(e))
 }
 
-/// Parse a PEM blob into a single private key (PKCS#8 / PKCS#1 / SEC1).
+/// Parse a PEM blob into a single private key (PKCS#8 / PKCS#1 / SEC1). Returns
+/// an error if the blob contains no private key.
 #[cfg(feature = "rustls")]
 fn load_key(
     pem: &[u8],
 ) -> Result<tokio_rustls::rustls::pki_types::PrivateKeyDer<'static>, ConnectError> {
-    let mut reader = std::io::Cursor::new(pem);
-    rustls_pemfile::private_key(&mut reader)
-        .map_err(|e| ConnectError::new(ErrorKind::Tls).with_source(e))?
-        .ok_or_else(|| ConnectError::msg(ErrorKind::Tls, "no private key found in PEM"))
+    use tokio_rustls::rustls::pki_types::PrivateKeyDer;
+    use tokio_rustls::rustls::pki_types::pem::PemObject;
+    PrivateKeyDer::from_pem_slice(pem).map_err(|e| ConnectError::new(ErrorKind::Tls).with_source(e))
 }
 
 /// A certificate verifier that accepts any chain. Test-only; gated behind

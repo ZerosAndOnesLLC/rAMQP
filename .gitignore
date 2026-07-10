@@ -3,6 +3,14 @@
 debug
 target
 
+# Test-script run artifacts (logs, captured metrics, spawned broker data dirs)
+ramqp-broker/scripts/out/
+
+# cargo-fuzz corpora/artifacts and coverage output
+ramqp-core/fuzz/corpus/
+ramqp-core/fuzz/artifacts/
+ramqp-core/fuzz/coverage/
+
 # Stray local check binary
 /check_parsing
 

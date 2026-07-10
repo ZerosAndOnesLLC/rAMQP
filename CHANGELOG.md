@@ -5,6 +5,15 @@ All notable changes to ramqp will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.1] - unreleased
+
+### Security
+- Replaced the unmaintained `rustls-pemfile` crate (RUSTSEC-2025-0134) with the
+  PEM parsing built into `rustls-pki-types` (already present via `rustls`, and
+  the crate that owns the `CertificateDer`/`PrivateKeyDer` types we return). No
+  public API or behavior change; the `rustls` feature no longer pulls
+  `rustls-pemfile`. (#21)
+
 ## [0.8.0] - unreleased
 
 **No `Cargo.toml` or code changes needed to upgrade**: `ramqp = "0.8"` is a

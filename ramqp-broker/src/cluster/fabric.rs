@@ -10,7 +10,7 @@
 //! Hot-path shape (broker.md §3.2):
 //! - **Zero-copy bodies** — message payloads ride as the raw tail of a frame,
 //!   sliced out of the read buffer as refcounted `Bytes`; they are never run
-//!   through serde. Only the small fixed header is bincode-encoded.
+//!   through serde. Only the small fixed header is serde_bin-encoded.
 //! - **Batched writes** — the writer task drains its queue and flushes once
 //!   per wakeup, so a burst of deliveries/acks is one syscall, not N.
 //! - **Correlation ids, not lock-step RPC** — requests are pipelined and
@@ -71,9 +71,9 @@ pub enum PublishStatus {
 /// A correlated request. The body's meaning depends on the kind.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RequestKind {
-    /// Body: the bincode Raft RPC for `kind`. Reply body: its bincode result.
+    /// Body: the serde_bin Raft RPC for `kind`. Reply body: its serde_bin result.
     Raft(GroupRef, RaftKind),
-    /// Body: a bincode [`super::meta::MetaCommand`]. Reply body: bincode
+    /// Body: a serde_bin [`super::meta::MetaCommand`]. Reply body: serde_bin
     /// `Result<MetaResponse, MetaWriteError>`.
     MetaWrite,
     /// Start (or heal) this node's member of a queue group. Empty body/reply.
@@ -83,20 +83,20 @@ pub enum RequestKind {
         /// The full replica set: `(node id, fabric address)`.
         members: Vec<(NodeId, String)>,
     },
-    /// Ask which node leads a queue group. Reply body: bincode `Option<NodeId>`.
+    /// Ask which node leads a queue group. Reply body: serde_bin `Option<NodeId>`.
     WhoLeads {
         /// The queue name.
         queue: String,
     },
     /// Publish one message to a queue this node leads. Body: the raw message.
-    /// Reply body: bincode [`PublishStatus`].
+    /// Reply body: serde_bin [`PublishStatus`].
     Publish {
         /// The queue name.
         queue: String,
     },
     /// Open a subscription channel to a queue this node leads. Deliveries
     /// flow back as [`FabricHeader::Deliver`] frames carrying `sub_chan`.
-    /// Reply body: bincode `Result<(), Option<NodeId>>` (`Err` = not leader).
+    /// Reply body: serde_bin `Result<(), Option<NodeId>>` (`Err` = not leader).
     OpenSub {
         /// The queue name.
         queue: String,
@@ -105,14 +105,14 @@ pub enum RequestKind {
         sub_chan: u64,
     },
     /// Publish into a slot previously reserved via [`RequestKind::Reserve`]
-    /// (transaction commit). Body: the raw message. Reply body: bincode
+    /// (transaction commit). Body: the raw message. Reply body: serde_bin
     /// [`PublishStatus`].
     PublishReserved {
         /// The queue name.
         queue: String,
     },
     /// Reserve `count` capacity slots on a queue this node leads
-    /// (transaction commit phase 1). Reply body: bincode `bool`.
+    /// (transaction commit phase 1). Reply body: serde_bin `bool`.
     Reserve {
         /// The queue name.
         queue: String,
@@ -243,9 +243,9 @@ impl OutFrame {
 }
 
 /// Encode one frame into `out`:
-/// `[u32 total][u16 header_len][bincode header][raw body]`.
+/// `[u32 total][u16 header_len][serde_bin header][raw body]`.
 fn encode_frame(frame: &OutFrame, out: &mut BytesMut) -> std::io::Result<()> {
-    let header = bincode::serialize(&frame.header).map_err(std::io::Error::other)?;
+    let header = crate::serde_bin::to_vec(&frame.header).map_err(std::io::Error::other)?;
     let header_len = u16::try_from(header.len()).map_err(std::io::Error::other)?;
     let total = 2 + header.len() + frame.body.len();
     if total > MAX_FABRIC_FRAME {
@@ -280,7 +280,7 @@ pub async fn read_frame(
                 }
                 let header_bytes = frame.split_to(header_len);
                 let header: FabricHeader =
-                    bincode::deserialize(&header_bytes).map_err(std::io::Error::other)?;
+                    crate::serde_bin::from_slice(&header_bytes).map_err(std::io::Error::other)?;
                 return Ok((header, frame.freeze()));
             }
         }
@@ -408,7 +408,7 @@ impl ConnState {
             )
             .await;
         let outcome: Result<(), Option<NodeId>> = match reply {
-            Ok(body) => match bincode::deserialize(&body) {
+            Ok(body) => match crate::serde_bin::from_slice(&body) {
                 Ok(outcome) => outcome,
                 Err(e) => {
                     // A bad reply body still leaves the sub registered locally
@@ -674,7 +674,8 @@ mod tests {
         buf.advance(4);
         assert_eq!(buf.len(), total);
         let header_len = buf.get_u16() as usize;
-        let header: FabricHeader = bincode::deserialize(&buf.split_to(header_len)).expect("header");
+        let header: FabricHeader =
+            crate::serde_bin::from_slice(&buf.split_to(header_len)).expect("header");
         assert_eq!(
             header,
             FabricHeader::Deliver {
@@ -686,7 +687,7 @@ mod tests {
     }
 
     #[test]
-    fn raft_rpc_payloads_survive_bincode() {
+    fn raft_rpc_payloads_survive_serde_bin() {
         use openraft::raft::AppendEntriesRequest;
         use openraft::{BasicNode, Entry, EntryPayload, LogId, Vote};
 
@@ -707,9 +708,9 @@ mod tests {
             entries: vec![entry],
             leader_commit: Some(LogId::new(openraft::CommittedLeaderId::new(3, 1), 8)),
         };
-        let bytes = bincode::serialize(&req).expect("serialize");
+        let bytes = crate::serde_bin::to_vec(&req).expect("serialize");
         let back: AppendEntriesRequest<QueueTypeConfig> =
-            bincode::deserialize(&bytes).expect("deserialize");
+            crate::serde_bin::from_slice(&bytes).expect("deserialize");
         assert_eq!(back.entries.len(), 1);
         match &back.entries[0].payload {
             EntryPayload::Normal(QueueCommand::Enqueue { body, .. }) => {
@@ -726,9 +727,9 @@ mod tests {
                 (3, BasicNode::new("c:3")),
             ]),
         );
-        let bytes = bincode::serialize(&m).expect("membership serialize");
+        let bytes = crate::serde_bin::to_vec(&m).expect("membership serialize");
         let back: openraft::Membership<NodeId, BasicNode> =
-            bincode::deserialize(&bytes).expect("membership deserialize");
+            crate::serde_bin::from_slice(&bytes).expect("membership deserialize");
         assert_eq!(back.get_node(&2).map(|n| n.addr.as_str()), Some("b:2"));
     }
 
