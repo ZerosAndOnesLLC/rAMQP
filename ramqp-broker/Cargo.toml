@@ -1,6 +1,6 @@
 [package]
 name = "ramqp-broker"
-version = "0.8.28"
+version = "0.8.29"
 edition = "2024"
 description = "A performance-first, highly-available AMQP 1.0 broker in Rust (in development)."
 license = "MIT"
@@ -19,6 +19,10 @@ openraft = { version = "0.9.24", features = ["serde"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 redb = { version = "4", optional = true }
+# The daemon's global allocator (wired up in the `ramqp-brokerd` bin). glibc's
+# malloc fragments under high connection churn (issue #23); jemalloc keeps RSS
+# and throughput flat.
+tikv-jemallocator = { version = "0.7", optional = true }
 
 [dev-dependencies]
 # The published client, used as the interop peer for loopback tests.
@@ -27,5 +31,13 @@ tempfile = "3.27.0"
 tokio = { version = "1", features = ["full", "test-util"] }
 
 [features]
+# jemalloc is the daemon's default global allocator: glibc's malloc fragments
+# its per-thread arenas under high connection open/close churn, growing RSS
+# without bound and collapsing throughput (issue #23) — jemalloc keeps both flat
+# (measured: RSS +12% vs +64%, throughput -11% vs -76% over a 20-min churn
+# soak). Disable with `--no-default-features` on targets jemalloc doesn't
+# support.
+default = ["jemalloc"]
+jemalloc = ["dep:tikv-jemallocator"]
 # Durable-local queues (`/durable/<name>`) backed by the redb embedded store.
 store-redb = ["dep:redb"]

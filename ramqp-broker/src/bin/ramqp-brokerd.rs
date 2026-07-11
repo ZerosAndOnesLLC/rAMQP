@@ -18,6 +18,15 @@
 
 use ramqp_broker::{Broker, BrokerConfig, ClusterMemberConfig};
 
+// Use jemalloc as the global allocator. glibc's malloc fragments its per-thread
+// arenas under the broker's high connection open/close churn, growing RSS
+// without bound and collapsing throughput over a long run (issue #23); jemalloc
+// holds both flat. Disable with `--no-default-features` where jemalloc is
+// unavailable.
+#[cfg(feature = "jemalloc")]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 struct Args {
     listen: String,
     node_id: Option<u64>,
