@@ -43,6 +43,12 @@ A **performance-first, highly-available AMQP 1.0 broker** in Rust, built on
 cargo run -p ramqp-broker --bin ramqp-brokerd -- --listen 0.0.0.0:5672
 ```
 
+The daemon uses **jemalloc** as its global allocator by default: glibc's malloc
+fragments its per-thread arenas under high connection open/close churn, growing
+RSS and collapsing throughput over a long run (issue #23); jemalloc keeps both
+flat. Build with `--no-default-features` to opt out (e.g. on a target jemalloc
+doesn't support).
+
 `RUST_LOG` controls tracing. For a cluster, give each node an id, a fabric
 listen address, and the shared seed list:
 
