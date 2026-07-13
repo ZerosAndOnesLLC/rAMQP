@@ -185,3 +185,17 @@ jobs:
           java-version: '21'
       - name: Qpid JMS interop
         run: ramqp-broker/tests/interop/jms/run.sh
+
+  # Process-level split-brain: a 3-node quorum cluster across Linux network
+  # namespaces, iptables-partitioned into majority/minority, asserting the
+  # majority stays available, the minority refuses (never silently accepts),
+  # and no committed message is lost on heal. Needs root (netns + iptables);
+  # the script self-elevates via sudo.
+  partition:
+    name: Partition (netns split-brain)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Network-partition test
+        run: ramqp-broker/tests/partition/run.sh
