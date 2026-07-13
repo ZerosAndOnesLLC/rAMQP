@@ -7,6 +7,10 @@ license = "MIT"
 repository = "https://github.com/ZerosAndOnesLLC/rAMQP"
 keywords = ["amqp", "amqp1", "broker", "messaging", "async"]
 categories = ["network-programming", "asynchronous"]
+# Held back from crates.io: pre-alpha API surface (config/auth/addressing still
+# moving). Publish deliberately once it stabilizes — until then this guard stops
+# an accidental `cargo publish -p ramqp-broker`. (RELEASING.md, Option A.)
+publish = false
 
 [dependencies]
 ramqp-core = { path = "../ramqp-core", version = "0.2.4", features = ["transaction", "scram"] }
