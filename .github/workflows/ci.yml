@@ -167,3 +167,21 @@ jobs:
           status=$?
           kill "$broker" 2>/dev/null || true
           exit $status
+
+  # External-toolchain interop: an independent, third-party AMQP 1.0 client
+  # stack (Apache Qpid JMS, pure Java) exercising ramqp-broker — the JMS leg of
+  # broker.md Phase 10, alongside the Rust fe2o3-amqp leg in bench-compare. The
+  # runner fetches qpid-jms, compiles the client, and runs the #[ignore]d
+  # jms_interop test (which starts a loopback broker in-process).
+  interop-jms:
+    name: Interop (Qpid JMS -> ramqp-broker)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Qpid JMS interop
+        run: ramqp-broker/tests/interop/jms/run.sh
