@@ -229,3 +229,39 @@ Known limitation (documented in the code): a paged queue's snapshot keeps
 spilled bodies **external** (node-local refs) — follower catch-up *via
 snapshot* for a deep paged queue is not yet supported (log-replay catch-up
 is); segment shipping is the follow-up.
+
+## Tuned-incumbent re-run — Phase 10 (provisional)
+
+The Phase 4/6 tables above ran RabbitMQ at stock defaults; broker.md §3.4 asks
+for a re-run against a **tuned** incumbent, and for the quorum leg to be
+**durability-parity** (our quorum fsyncs its Raft log via `store-redb`, matched
+against RabbitMQ's fsync-backed quorum queue — closing the "in-memory vs fsync"
+caveat that made the Phase 6 quorum gap partly a durability gap). Every leg here
+runs **over loopback TCP against a broker process**, so the transport path is
+identical for all rows (the Phase 4 table compared ours in-process vs RabbitMQ
+in docker; this is fairer).
+
+Closed-loop e2e latency, µs, 20 000 samples ([`tuned/rabbitmq.conf`](tuned/rabbitmq.conf)):
+
+| leg | p50 | p99 | p99.9 |
+|---|--:|--:|--:|
+| ramqp-broker transient            | 92.7 | 218.6 | 424.4 |
+| RabbitMQ 4.x classic (**tuned**)  | 263.3 | 483.7 | 655.8 |
+| ramqp-broker quorum (`store-redb`, fsync) | 298.3 | 585.9 | 761.4 |
+| RabbitMQ 4.x quorum (fsync)       | 2401.3 | 4233.0 | 7982.6 |
+
+The headline holds under tuning and at durability parity: transient p50 ≈ 2.8×
+below tuned RabbitMQ classic, and — the point of the re-run — our **fsync-backed
+quorum** is ≈ 8× below RabbitMQ's fsync quorum, so the Phase 6 gap was *not*
+merely a durability artifact.
+
+> **⚠️ PROVISIONAL — indicative only.** These numbers were taken on a
+> shared/virtualized box (WSL2), not quiet bare metal, so they are directional,
+> not the "defend-forever" figures broker.md §3.4 requires. Reproduce (and
+> generate the real numbers on isolated hardware) with the one command:
+>
+> ```sh
+> bench-compare/tuned/run.sh    # stands up tuned RabbitMQ on 5673/15673, runs all legs
+> ```
+>
+> Artemis-tuned and a multi-connection load sweep are the remaining §3.4 items.
