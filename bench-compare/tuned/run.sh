@@ -31,11 +31,15 @@ RABBIT_MGMT_PORT="${RABBIT_MGMT_PORT:-15673}"
 declare -a PIDS=()
 DATA_DIR="$(mktemp -d)"
 
+ARTEMIS_IMAGE="${ARTEMIS_IMAGE:-apache/activemq-artemis:latest-alpine}"
+ARTEMIS_PORT="${ARTEMIS_PORT:-5674}"
+ARTEMIS_CORE_PORT="${ARTEMIS_CORE_PORT:-61617}"
+
 cleanup() {
     set +e
     for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null; done
     pkill -f "$BRK" 2>/dev/null
-    docker rm -f rabbit-tuned >/dev/null 2>&1
+    docker rm -f rabbit-tuned artemis-tuned >/dev/null 2>&1
     rm -rf "$DATA_DIR"
 }
 trap cleanup EXIT
@@ -61,6 +65,32 @@ curl -fsS -u guest:guest -X PUT http://localhost:$RABBIT_MGMT_PORT/api/queues/%2
 curl -fsS -u guest:guest -X PUT http://localhost:$RABBIT_MGMT_PORT/api/queues/%2F/rq_quorum \
     -H content-type:application/json -d '{"durable":true,"arguments":{"x-queue-type":"quorum"}}' >/dev/null
 echo ">> RabbitMQ queues declared (rq_classic, rq_quorum)."
+
+# --- tuned Artemis -------------------------------------------------------
+# Tuning applied at `artemis create` time (ARTEMIS_EXTRA_ARGS): NIO journal,
+# autotune off, no message paging cap — a low-latency, throughput-oriented
+# config (its best shot, mirroring the RabbitMQ tuning intent).
+echo ">> starting tuned Artemis ($ARTEMIS_IMAGE) ..."
+docker rm -f artemis-tuned >/dev/null 2>&1 || true
+docker run -d --name artemis-tuned \
+    -p $ARTEMIS_PORT:5672 -p $ARTEMIS_CORE_PORT:61616 \
+    -e ARTEMIS_USER=guest -e ARTEMIS_PASSWORD=guest \
+    -e "ARTEMIS_EXTRA_ARGS=--no-autotune --journal-type NIO --global-max-messages -1 --relax-jolokia --http-host 0.0.0.0" \
+    "$ARTEMIS_IMAGE" >/dev/null
+echo ">> waiting for Artemis + declaring an ANYCAST queue ..."
+artemis_ready=0
+for _ in $(seq 1 40); do
+    if docker exec artemis-tuned /var/lib/artemis-instance/bin/artemis queue create \
+        --name bench_artemis --address bench_artemis --anycast --durable \
+        --preserve-on-no-consumers --auto-create-address \
+        --url "tcp://localhost:61616" --user guest --password guest --silent >/dev/null 2>&1; then
+        artemis_ready=1
+        break
+    fi
+    sleep 2
+done
+[ "$artemis_ready" -eq 1 ] && echo ">> Artemis queue declared (bench_artemis)." \
+    || echo "!! Artemis did not become ready — its rows will show n/a."
 
 # --- our broker: transient + durable single-node quorum ------------------
 echo ">> starting ramqp-brokerd (transient) on :$OURS_PORT ..."
@@ -99,6 +129,7 @@ echo ">> running latency legs ($LAT_N samples each) ..."
     echo "|---|--:|--:|--:|"
     run_leg "ramqp-broker transient"            "amqp://127.0.0.1:$OURS_PORT"   "/queues/bench"
     run_leg "RabbitMQ 4.x classic (tuned)"      "amqp://guest:guest@127.0.0.1:$RABBIT_PORT" "/queues/rq_classic"
+    run_leg "Artemis (tuned, NIO)"              "amqp://guest:guest@127.0.0.1:$ARTEMIS_PORT" "bench_artemis"
     run_leg "ramqp-broker quorum (store-redb)"  "amqp://127.0.0.1:$OURS_Q_PORT" "/quorum/bench"
     run_leg "RabbitMQ 4.x quorum (fsync)"       "amqp://guest:guest@127.0.0.1:$RABBIT_PORT" "/queues/rq_quorum"
 } | tee "$OUT"
