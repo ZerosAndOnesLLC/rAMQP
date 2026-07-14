@@ -120,6 +120,17 @@ probe "amqp://$SUBNET.1:5672" "$QUEUE" expect-accept 3 \
     || fail "majority {n1,n2} refused a publish it should have accepted"
 log "majority accepted 3 more (8 committed total)."
 
+# Multi-connection load sweep: sustained concurrent producers against the
+# majority DURING the partition (8 connections x 5 = 40 publishes), all accepted.
+LOAD_CONNS=8
+LOAD_PER=5
+LOAD_TOTAL=$((LOAD_CONNS * LOAD_PER))
+log "majority load sweep: $LOAD_CONNS connections x $LOAD_PER publishes to n1 ..."
+load_out="$(probe "amqp://$SUBNET.1:5672" "$QUEUE" load "$LOAD_CONNS" "$LOAD_PER")" \
+    || fail "majority dropped a publish under concurrent load: $load_out"
+log "load sweep: $load_out (all accepted)."
+COMMITTED=$((8 + LOAD_TOTAL))
+
 # --- minority must refuse, never silently accept ------------------------
 log "minority check: publishing to n3 (expect REFUSED, never accepted) ..."
 probe "amqp://$SUBNET.3:5672" "$QUEUE" expect-refused 3 \
@@ -132,11 +143,12 @@ ip netns exec ns3 iptables -F
 sleep 6
 
 log "consuming from n1 to check for loss ..."
-out="$(probe "amqp://$SUBNET.1:5672" "$QUEUE" consume 20)" || fail "consume probe failed"
+out="$(probe "amqp://$SUBNET.1:5672" "$QUEUE" consume $((COMMITTED + 20)))" || fail "consume probe failed"
 got="$(echo "$out" | sed -n 's/^CONSUMED \([0-9]*\)$/\1/p')"
 [ -n "$got" ] || fail "could not parse consume output: $out"
-log "consumed $got messages (expected >= 8 committed)."
-[ "$got" -ge 8 ] || fail "message loss: only $got of the 8 committed messages survived"
+log "consumed $got messages (expected >= $COMMITTED committed)."
+[ "$got" -ge "$COMMITTED" ] \
+    || fail "message loss: only $got of the $COMMITTED committed messages survived"
 
 echo
-echo "PARTITION TEST PASSED: majority available, minority refused, no committed-message loss."
+echo "PARTITION TEST PASSED: majority available (incl. $LOAD_TOTAL-publish concurrent load), minority refused, no committed-message loss."

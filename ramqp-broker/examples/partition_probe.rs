@@ -13,6 +13,10 @@
 //!                       silent-loss guard)
 //!     consume         — drain up to `count` messages within a window and print
 //!                       the number received (always exit 0)
+//!     load            — `count` concurrent connections each send `[arg5]`
+//!                       messages; exit 0 iff every send is accepted (a
+//!                       multi-connection availability sweep). Prints
+//!                       "LOADED <accepted>/<expected>".
 
 use std::time::Duration;
 
@@ -37,6 +41,12 @@ async fn main() {
         "expect-accept" => run_expect_accept(&url, &address, count).await,
         "expect-refused" => run_expect_refused(&url, &address, count).await,
         "consume" => run_consume(&url, &address, count).await,
+        "load" => {
+            // load <connections=count(arg4)> <per_conn(arg5)>
+            let connections = count.max(1);
+            let per_conn: usize = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(1);
+            run_load(&url, &address, connections, per_conn).await
+        }
         other => {
             eprintln!("unknown mode: {other}");
             2
@@ -168,4 +178,46 @@ async fn run_consume(url: &str, address: &str, count: usize) -> i32 {
     println!("CONSUMED {got}");
     let _ = conn.close().await;
     0
+}
+
+/// Multi-connection availability sweep: `connections` producers send `per_conn`
+/// messages each, concurrently. Exit 0 iff every send is accepted.
+async fn run_load(url: &str, address: &str, connections: usize, per_conn: usize) -> i32 {
+    let mut tasks = Vec::with_capacity(connections);
+    for c in 0..connections {
+        let url = url.to_string();
+        let address = address.to_string();
+        tasks.push(tokio::spawn(async move {
+            let Some(conn) = connect(&url).await else {
+                return 0usize;
+            };
+            let Ok(session) = conn.begin_session().await else {
+                return 0;
+            };
+            let Ok(producer) = session.create_producer(&address).await else {
+                return 0;
+            };
+            let mut ok = 0;
+            for i in 0..per_conn {
+                match tokio::time::timeout(
+                    SEND_TIMEOUT,
+                    producer.send(Message::text(format!("c{c}-m{i}"))),
+                )
+                .await
+                {
+                    Ok(Ok(_)) => ok += 1,
+                    _ => break,
+                }
+            }
+            let _ = conn.close().await;
+            ok
+        }));
+    }
+    let mut accepted = 0;
+    for t in tasks {
+        accepted += t.await.unwrap_or(0);
+    }
+    let expected = connections * per_conn;
+    println!("LOADED {accepted}/{expected}");
+    if accepted == expected { 0 } else { 1 }
 }
