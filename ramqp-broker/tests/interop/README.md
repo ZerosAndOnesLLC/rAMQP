@@ -12,7 +12,20 @@ leg lives in [`bench-compare/tests/fe2o3_interop.rs`](../../../bench-compare/tes
 | `fe2o3-amqp` | Rust (`fe2o3-amqp`) | client → our broker | `bench-compare/tests/fe2o3_interop.rs` | ✅ landed |
 | **Qpid JMS** | Java (Apache Qpid JMS 2.x, Jakarta Messaging) | client → our broker | `jms/` + `tests/jms_interop.rs` | ✅ landed |
 | **Qpid Proton** | Python/C (`python3-qpid-proton`) | client → our broker | `proton/` | ✅ landed |
-| our client → Qpid | `ramqp` | client → Qpid Broker-J | — | ⏳ pending (broker provisioning) |
+| our client → Qpid | `ramqp` | client → Qpid Broker-J | — | ⏸️ deferred (see note) |
+
+**Note on our-client → Qpid Broker-J:** attempted, deferred. Our client's
+reference-broker interop is already covered by the `interop-rabbitmq` and
+`interop-artemis` CI jobs (the `ramqp/tests/broker.rs` suite against two
+independent brokers). Adding Qpid Broker-J as a third stalled on the
+`apache/qpid-broker-j` image itself, not on rAMQP: it does not substitute
+`QPID_ADMIN_USER`/`QPID_ADMIN_PASSWORD` into its config (the admin account stays
+the literal `${QPID_ADMIN_USER}`), its Plain auth provider offers no ANONYMOUS,
+and its REST returns 405 for queue creation — so neither pre-declaring a queue
+nor connecting cleanly worked without deeper image surgery. Revisit with a
+purpose-built Broker-J config (a mounted `initial-config.json` with a plain
+password file + `nodeAutoCreationPolicies`) if a third reference broker is
+wanted.
 
 ## Qpid JMS leg
 
