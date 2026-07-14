@@ -186,6 +186,21 @@ jobs:
       - name: Qpid JMS interop
         run: ramqp-broker/tests/interop/jms/run.sh
 
+  # External-toolchain interop: Apache Qpid Proton (Python, the C-based AMQP 1.0
+  # engine) exercising ramqp-broker — a third independent stack after fe2o3-amqp
+  # (Rust) and Qpid JMS (Java). Installs proton on the runner; run.sh takes the
+  # host path.
+  interop-proton:
+    name: Interop (Qpid Proton -> ramqp-broker)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install python3-qpid-proton
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq python3-qpid-proton
+      - name: Qpid Proton interop
+        run: ramqp-broker/tests/interop/proton/run.sh
+
   # Process-level split-brain: a 3-node quorum cluster across Linux network
   # namespaces, iptables-partitioned into majority/minority, asserting the
   # majority stays available, the minority refuses (never silently accepts),

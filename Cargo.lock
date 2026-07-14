@@ -1493,7 +1493,7 @@ checksum = "dc33ff2d4973d518d823d61aa239014831e521c75da58e3df4840d3f47749d09"
 
 [[package]]
 name = "ramqp"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "base64",
  "bytes",
@@ -1534,7 +1534,7 @@ dependencies = [
 
 [[package]]
 name = "ramqp-broker"
-version = "0.8.33"
+version = "0.8.34"
 dependencies = [
  "bytes",
  "futures-util",
@@ -1553,7 +1553,7 @@ dependencies = [
 
 [[package]]
 name = "ramqp-core"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "base64",
  "bytes",

@@ -1094,7 +1094,7 @@ impl<S: IoStream> BrokerConnection<S> {
                     .sessions
                     .get(&local)
                     .expect("bound channel")
-                    .knows_link(&attach.name)
+                    .knows_link(&attach.name, attach.role)
                 {
                     // A response to a link WE initiated — of which there are
                     // none today (the broker never initiates links), so this
