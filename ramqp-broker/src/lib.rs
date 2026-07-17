@@ -5,11 +5,28 @@
 //! architecture and phased plan.
 //!
 //! # Status
-//! Phase 4 single-node MVP: TCP acceptor, server-order handshake (protocol
-//! header → SASL ANONYMOUS/PLAIN → `open`), a per-connection driver, and
-//! in-memory **transient queues** (one lock-free actor per queue) with
-//! competing consumers, credit-based dispatch, and settlement→ack/requeue.
-//! Durability lands in Phase 7; clustering (per-queue Raft) in Phases 5–6.
+//! Working, pre-1.0. Any AMQP 1.0 client connects (TCP acceptor, server-order
+//! handshake, SASL ANONYMOUS/PLAIN behind a pluggable [`auth::Authenticator`]).
+//! Three queue families, selected by address:
+//!
+//! - `/queues/<name>` — **transient**: one lock-free actor per queue,
+//!   competing consumers, credit-based dispatch, settlement → ack/requeue,
+//!   bounded depth.
+//! - `/quorum/<name>` — **quorum**: each queue its own Raft group (openraft);
+//!   the accepted disposition is the replicated-commit durability confirm.
+//! - `/durable/<name>` — **durable** (feature `store-redb` + a `data_dir`):
+//!   on-disk via redb, group-commit fsync, full restart recovery.
+//!
+//! Clustering: a metadata Raft group plus a multiplexed inter-node fabric;
+//! any node serves any queue via leader-following proxying, with failover.
+//! Per-queue policies (TTL, length bounds, overflow, dead-lettering,
+//! delivery-attempt caps), transactions, and a Prometheus/JSON management
+//! endpoint are in. Interop is exercised against the `ramqp` and
+//! `fe2o3-amqp` clients, JMS (Qpid JMS), and Qpid Proton.
+//!
+//! The API (notably [`config::BrokerConfig`]) is still settling — hence
+//! `#[non_exhaustive]` config types and the 0.x version. Architecture and
+//! phased plan: `broker.md` in the repository.
 //!
 //! ```no_run
 //! use ramqp_broker::{Broker, BrokerConfig};

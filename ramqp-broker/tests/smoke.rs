@@ -98,10 +98,8 @@ async fn sessions_can_end_and_reopen() {
 
 #[tokio::test]
 async fn connection_limit_refuses_excess_then_recovers() {
-    let config = BrokerConfig {
-        max_connections: 1,
-        ..Default::default()
-    };
+    let mut config = BrokerConfig::default();
+    config.max_connections = 1;
     let (addr, shutdown) = start(Broker::new(config)).await;
 
     // The first connection establishes and holds the sole permit.

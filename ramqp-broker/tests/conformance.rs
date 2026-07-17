@@ -160,11 +160,9 @@ mod error_conditions {
     /// the inbound-handshake timeout fires, observed as EOF on our end.
     #[tokio::test]
     async fn stalled_handshake_is_timed_out() {
-        let config = BrokerConfig {
-            connection: ConnectionConfig {
-                connect_timeout: Some(std::time::Duration::from_millis(200)),
-                ..Default::default()
-            },
+        let mut config = BrokerConfig::default();
+        config.connection = ConnectionConfig {
+            connect_timeout: Some(std::time::Duration::from_millis(200)),
             ..Default::default()
         };
         let lb = loopback_with(Broker::new(config)).await;

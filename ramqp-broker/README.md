@@ -1,13 +1,17 @@
 # ramqp-broker
 
 A **performance-first, highly-available AMQP 1.0 broker** in Rust, built on
-[`ramqp-core`](../ramqp-core) — the same clean-room protocol engine as the
-[`ramqp`](https://crates.io/crates/ramqp) client.
+[`ramqp-core`](https://crates.io/crates/ramqp-core) — the same clean-room
+protocol engine as the [`ramqp`](https://crates.io/crates/ramqp) client.
 
-> **Status: in development, working.** The design, performance targets, and
-> phased plan live in [`broker.md`](../broker.md) at the repository root; its
-> §11 checkboxes are the live status. Not yet published to crates.io (the API
-> is pre-alpha).
+> **Status: working, pre-1.0.** The wire protocol, queue semantics, and HA
+> behavior are exercised by a conformance suite, cross-client interop
+> (`ramqp`, `fe2o3-amqp`, Qpid JMS, Qpid Proton), and partition/chaos tests.
+> The **Rust API is still settling** (config types are `#[non_exhaustive]`);
+> expect additive change across 0.x. The design, performance targets, and
+> phased plan live in
+> [`broker.md`](https://github.com/ZerosAndOnesLLC/rAMQP/blob/main/broker.md)
+> in the repository.
 
 ## Working today
 
@@ -40,8 +44,12 @@ A **performance-first, highly-available AMQP 1.0 broker** in Rust, built on
 ## Run it
 
 ```sh
-cargo run -p ramqp-broker --bin ramqp-brokerd -- --listen 0.0.0.0:5672
+cargo install ramqp-broker            # installs the ramqp-brokerd daemon
+ramqp-brokerd --listen 0.0.0.0:5672
 ```
+
+(or from a repo checkout:
+`cargo run -p ramqp-broker --bin ramqp-brokerd -- --listen 0.0.0.0:5672`)
 
 The daemon uses **jemalloc** as its global allocator by default: glibc's malloc
 fragments its per-thread arenas under high connection open/close churn, growing
@@ -67,7 +75,8 @@ RAMQP_URL=amqp://localhost:5672 RAMQP_ADDRESS=/queues/demo \
     cargo run -p ramqp --example produce_consume
 ```
 
-Or embed it:
+Or embed it (`ramqp-broker = "0.9"` in `Cargo.toml`; add the `store-redb`
+feature for `/durable/*` queues):
 
 ```rust,no_run
 use ramqp_broker::{Broker, BrokerConfig};
@@ -81,7 +90,9 @@ bound.run().await
 ## Testing
 
 Beyond the in-tree suite (`cargo test --all-features`), a re-runnable battery
-lives in [`scripts/`](scripts) — the same checks build over build, so
+lives in
+[`scripts/`](https://github.com/ZerosAndOnesLLC/rAMQP/tree/main/ramqp-broker/scripts)
+— the same checks build over build, so
 regressions in correctness, memory, HA, interop, or robustness surface before a
 release. It is **not** wired into CI; run it by hand:
 
@@ -96,14 +107,16 @@ nodes with a zero-accepted-loss verifier, plus durable crash recovery), an
 interop matrix (`ramqp` and `fe2o3-amqp` clients × ramqp-broker / RabbitMQ /
 Artemis), robustness floods, and `cargo-fuzz` on the wire decoders. Performance
 (`scripts/bench.sh`) and coverage (`scripts/cov.sh`) are manual and never gate.
-See [`scripts/README.md`](scripts/README.md).
+See
+[`scripts/README.md`](https://github.com/ZerosAndOnesLLC/rAMQP/blob/main/ramqp-broker/scripts/README.md).
 
 ## Numbers
 
 Untuned first numbers vs RabbitMQ 4.3.1 and Artemis on the same machine —
 2–3× lower latency at every percentile, 4–6× the throughput, at a fraction of
 the footprint — with methodology and caveats in
-[`bench-compare/README.md`](../bench-compare/README.md). Performance is the
-product here: targets and the hot-path rules are `broker.md` §3.
+[`bench-compare/README.md`](https://github.com/ZerosAndOnesLLC/rAMQP/blob/main/bench-compare/README.md).
+Performance is the product here: targets and the hot-path rules are
+`broker.md` §3.
 
 `#![forbid(unsafe_code)]`. MIT license.

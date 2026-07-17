@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.8.2] - unreleased
 
+### Added
+- **`ramqp-broker` publishes to crates.io, first release 0.9.0.** The broker
+  (transient + Raft-replicated quorum + redb-durable queues, clustering with
+  leader routing, policies, transactions, management endpoint) ships as a
+  library crate and the `ramqp-brokerd` daemon (`cargo install ramqp-broker`).
+  Its config types (`BrokerConfig`, `QueuePolicy`, `OverflowBehavior`,
+  `ClusterMemberConfig`) are now `#[non_exhaustive]` — construct via
+  `Default`/`new` and set fields — so future knobs arrive without build
+  breaks. Pre-1.0: the Rust API may still change additively across 0.x.
+
 ### Fixed
 - **`ramqp-core` (0.2.5): a session now keys links by (name, role), not name
   alone.** AMQP 1.0 §2.6.1 identifies a link by container-id + name + *role*, so

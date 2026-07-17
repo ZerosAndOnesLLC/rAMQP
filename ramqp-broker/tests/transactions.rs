@@ -249,13 +249,9 @@ async fn transactions_commit_into_quorum_queues() {
 #[tokio::test]
 async fn commit_with_a_full_queue_applies_nothing() {
     let mut config = BrokerConfig::default();
-    config.policies.push((
-        "txn-full".to_owned(),
-        ramqp_broker::QueuePolicy {
-            max_length: Some(1),
-            ..Default::default()
-        },
-    ));
+    let mut policy = ramqp_broker::QueuePolicy::default();
+    policy.max_length = Some(1);
+    config.policies.push(("txn-full".to_owned(), policy));
     let bound = Broker::new(config).bind("127.0.0.1:0").await.expect("bind");
     let addr = bound.local_addr();
     let shutdown = bound.shutdown_handle();

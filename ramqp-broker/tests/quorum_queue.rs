@@ -131,10 +131,8 @@ async fn quorum_consumer_drop_requeues_unacked() {
 
 #[tokio::test]
 async fn quorum_overflow_rejects_the_publish() {
-    let config = BrokerConfig {
-        max_queue_depth: 2,
-        ..Default::default()
-    };
+    let mut config = BrokerConfig::default();
+    config.max_queue_depth = 2;
     let (addr, shutdown) = start(config).await;
     let conn = ConnectionBuilder::new(format!("amqp://{addr}"))
         .connect()

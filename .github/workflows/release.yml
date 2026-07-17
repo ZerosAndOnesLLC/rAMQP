@@ -4,9 +4,12 @@ name: Release
 # (Settings -> Secrets and variables -> Actions). Create the token at
 # https://crates.io/settings/tokens with the "publish-update" scope.
 #
-# Publish ORDER matters (see RELEASING.md): `ramqp` depends on `ramqp-core`
-# by version, so core must land on crates.io first. `ramqp-broker` is not
-# published yet (pre-alpha); `bench-compare` is publish = false.
+# Publish ORDER matters (see RELEASING.md): `ramqp` and `ramqp-broker` both
+# depend on `ramqp-core` by version, so core must land on crates.io first.
+# `bench-compare` is publish = false.
+#
+# NOTE: the token needs the "publish-new" scope for a crate's FIRST-ever
+# publish (publish-update alone fails on a new crate name).
 
 on:
   push:
@@ -55,7 +58,29 @@ jobs:
           done
           echo "index never showed ramqp-core $core_version"; exit 1
       - name: Publish ramqp
-        run: cargo publish -p ramqp --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        # Skips cleanly if this version of ramqp is already published
+        # (e.g. a broker-only release retagging the same client version).
+        run: |
+          if cargo publish -p ramqp --token ${{ secrets.CARGO_REGISTRY_TOKEN }} 2>err.log; then
+            echo "ramqp published"
+          elif grep -q "already exists" err.log; then
+            echo "ramqp version already on crates.io; continuing"
+          else
+            cat err.log; exit 1
+          fi
+      - name: Publish ramqp-broker
+        # Same tolerance: a client-only release may retag the same broker
+        # version. The broker's registry dependency is only ramqp-core (the
+        # `ramqp` dev-dependency is path-only and stripped at packaging), so
+        # the core index wait above is the only ordering it needs.
+        run: |
+          if cargo publish -p ramqp-broker --token ${{ secrets.CARGO_REGISTRY_TOKEN }} 2>err.log; then
+            echo "ramqp-broker published"
+          elif grep -q "already exists" err.log; then
+            echo "ramqp-broker version already on crates.io; continuing"
+          else
+            cat err.log; exit 1
+          fi
 
   release:
     name: Create GitHub Release

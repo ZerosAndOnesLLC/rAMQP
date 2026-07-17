@@ -10,7 +10,12 @@ use ramqp_core::config::{ConnectionConfig, SessionConfig};
 /// `open`), guarding against a client that opens the socket then stalls
 /// (slow-loris); its client-only fields (`command_buffer`, `reconnect`) are
 /// unused by the broker.
+///
+/// Marked `#[non_exhaustive]`: construct via [`BrokerConfig::default()`] and
+/// set the fields you need — new knobs then arrive as minor-version additions
+/// instead of build breaks.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct BrokerConfig {
     /// Connection-level settings (also the source of our `open`).
     pub connection: ConnectionConfig,
@@ -84,7 +89,11 @@ pub struct BrokerConfig {
 }
 
 /// Per-queue behavior policies: TTL, length bounds, dead-lettering.
+///
+/// Marked `#[non_exhaustive]`: construct via [`QueuePolicy::default()`] and
+/// set the fields you need.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct QueuePolicy {
     /// Messages older than this are expired instead of delivered (checked
     /// lazily when a message reaches the head of the queue, RabbitMQ-classic
@@ -122,6 +131,7 @@ pub struct QueuePolicy {
 
 /// Overflow behavior at [`QueuePolicy::max_length`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum OverflowBehavior {
     /// Refuse the new publish (`rejected`, `resource-limit-exceeded`) — the
     /// default, matching the broker-wide depth cap.
@@ -149,7 +159,10 @@ pub enum OverflowBehavior {
 /// a private VLAN/VPC, a WireGuard mesh, or strict firewall rules limiting
 /// the port to the cluster's own nodes. The broker logs a warning at
 /// startup when the fabric binds a non-loopback address.
+/// Marked `#[non_exhaustive]`: construct via [`ClusterMemberConfig::new`]
+/// and adjust fields (e.g. `replicas`) afterwards.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ClusterMemberConfig {
     /// This node's id (must appear in `seeds`, unique per node).
     pub node_id: u64,
