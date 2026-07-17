@@ -35,7 +35,8 @@ mod framing {
         let lb = loopback().await;
         let mut peer = RawPeer::open(lb.addr, "conformance", 65536).await;
 
-        peer.send(0, Performative::Close(Close { error: None })).await;
+        peer.send(0, Performative::Close(Close { error: None }))
+            .await;
         match peer.wait_for_close().await {
             CloseOutcome::Clean | CloseOutcome::Dropped => {}
             CloseOutcome::Error(e) => panic!("graceful close drew an error: {}", e.condition),
@@ -95,7 +96,10 @@ mod framing {
         match read_raw_frame(&mut stream, &mut buf).await.body {
             FrameBody::Amqp(Performative::Begin(_), _) => {}
             FrameBody::Amqp(Performative::Close(c), _) => {
-                panic!("broker rejected a spec-legal oversized frame: {:?}", c.error)
+                panic!(
+                    "broker rejected a spec-legal oversized frame: {:?}",
+                    c.error
+                )
             }
             other => panic!("expected a begin response, got {other:?}"),
         }
@@ -121,7 +125,8 @@ mod error_conditions {
         let lb = loopback().await;
         let mut peer = RawPeer::open(lb.addr, "dup", 65536).await;
 
-        peer.send(0, Performative::Open(Open::new("dup-again"))).await;
+        peer.send(0, Performative::Open(Open::new("dup-again")))
+            .await;
 
         match peer.wait_for_close().await {
             CloseOutcome::Error(e) => {
@@ -172,9 +177,10 @@ mod error_conditions {
             .await
             .expect("connect");
         let mut buf = [0u8; 1];
-        let observed = tokio::time::timeout(std::time::Duration::from_secs(2), stream.read(&mut buf))
-            .await
-            .expect("broker must drop the stalled handshake well before 2s");
+        let observed =
+            tokio::time::timeout(std::time::Duration::from_secs(2), stream.read(&mut buf))
+                .await
+                .expect("broker must drop the stalled handshake well before 2s");
         assert!(
             matches!(observed, Ok(0)),
             "expected EOF from the timed-out handshake, got {observed:?}"
@@ -286,8 +292,7 @@ mod settlement {
             .create_consumer("/queues/settle-accept")
             .await
             .expect("c2");
-        let again =
-            tokio::time::timeout(std::time::Duration::from_millis(300), c2.recv()).await;
+        let again = tokio::time::timeout(std::time::Duration::from_millis(300), c2.recv()).await;
         assert!(again.is_err(), "an accepted delivery was redelivered");
 
         conn.close().await.expect("close");

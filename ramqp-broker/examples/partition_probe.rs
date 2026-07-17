@@ -89,7 +89,8 @@ async fn run_expect_accept(url: &str, address: &str, count: usize) -> i32 {
         }
     };
     for i in 0..count {
-        match tokio::time::timeout(SEND_TIMEOUT, producer.send(Message::text(format!("m{i}")))).await
+        match tokio::time::timeout(SEND_TIMEOUT, producer.send(Message::text(format!("m{i}"))))
+            .await
         {
             Ok(Ok(_)) => {}
             Ok(Err(e)) => {
@@ -122,7 +123,8 @@ async fn run_expect_refused(url: &str, address: &str, count: usize) -> i32 {
             return 0;
         }
     };
-    let producer = match tokio::time::timeout(SEND_TIMEOUT, session.create_producer(address)).await {
+    let producer = match tokio::time::timeout(SEND_TIMEOUT, session.create_producer(address)).await
+    {
         Ok(Ok(p)) => p,
         _ => {
             // Attach that hangs/fails without quorum also means nothing accepted.
@@ -132,7 +134,8 @@ async fn run_expect_refused(url: &str, address: &str, count: usize) -> i32 {
     };
     let mut refused = 0;
     for i in 0..count {
-        match tokio::time::timeout(SEND_TIMEOUT, producer.send(Message::text(format!("nq{i}")))).await
+        match tokio::time::timeout(SEND_TIMEOUT, producer.send(Message::text(format!("nq{i}"))))
+            .await
         {
             Ok(Ok(_)) => {
                 eprintln!("ACCEPTED a publish without quorum — silent-loss hazard");

@@ -274,7 +274,8 @@ impl Session {
         attach.handle = handle;
         let name = attach.name.clone();
         // Our local role for a self-initiated attach is `attach.role`.
-        self.link_handles.insert((name.clone(), attach.role), handle);
+        self.link_handles
+            .insert((name.clone(), attach.role), handle);
         let link = match attach.role {
             Role::Sender => {
                 if attach.initial_delivery_count.is_none() {
@@ -483,7 +484,8 @@ impl Session {
         let mut link = link;
         link.set_remote_handle(attach.handle);
         link.mark_attached();
-        self.link_handles.insert((attach.name.clone(), our_role), local);
+        self.link_handles
+            .insert((attach.name.clone(), our_role), local);
         self.remote_handles.bind(attach.handle, local);
         self.links.insert(local, link);
 
@@ -1525,7 +1527,10 @@ mod tests {
             )
             .expect("same-name receiver attach accepted");
 
-        assert_ne!(s.handle, r.handle, "the two links get distinct local handles");
+        assert_ne!(
+            s.handle, r.handle,
+            "the two links get distinct local handles"
+        );
 
         // A genuine duplicate (same name AND same role) is still refused.
         let (tx3, _rx3) = mpsc::channel(16);
@@ -1542,7 +1547,10 @@ mod tests {
             tx3,
             &mut transport,
         );
-        assert!(dup.is_err(), "a same-name same-role duplicate is still rejected");
+        assert!(
+            dup.is_err(),
+            "a same-name same-role duplicate is still rejected"
+        );
     }
 
     #[tokio::test]

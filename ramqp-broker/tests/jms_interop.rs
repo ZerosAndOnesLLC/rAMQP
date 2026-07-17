@@ -22,8 +22,9 @@ use harness::*;
 async fn qpid_jms_roundtrips_through_our_broker() {
     let lib = std::env::var("QPID_JMS_CP")
         .expect("QPID_JMS_CP (qpid-jms lib dir) must be set — run tests/interop/jms/run.sh");
-    let classes = std::env::var("QPID_JMS_CLASSES")
-        .expect("QPID_JMS_CLASSES (compiled JmsInterop dir) must be set — run tests/interop/jms/run.sh");
+    let classes = std::env::var("QPID_JMS_CLASSES").expect(
+        "QPID_JMS_CLASSES (compiled JmsInterop dir) must be set — run tests/interop/jms/run.sh",
+    );
 
     let lb = loopback().await;
     let url = lb.url();
