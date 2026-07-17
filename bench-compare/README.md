@@ -229,3 +229,42 @@ Known limitation (documented in the code): a paged queue's snapshot keeps
 spilled bodies **external** (node-local refs) — follower catch-up *via
 snapshot* for a deep paged queue is not yet supported (log-replay catch-up
 is); segment shipping is the follow-up.
+
+## Tuned-incumbent re-run — Phase 10 (provisional)
+
+The Phase 4/6 tables above ran RabbitMQ at stock defaults; broker.md §3.4 asks
+for a re-run against a **tuned** incumbent, and for the quorum leg to be
+**durability-parity** (our quorum fsyncs its Raft log via `store-redb`, matched
+against RabbitMQ's fsync-backed quorum queue — closing the "in-memory vs fsync"
+caveat that made the Phase 6 quorum gap partly a durability gap). Every leg here
+runs **over loopback TCP against a broker process**, so the transport path is
+identical for all rows (the Phase 4 table compared ours in-process vs RabbitMQ
+in docker; this is fairer).
+
+Closed-loop e2e latency, µs, 20 000 samples ([`tuned/rabbitmq.conf`](tuned/rabbitmq.conf);
+tuned Artemis = NIO journal + autotune off). Representative run:
+
+| leg | p50 | p99 | p99.9 |
+|---|--:|--:|--:|
+| ramqp-broker transient            | 93.7 | 263.0 | 340.4 |
+| RabbitMQ 4.x classic (**tuned**)  | 249.1 | 467.4 | 650.6 |
+| Artemis (**tuned**, NIO)          | 292.1 | 704.2 | 1132.5 |
+| ramqp-broker quorum (`store-redb`, fsync) | 304.3 | 665.3 | 866.9 |
+| RabbitMQ 4.x quorum (fsync)       | 2260.5 | 3834.4 | 7303.2 |
+
+The headline holds under tuning and at durability parity: transient p50 ≈ 2.7×
+below tuned RabbitMQ classic and ≈ 3× below tuned Artemis, and — the point of
+the re-run — our **fsync-backed quorum** is ≈ 7× below RabbitMQ's fsync quorum,
+so the Phase 6 gap was *not* merely a durability artifact.
+
+> **⚠️ PROVISIONAL — indicative only.** These numbers were taken on a
+> shared/virtualized box (WSL2), not quiet bare metal, so they are directional,
+> not the "defend-forever" figures broker.md §3.4 requires. Reproduce (and
+> generate the real numbers on isolated hardware) with the one command:
+>
+> ```sh
+> bench-compare/tuned/run.sh    # stands up tuned RabbitMQ (5673) + Artemis (5674), runs all legs
+> ```
+>
+> Remaining §3.4 items: the bare-metal run, and a latency-under-N-concurrent-
+> connections sweep (this table is single-connection closed-loop).

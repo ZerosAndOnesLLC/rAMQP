@@ -12,14 +12,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let session = conn.begin_session().await?;
     let mut consumer = session.create_consumer(&address).await?;
     let mut drained = 0usize;
-    loop {
-        match tokio::time::timeout(std::time::Duration::from_secs(1), consumer.recv()).await {
-            Ok(Ok(d)) => {
-                drained += 1;
-                consumer.accept(&d).await?;
-            }
-            _ => break,
-        }
+    while let Ok(Ok(d)) =
+        tokio::time::timeout(std::time::Duration::from_secs(1), consumer.recv()).await
+    {
+        drained += 1;
+        consumer.accept(&d).await?;
     }
     println!("drained {drained} leftover messages from {address}");
     conn.close().await?;

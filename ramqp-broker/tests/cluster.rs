@@ -34,14 +34,12 @@ async fn start_cluster(n: usize) -> Vec<Node> {
     let seeds: Vec<(u64, String)> = (1..=n as u64).zip(fabric_addrs).collect();
     let mut nodes = Vec::new();
     for (id, fabric_addr) in &seeds {
-        let config = BrokerConfig {
-            cluster: Some(ClusterMemberConfig::new(
-                *id,
-                fabric_addr.clone(),
-                seeds.clone(),
-            )),
-            ..Default::default()
-        };
+        let mut config = BrokerConfig::default();
+        config.cluster = Some(ClusterMemberConfig::new(
+            *id,
+            fabric_addr.clone(),
+            seeds.clone(),
+        ));
         let broker = Broker::new(config);
         let bound = broker
             .clone()

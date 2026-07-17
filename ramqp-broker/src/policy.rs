@@ -238,6 +238,10 @@ impl EffectivePolicy {
     /// that resolves once the copy's fate is known (durably stored, refused,
     /// or dropped). A durable source orders its own Remove after it; `None`
     /// means the message simply dropped and the caller may proceed at once.
+    ///
+    /// Only the durable store (`durable.rs`) needs the ordered variant, so it is
+    /// gated to `store-redb` to keep default-feature builds warning-clean.
+    #[cfg(feature = "store-redb")]
     pub fn dead_letter_ordered(
         &self,
         queue: &str,

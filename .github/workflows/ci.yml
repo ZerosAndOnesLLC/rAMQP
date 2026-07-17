@@ -167,3 +167,50 @@ jobs:
           status=$?
           kill "$broker" 2>/dev/null || true
           exit $status
+
+  # External-toolchain interop: an independent, third-party AMQP 1.0 client
+  # stack (Apache Qpid JMS, pure Java) exercising ramqp-broker — the JMS leg of
+  # broker.md Phase 10, alongside the Rust fe2o3-amqp leg in bench-compare. The
+  # runner fetches qpid-jms, compiles the client, and runs the #[ignore]d
+  # jms_interop test (which starts a loopback broker in-process).
+  interop-jms:
+    name: Interop (Qpid JMS -> ramqp-broker)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Qpid JMS interop
+        run: ramqp-broker/tests/interop/jms/run.sh
+
+  # External-toolchain interop: Apache Qpid Proton (Python, the C-based AMQP 1.0
+  # engine) exercising ramqp-broker — a third independent stack after fe2o3-amqp
+  # (Rust) and Qpid JMS (Java). Installs proton on the runner; run.sh takes the
+  # host path.
+  interop-proton:
+    name: Interop (Qpid Proton -> ramqp-broker)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install python3-qpid-proton
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq python3-qpid-proton
+      - name: Qpid Proton interop
+        run: ramqp-broker/tests/interop/proton/run.sh
+
+  # Process-level split-brain: a 3-node quorum cluster across Linux network
+  # namespaces, iptables-partitioned into majority/minority, asserting the
+  # majority stays available, the minority refuses (never silently accepts),
+  # and no committed message is lost on heal. Needs root (netns + iptables);
+  # the script self-elevates via sudo.
+  partition:
+    name: Partition (netns split-brain)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Network-partition test
+        run: ramqp-broker/tests/partition/run.sh

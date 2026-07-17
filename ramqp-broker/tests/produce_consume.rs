@@ -106,10 +106,8 @@ async fn consumer_handle_reuse_across_queues_never_cross_delivers() {
 /// bad address must never tear the whole session down.
 #[tokio::test]
 async fn link_refusal_keeps_the_session_alive() {
-    let config = BrokerConfig {
-        max_queues: 1,
-        ..Default::default()
-    };
+    let mut config = BrokerConfig::default();
+    config.max_queues = 1;
     let bound = Broker::new(config).bind("127.0.0.1:0").await.expect("bind");
     let addr = bound.local_addr();
     let shutdown = bound.shutdown_handle();
@@ -420,10 +418,8 @@ async fn cross_connection_produce_consume() {
 
 #[tokio::test]
 async fn queue_overflow_rejects_the_publish() {
-    let config = BrokerConfig {
-        max_queue_depth: 3,
-        ..Default::default()
-    };
+    let mut config = BrokerConfig::default();
+    config.max_queue_depth = 3;
     let bound = Broker::new(config).bind("127.0.0.1:0").await.expect("bind");
     let addr = bound.local_addr();
     let shutdown = bound.shutdown_handle();

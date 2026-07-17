@@ -1,19 +1,25 @@
 [package]
 name = "ramqp-broker"
-version = "0.8.29"
+version = "0.9.0"
 edition = "2024"
-description = "A performance-first, highly-available AMQP 1.0 broker in Rust (in development)."
+description = "A performance-first, highly-available AMQP 1.0 broker in Rust: transient, durable, and Raft-replicated quorum queues."
 license = "MIT"
 repository = "https://github.com/ZerosAndOnesLLC/rAMQP"
+readme = "README.md"
 keywords = ["amqp", "amqp1", "broker", "messaging", "async"]
 categories = ["network-programming", "asynchronous"]
-# Held back from crates.io: pre-alpha API surface (config/auth/addressing still
-# moving). Publish deliberately once it stabilizes — until then this guard stops
-# an accidental `cargo publish -p ramqp-broker`. (RELEASING.md, Option A.)
-publish = false
+
+# The integration tests drive the broker with the `ramqp` client, a path-only
+# dev-dependency that packaging strips — so inside the published .crate they
+# could never compile. Keep them out of the package (they live in the repo).
+exclude = ["tests"]
+
+[package.metadata.docs.rs]
+# Build docs with every feature so `/durable/*` (store-redb) items appear.
+all-features = true
 
 [dependencies]
-ramqp-core = { path = "../ramqp-core", version = "0.2.4", features = ["transaction", "scram"] }
+ramqp-core = { path = "../ramqp-core", version = "0.2.5", features = ["transaction", "scram"] }
 bytes = { version = "1", features = ["serde"] }
 futures-util = "0.3"
 tokio = { version = "1", features = ["sync", "io-util", "net", "rt", "rt-multi-thread", "macros", "time", "signal"] }

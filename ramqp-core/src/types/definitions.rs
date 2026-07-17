@@ -30,13 +30,24 @@ pub type MessageFormat = u32;
 
 /// The directional role of a link endpoint. Encoded as a `boolean`
 /// (`false` = sender, `true` = receiver).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Role {
     /// The endpoint is the sending side.
     #[default]
     Sender,
     /// The endpoint is the receiving side.
     Receiver,
+}
+
+impl Role {
+    /// The mirror role — what the *other* end of a link plays. A peer's `attach`
+    /// carrying role `R` references our local link endpoint of role `R.opposite()`.
+    pub fn opposite(self) -> Role {
+        match self {
+            Role::Sender => Role::Receiver,
+            Role::Receiver => Role::Sender,
+        }
+    }
 }
 
 impl Encode for Role {

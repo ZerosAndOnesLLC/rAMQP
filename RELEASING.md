@@ -9,7 +9,7 @@ releases work. This page is the checklist.
 |---|---|---|
 | `ramqp-core` | new name (verified available) | **Yes — and always first** |
 | `ramqp` | exists (0.7.2 published) | Yes, after `ramqp-core` |
-| `ramqp-broker` | new name (verified available) | **Not yet** — pre-alpha API; publish once it stabilizes |
+| `ramqp-broker` | first publish: **0.9.0** | Yes — after `ramqp-core` (its only registry dependency; the `ramqp` dev-dependency is path-only and stripped at packaging) |
 | `ramqp-bench-compare` | — | Never (`publish = false`; keeps the `fe2o3-amqp` dev dependency out of the graph) |
 
 ## Why order matters (the Cargo.toml mechanics)
@@ -29,7 +29,11 @@ fails unless a matching `ramqp-core` already exists on crates.io. Hence:
 3. `cargo publish -p ramqp`
 
 `ramqp-broker/Cargo.toml` has the same shaped dependency on `ramqp-core`, so
-the same rule applies whenever it starts publishing.
+the same rule applies to it: core first, then the broker (`release.yml` does
+core → ramqp → broker). The broker's first-ever publish needs the token to
+have the **publish-new** scope, and it resets the version to a deliberate
+**0.9.0** (the pre-publish 0.8.x patch numbers were per-commit workspace
+churn, not a release cadence).
 
 ### Keeping the version pins in sync
 

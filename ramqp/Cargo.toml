@@ -1,6 +1,6 @@
 [package]
 name = "ramqp"
-version = "0.8.1"
+version = "0.8.2"
 edition = "2024"
 description = "Async AMQP 1.0 client for Rust on tokio — connects to RabbitMQ 4.x, ActiveMQ Artemis, and other AMQP 1.0 brokers."
 license = "MIT"
@@ -18,7 +18,7 @@ name = "ramqp"
 path = "src/lib.rs"
 
 [dependencies]
-ramqp-core = { path = "../ramqp-core", version = "0.2.4" }
+ramqp-core = { path = "../ramqp-core", version = "0.2.5" }
 bytes = "1"
 thiserror = "2"
 ordered-float = "5"

@@ -82,10 +82,13 @@ pub struct Session {
     handles: HandleAllocator,
     remote_handles: RemoteHandleMap,
     links: HashMap<u32, Link>,
-    /// Index of link name -> local handle, so a peer `attach` response binds in
-    /// O(1) instead of scanning every link. Kept in lockstep with `links` via
-    /// [`Session::forget_link`].
-    link_handles: HashMap<String, u32>,
+    /// Index of (link name, our local role) -> local handle, so a peer `attach`
+    /// response binds in O(1) instead of scanning every link. Keyed by role as
+    /// well as name because AMQP 1.0 §2.6.1 identifies a link by container-id +
+    /// name + *role*: a sender and a receiver may legitimately share a name on
+    /// one session (e.g. a Qpid Proton client opening both to the same address).
+    /// Kept in lockstep with `links` via [`Session::forget_link`].
+    link_handles: HashMap<(String, Role), u32>,
     events: mpsc::UnboundedSender<SessionEvent>,
     pending_begin: Option<Reply<SessionOpened, SessionError>>,
     pending_end: Option<Reply<(), SessionError>>,
@@ -270,7 +273,9 @@ impl Session {
         };
         attach.handle = handle;
         let name = attach.name.clone();
-        self.link_handles.insert(name.clone(), handle);
+        // Our local role for a self-initiated attach is `attach.role`.
+        self.link_handles
+            .insert((name.clone(), attach.role), handle);
         let link = match attach.role {
             Role::Sender => {
                 if attach.initial_delivery_count.is_none() {
@@ -306,7 +311,12 @@ impl Session {
         attach: Attach,
         transport: &mut FramedTransport<S>,
     ) {
-        let Some(&local) = self.link_handles.get(&attach.name) else {
+        // This is the peer's *response* to a link we initiated: the frame's role
+        // is the peer's, so our local endpoint plays the opposite role.
+        let Some(&local) = self
+            .link_handles
+            .get(&(attach.name.clone(), attach.role.opposite()))
+        else {
             return;
         };
         // Only bind a link still awaiting its peer attach (ignore a duplicate
@@ -353,12 +363,15 @@ impl Session {
         }
     }
 
-    /// Whether a link with this name was initiated locally (so an inbound
-    /// `attach` for it is the peer's *response*, handled by
-    /// [`Session::on_peer_attach`]). An unknown name on a server is a
-    /// peer-initiated attach for [`Session::accept_peer_attach`].
-    pub fn knows_link(&self, name: &str) -> bool {
-        self.link_handles.contains_key(name)
+    /// Whether the link an inbound `attach` (carrying `remote_role`) refers to
+    /// was initiated locally — i.e. this attach is the peer's *response*,
+    /// handled by [`Session::on_peer_attach`]. Matched by name **and** role
+    /// (our local endpoint plays `remote_role.opposite()`), so a peer opening a
+    /// same-named link in the *other* direction is correctly seen as a new
+    /// peer-initiated attach for [`Session::accept_peer_attach`], not a response.
+    pub fn knows_link(&self, name: &str, remote_role: Role) -> bool {
+        self.link_handles
+            .contains_key(&(name.to_string(), remote_role.opposite()))
     }
 
     /// Diagnostics: per sender link, what is still queued locally, what the
@@ -399,21 +412,25 @@ impl Session {
         events: mpsc::Sender<LinkEvent>,
         transport: &mut FramedTransport<S>,
     ) -> Result<AcceptedLink, LinkError> {
-        if self.link_handles.contains_key(&attach.name) {
+        // We take the mirror role of the peer's.
+        let our_role = attach.role.opposite();
+        // Reject only a duplicate of the *same* link (name + our role); a
+        // same-named link in the other direction is a distinct link (§2.6.1).
+        if self
+            .link_handles
+            .contains_key(&(attach.name.clone(), our_role))
+        {
             return Err(LinkError::msg(
                 ErrorKind::ProtocolViolation,
-                format!("duplicate attach for link name {:?}", attach.name),
+                format!(
+                    "duplicate attach for link name {:?} (role {:?})",
+                    attach.name, our_role
+                ),
             ));
         }
         let local = self.handles.allocate().ok_or_else(|| {
             LinkError::msg(ErrorKind::Capacity, "handle-max exhausted accepting attach")
         })?;
-
-        // We take the mirror role of the peer's.
-        let our_role = match attach.role {
-            Role::Sender => Role::Receiver,
-            Role::Receiver => Role::Sender,
-        };
 
         let mut response = Attach {
             name: attach.name.clone(),
@@ -467,7 +484,8 @@ impl Session {
         let mut link = link;
         link.set_remote_handle(attach.handle);
         link.mark_attached();
-        self.link_handles.insert(attach.name.clone(), local);
+        self.link_handles
+            .insert((attach.name.clone(), our_role), local);
         self.remote_handles.bind(attach.handle, local);
         self.links.insert(local, link);
 
@@ -797,11 +815,11 @@ impl Session {
     /// `links` across the (three) detach paths.
     fn forget_link(&mut self, local: u32) {
         if let Some(link) = self.links.remove(&local) {
-            let name = match &link {
-                Link::Sender(s) => &s.name,
-                Link::Receiver(r) => &r.name,
+            let key = match &link {
+                Link::Sender(s) => (s.name.clone(), Role::Sender),
+                Link::Receiver(r) => (r.name.clone(), Role::Receiver),
             };
-            self.link_handles.remove(name);
+            self.link_handles.remove(&key);
         }
         self.handles.release(local);
     }
@@ -1398,7 +1416,7 @@ mod tests {
             other => panic!("expected detach, got {other:?}"),
         }
         // The throwaway handle was released: the session can still attach links.
-        assert!(!session.knows_link("bad"));
+        assert!(!session.knows_link("bad", Role::Sender));
     }
 
     #[tokio::test]
@@ -1461,6 +1479,78 @@ mod tests {
             }
             other => panic!("expected transfer, got {other:?}"),
         }
+    }
+
+    /// A peer may open a sender and a receiver that SHARE a link name on one
+    /// session — AMQP 1.0 §2.6.1 identifies a link by name AND role. Both must
+    /// attach. Regression: the broker once keyed links by name alone, so the
+    /// second same-named attach was misrouted/dropped, breaking Qpid Proton's
+    /// default link naming (`<container>-<address>` for both directions).
+    #[tokio::test]
+    async fn same_name_sender_and_receiver_both_attach() {
+        let begin = peer_begin();
+        let (mut session, _resp, _evt, mut transport, _far) = server_session(&begin);
+
+        // Peer's sender named "shared" (we mirror as receiver).
+        let (tx1, _rx1) = mpsc::channel(16);
+        let s = session
+            .accept_peer_attach(
+                Attach {
+                    name: "shared".into(),
+                    handle: 0,
+                    role: Role::Sender,
+                    ..Default::default()
+                },
+                CreditMode::Manual,
+                0,
+                None,
+                tx1,
+                &mut transport,
+            )
+            .expect("sender attach accepted");
+
+        // Peer's receiver with the SAME name (we mirror as sender).
+        let (tx2, _rx2) = mpsc::channel(16);
+        let r = session
+            .accept_peer_attach(
+                Attach {
+                    name: "shared".into(),
+                    handle: 1,
+                    role: Role::Receiver,
+                    ..Default::default()
+                },
+                CreditMode::Manual,
+                0,
+                None,
+                tx2,
+                &mut transport,
+            )
+            .expect("same-name receiver attach accepted");
+
+        assert_ne!(
+            s.handle, r.handle,
+            "the two links get distinct local handles"
+        );
+
+        // A genuine duplicate (same name AND same role) is still refused.
+        let (tx3, _rx3) = mpsc::channel(16);
+        let dup = session.accept_peer_attach(
+            Attach {
+                name: "shared".into(),
+                handle: 2,
+                role: Role::Sender,
+                ..Default::default()
+            },
+            CreditMode::Manual,
+            0,
+            None,
+            tx3,
+            &mut transport,
+        );
+        assert!(
+            dup.is_err(),
+            "a same-name same-role duplicate is still rejected"
+        );
     }
 
     #[tokio::test]

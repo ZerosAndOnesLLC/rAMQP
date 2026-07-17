@@ -12,9 +12,9 @@ broker — with no external AMQP dependencies anywhere.
 
 | Crate | What it is | Status |
 |---|---|---|
-| [`ramqp`](https://crates.io/crates/ramqp) | The async **client** — connects to RabbitMQ 4.x, ActiveMQ Artemis, and other AMQP 1.0 brokers | Published (0.7.2; 0.8.1 pending — see [Upgrading to 0.8](#upgrading-to-08)) |
-| `ramqp-core` | The role-agnostic **engine**: clean-room codec + type system, framing, session/link state machines, SASL (both directions) | 0.2.4, publishes together with `ramqp` 0.8.1 |
-| `ramqp-broker` | The **broker**: store-and-forward AMQP 1.0 server with transient + Raft-replicated quorum queues | In development, working — see [The broker](#the-broker-ramqp-broker) |
+| [`ramqp`](https://crates.io/crates/ramqp) | The async **client** — connects to RabbitMQ 4.x, ActiveMQ Artemis, and other AMQP 1.0 brokers | Published (0.8.1 — see [Upgrading to 0.8](#upgrading-to-08)) |
+| [`ramqp-core`](https://crates.io/crates/ramqp-core) | The role-agnostic **engine**: clean-room codec + type system, framing, session/link state machines, SASL (both directions) | Published (0.2.4) |
+| `ramqp-broker` | The **broker**: store-and-forward AMQP 1.0 server with transient, durable, and Raft-replicated quorum queues | Working, pre-1.0 — first crates.io release (0.9.0) ships with the next tag; see [The broker](#the-broker-ramqp-broker) |
 
 Everything is `#![forbid(unsafe_code)]`, async-first, and MIT.
 
@@ -106,7 +106,7 @@ What's new is *optional*, for your `Cargo.toml` only if you want it:
 ```toml
 ramqp = "0.8"          # the client, exactly as before
 ramqp-core = "0.2"     # just the engine (codec/types/state machines), no client
-ramqp-broker = "0.1"   # embed the broker (pre-alpha; API unstable, not yet published)
+ramqp-broker = "0.9"   # embed the broker (working, pre-1.0; config API still settling)
 ```
 
 A client-only build never compiles broker code, and vice versa — isolation is
@@ -117,7 +117,9 @@ by crate boundary, not feature flags.
 ## The broker (`ramqp-broker`)
 
 A performance-first, highly-available AMQP 1.0 broker on the same clean-room
-engine. **In development and moving fast** — the design, targets, and phased
+engine. **Working, pre-1.0** — the wire behavior is exercised by conformance,
+cross-client interop, and partition/chaos suites; the Rust config API is
+still settling (`#[non_exhaustive]` types). The design, targets, and phased
 plan live in [`broker.md`](broker.md); its §11 checkboxes are the live status.
 
 Working today:

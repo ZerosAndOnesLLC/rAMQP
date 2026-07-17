@@ -65,12 +65,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let samples = env_usize("DEPTH_SAMPLES", 2_000);
     let data_dir = std::env::var("DEPTH_DATA_DIR").ok();
 
-    let config = ramqp_broker::BrokerConfig {
-        max_queue_depth: target + samples * 8 + 10_000,
-        data_dir: data_dir.clone().map(Into::into),
-        resident_bytes_max: env_usize("DEPTH_RESIDENT_MAX", 64 * 1024 * 1024),
-        ..Default::default()
-    };
+    let mut config = ramqp_broker::BrokerConfig::default();
+    config.max_queue_depth = target + samples * 8 + 10_000;
+    config.data_dir = data_dir.clone().map(Into::into);
+    config.resident_bytes_max = env_usize("DEPTH_RESIDENT_MAX", 64 * 1024 * 1024);
     if let Some(dir) = &data_dir {
         // Fresh run: stale spill/snapshot dirs would skew nothing, but a
         // stale durable store would.
@@ -143,7 +141,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         received += 1;
         if received == filled {
             last = Some(d);
-        } else if received % 64 == 0 {
+        } else if received.is_multiple_of(64) {
             consumer.accept_through(&d).await?;
         }
     }

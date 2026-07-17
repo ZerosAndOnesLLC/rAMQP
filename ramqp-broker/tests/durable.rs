@@ -16,10 +16,9 @@ async fn start(config: BrokerConfig) -> (std::net::SocketAddr, ShutdownHandle) {
 }
 
 fn config_with(dir: &std::path::Path) -> BrokerConfig {
-    BrokerConfig {
-        data_dir: Some(dir.to_path_buf()),
-        ..Default::default()
-    }
+    let mut config = BrokerConfig::default();
+    config.data_dir = Some(dir.to_path_buf());
+    config
 }
 
 fn text_of(delivery: &ramqp::Delivery) -> String {
@@ -79,14 +78,10 @@ async fn durable_produce_consume_round_trip() {
 async fn durable_dead_letter_lands_in_a_durable_dlq() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut config = config_with(dir.path());
-    config.policies.push((
-        "ttl-src".to_owned(),
-        ramqp_broker::QueuePolicy {
-            message_ttl: Some(std::time::Duration::from_millis(200)),
-            dead_letter: Some("/durable/ttl-dlx".to_owned()),
-            ..Default::default()
-        },
-    ));
+    let mut policy = ramqp_broker::QueuePolicy::default();
+    policy.message_ttl = Some(std::time::Duration::from_millis(200));
+    policy.dead_letter = Some("/durable/ttl-dlx".to_owned());
+    config.policies.push(("ttl-src".to_owned(), policy));
     let (addr, shutdown) = start(config).await;
     let conn = ConnectionBuilder::new(format!("amqp://{addr}"))
         .connect()
@@ -368,14 +363,15 @@ async fn quorum_messages_survive_a_broker_restart() {
 #[tokio::test(flavor = "multi_thread")]
 async fn clustered_catalog_and_queue_survive_a_restart() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let cluster_config = |listen: String| BrokerConfig {
-        cluster: Some(ramqp_broker::ClusterMemberConfig::new(
+    let cluster_config = |listen: String| {
+        let mut config = BrokerConfig::default();
+        config.cluster = Some(ramqp_broker::ClusterMemberConfig::new(
             1,
             listen.clone(),
             vec![(1, listen)],
-        )),
-        data_dir: Some(dir.path().to_path_buf()),
-        ..Default::default()
+        ));
+        config.data_dir = Some(dir.path().to_path_buf());
+        config
     };
     // Reserve a fabric port so both lives use the same seed address.
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

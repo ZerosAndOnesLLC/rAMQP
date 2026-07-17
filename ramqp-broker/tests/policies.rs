@@ -28,17 +28,11 @@ fn text_of(delivery: &ramqp::Delivery) -> String {
 /// TTL: an expired message is dead-lettered instead of delivered.
 #[tokio::test]
 async fn expired_messages_dead_letter_instead_of_delivering() {
-    let config = BrokerConfig {
-        policies: vec![(
-            "ttl-".to_owned(),
-            QueuePolicy {
-                message_ttl: Some(Duration::from_millis(150)),
-                dead_letter: Some("/queues/dead".to_owned()),
-                ..Default::default()
-            },
-        )],
-        ..Default::default()
-    };
+    let mut policy = QueuePolicy::default();
+    policy.message_ttl = Some(Duration::from_millis(150));
+    policy.dead_letter = Some("/queues/dead".to_owned());
+    let mut config = BrokerConfig::default();
+    config.policies = vec![("ttl-".to_owned(), policy)];
     let (addr, shutdown) = start(config).await;
     let conn = ConnectionBuilder::new(format!("amqp://{addr}"))
         .connect()
@@ -89,18 +83,12 @@ async fn expired_messages_dead_letter_instead_of_delivering() {
 /// the displaced head.
 #[tokio::test]
 async fn drop_head_keeps_newest_and_dead_letters_the_oldest() {
-    let config = BrokerConfig {
-        policies: vec![(
-            "ring-".to_owned(),
-            QueuePolicy {
-                max_length: Some(3),
-                overflow: OverflowBehavior::DropHead,
-                dead_letter: Some("/queues/displaced".to_owned()),
-                ..Default::default()
-            },
-        )],
-        ..Default::default()
-    };
+    let mut policy = QueuePolicy::default();
+    policy.max_length = Some(3);
+    policy.overflow = OverflowBehavior::DropHead;
+    policy.dead_letter = Some("/queues/displaced".to_owned());
+    let mut config = BrokerConfig::default();
+    config.policies = vec![("ring-".to_owned(), policy)];
     let (addr, shutdown) = start(config).await;
     let conn = ConnectionBuilder::new(format!("amqp://{addr}"))
         .connect()
@@ -154,17 +142,11 @@ async fn drop_head_keeps_newest_and_dead_letters_the_oldest() {
 /// instead of redelivering forever.
 #[tokio::test]
 async fn delivery_limit_dead_letters_poison_messages() {
-    let config = BrokerConfig {
-        policies: vec![(
-            "poison-".to_owned(),
-            QueuePolicy {
-                max_delivery_attempts: Some(2),
-                dead_letter: Some("/queues/poison-dlx".to_owned()),
-                ..Default::default()
-            },
-        )],
-        ..Default::default()
-    };
+    let mut policy = QueuePolicy::default();
+    policy.max_delivery_attempts = Some(2);
+    policy.dead_letter = Some("/queues/poison-dlx".to_owned());
+    let mut config = BrokerConfig::default();
+    config.policies = vec![("poison-".to_owned(), policy)];
     let (addr, shutdown) = start(config).await;
     let conn = ConnectionBuilder::new(format!("amqp://{addr}"))
         .connect()
@@ -221,17 +203,11 @@ async fn delivery_limit_dead_letters_poison_messages() {
 /// failure increments and fired late (or never).
 #[tokio::test]
 async fn quorum_delivery_limit_fires_exactly() {
-    let config = BrokerConfig {
-        policies: vec![(
-            "qpoison-".to_owned(),
-            QueuePolicy {
-                max_delivery_attempts: Some(2),
-                dead_letter: Some("/queues/qpoison-dlx".to_owned()),
-                ..Default::default()
-            },
-        )],
-        ..Default::default()
-    };
+    let mut policy = QueuePolicy::default();
+    policy.max_delivery_attempts = Some(2);
+    policy.dead_letter = Some("/queues/qpoison-dlx".to_owned());
+    let mut config = BrokerConfig::default();
+    config.policies = vec![("qpoison-".to_owned(), policy)];
     let (addr, shutdown) = start(config).await;
     let conn = ConnectionBuilder::new(format!("amqp://{addr}"))
         .connect()
@@ -289,17 +265,11 @@ async fn quorum_delivery_limit_fires_exactly() {
 /// enforcement; expiry timestamps ride the replicated log).
 #[tokio::test]
 async fn quorum_queues_honor_ttl_and_dead_lettering() {
-    let config = BrokerConfig {
-        policies: vec![(
-            "qttl-".to_owned(),
-            QueuePolicy {
-                message_ttl: Some(Duration::from_millis(150)),
-                dead_letter: Some("/queues/qdead".to_owned()),
-                ..Default::default()
-            },
-        )],
-        ..Default::default()
-    };
+    let mut policy = QueuePolicy::default();
+    policy.message_ttl = Some(Duration::from_millis(150));
+    policy.dead_letter = Some("/queues/qdead".to_owned());
+    let mut config = BrokerConfig::default();
+    config.policies = vec![("qttl-".to_owned(), policy)];
     let (addr, shutdown) = start(config).await;
     let conn = ConnectionBuilder::new(format!("amqp://{addr}"))
         .connect()

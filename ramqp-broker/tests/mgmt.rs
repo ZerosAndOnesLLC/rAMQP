@@ -35,10 +35,8 @@ async fn metrics_and_queue_inspection() {
     let mgmt_addr = l.local_addr().unwrap();
     drop(l);
 
-    let config = BrokerConfig {
-        management_listen: Some(mgmt_addr.to_string()),
-        ..Default::default()
-    };
+    let mut config = BrokerConfig::default();
+    config.management_listen = Some(mgmt_addr.to_string());
     let bound = Broker::new(config).bind("127.0.0.1:0").await.expect("bind");
     let addr = bound.local_addr();
     let shutdown = bound.shutdown_handle();
