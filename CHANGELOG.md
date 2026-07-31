@@ -5,6 +5,18 @@ All notable changes to ramqp will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [ramqp-broker 0.9.2] - 2026-07-31
+
+Broker-only patch release; `ramqp` (0.8.2) and `ramqp-core` (0.2.5) are
+unchanged.
+
+### Changed
+- **Dependency refresh.** Regenerated `Cargo.lock` with the latest compatible
+  releases (clap 4.6.5, clap_builder 4.6.5, displaydoc 0.2.7, hybrid-array
+  0.4.14, tokio-macros 2.7.2). The lockfile ships inside the `ramqp-broker`
+  package, so `cargo install ramqp-broker --locked` now builds the daemon
+  against these versions. No manifest, code, or API changes.
+
 ## [ramqp-broker 0.9.1] - 2026-07-28
 
 Broker-only patch release; `ramqp` (0.8.2) and `ramqp-core` (0.2.5) are

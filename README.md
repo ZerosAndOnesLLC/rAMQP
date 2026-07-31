@@ -14,7 +14,7 @@ broker — with no external AMQP dependencies anywhere.
 |---|---|---|
 | [`ramqp`](https://crates.io/crates/ramqp) | The async **client** — connects to RabbitMQ 4.x, ActiveMQ Artemis, and other AMQP 1.0 brokers | Published (0.8.2 — see [Upgrading to 0.8](#upgrading-to-08)) |
 | [`ramqp-core`](https://crates.io/crates/ramqp-core) | The role-agnostic **engine**: clean-room codec + type system, framing, session/link state machines, SASL (both directions) | Published (0.2.5) |
-| [`ramqp-broker`](https://crates.io/crates/ramqp-broker) | The **broker**: store-and-forward AMQP 1.0 server with transient, durable, and Raft-replicated quorum queues | Published (0.9.1, pre-1.0) — see [The broker](#the-broker-ramqp-broker) |
+| [`ramqp-broker`](https://crates.io/crates/ramqp-broker) | The **broker**: store-and-forward AMQP 1.0 server with transient, durable, and Raft-replicated quorum queues | Published (0.9.2, pre-1.0) — see [The broker](#the-broker-ramqp-broker) |
 
 Everything is `#![forbid(unsafe_code)]`, async-first, and MIT.
 
