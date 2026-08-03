@@ -5,6 +5,22 @@ All notable changes to ramqp will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.3] - 2026-07-31
+
+Client-side dependency-range refresh: `ramqp` 0.8.3 + `ramqp-core` 0.2.6.
+No code or API changes; the public API remains compile-locked by
+`tests/public_api.rs`. `ramqp-broker` (0.9.2) is unchanged apart from
+syncing its `ramqp-core` pin.
+
+### Changed
+- **`base64` 0.22 → 0.23** in both `ramqp` (scram feature) and `ramqp-core`
+  (scram feature).
+- **`tokio-tungstenite` 0.29 → 0.30** in `ramqp` (ws feature). This also
+  drops the duplicate `sha1 0.10` that tungstenite 0.29 pulled alongside
+  the SCRAM stack's `sha1 0.11`.
+- Verified live against RabbitMQ 4.3.1: 6/6 broker interop tests and the
+  WebSocket bridge round-trip on the new tungstenite.
+
 ## [ramqp-broker 0.9.2] - 2026-07-31
 
 Broker-only patch release; `ramqp` (0.8.2) and `ramqp-core` (0.2.5) are
