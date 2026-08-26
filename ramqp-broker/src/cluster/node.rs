@@ -866,6 +866,9 @@ pub(crate) struct FabricRaftConn {
 type NetError<E> = openraft::error::RPCError<NodeId, BasicNode, E>;
 
 impl FabricRaftConn {
+    // The error type is dictated by openraft's `RaftNetwork` trait methods
+    // (`RPCError<NodeId, BasicNode, E>`), so its size is not ours to shrink.
+    #[allow(clippy::result_large_err)]
     async fn raft_call<Req, Resp, E>(
         &mut self,
         kind: RaftKind,
