@@ -14,7 +14,7 @@ description = "Comparison benchmark harness: ramqp vs fe2o3-amqp against a live 
 [dependencies]
 ramqp = { path = "../ramqp", features = ["ws"] }
 ramqp-broker = { path = "../ramqp-broker" }
-fe2o3-amqp = "0.17"
+fe2o3-amqp = "0.18"
 tokio = { version = "1", features = ["full"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # WebSocket->TCP proxy used to benchmark AMQP-over-WebSocket against a plain-TCP

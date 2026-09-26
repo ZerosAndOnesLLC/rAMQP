@@ -5,6 +5,26 @@ All notable changes to ramqp will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [ramqp-broker 0.9.4] - 2026-09-26
+
+Broker-only patch release; `ramqp` (0.8.3) and `ramqp-core` (0.2.6) are
+unchanged (their dependency ranges are already at the latest stable majors,
+so republishing them would ship identical packages).
+
+### Changed
+- **Dependency refresh.** Regenerated `Cargo.lock` with the latest compatible
+  releases (redb 4.3.0, uuid 1.26.1, thiserror 2.0.21, rust_decimal 1.43.0,
+  smallvec 1.16.2, clap 4.6.7, zerocopy 0.8.59, and other patch updates). The
+  lockfile ships inside the `ramqp-broker` package, so
+  `cargo install ramqp-broker --locked` now builds the daemon against these
+  versions. No manifest, code, or API changes.
+- Verified live on the refreshed lockfile: full workspace suite
+  (274 tests), RabbitMQ 4.x + ActiveMQ Artemis client interop (7/7 each),
+  TLS + WebSocket round-trips, and the Qpid JMS, Qpid Proton, and
+  fe2o3-amqp third-party interop legs against the broker.
+- Dev-only: the unpublished `bench-compare` harness moved to
+  `fe2o3-amqp` 0.18 (its interop leg passes against the broker unchanged).
+
 ## [ramqp-broker 0.9.3] - 2026-08-26
 
 Broker-only patch release; `ramqp` (0.8.3) and `ramqp-core` (0.2.6) are
