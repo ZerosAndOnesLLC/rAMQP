@@ -70,7 +70,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ANONYMOUS / PLAIN / EXTERNAL SASL are always available.
 
 Verified against live RabbitMQ 4.x and ActiveMQ Artemis — the interop suite
-runs in CI against both: SASL, open/begin/attach, credit flow, transfer, all
+runs against both in the release gate: SASL, open/begin/attach, credit flow, transfer, all
 four settlement outcomes, custom-CA TLS, AMQP-over-WebSocket, and transparent
 mid-stream reconnect.
 
@@ -202,7 +202,7 @@ cargo test --all-features     # incl. TLS / WS / SCRAM / transactions (180 tests
 cargo bench --bench codec     # codec/framing micro-benchmarks
 
 # Live-broker interop — #[ignore]d so a plain `cargo test` stays green;
-# CI runs this for real against RabbitMQ 4.x and Artemis:
+# the release gate runs this for real against RabbitMQ 4.x and Artemis:
 RAMQP_BROKER_URL=amqp://guest:guest@localhost:5672 \
 RAMQP_BROKER_ADDRESS=/queues/ramqp_it \
     cargo test --test broker -- --ignored --test-threads=1
@@ -210,6 +210,18 @@ RAMQP_BROKER_ADDRESS=/queues/ramqp_it \
 # Broker latency/throughput/RSS harness (ours in-process, or any AMQP URL):
 cargo run -p ramqp-bench-compare --release --bin latency
 ```
+
+## CI & Releases
+
+- **Pull requests** (`ci.yml`) run checks only, on GitHub-hosted `ubuntu-latest`
+  runners: `cargo fmt --check`, `cargo clippy --all-targets --all-features -D warnings`,
+  `cargo test` (default and `--all-features`), and `cargo doc` with `-D warnings`.
+  Merges to `main` don't re-run CI.
+- **Releases** (`release.yml`) run on `gh release create vX.Y.Z --generate-notes`.
+  A gate runs first on GitHub-hosted runners: all-features tests, the live-broker
+  interop suites (RabbitMQ, Artemis, ramqp-broker, Qpid JMS, Qpid Proton) and the
+  netns partition test. Only if every gate job passes are the crates published
+  to crates.io. Re-run a release with the workflow's manual dispatch and its tag.
 
 ## Releasing
 

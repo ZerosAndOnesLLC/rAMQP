@@ -1,37 +1,26 @@
 name: CI
 
+# PR checks only. The live-broker interop suites and the network-partition
+# test run as the release gate in release.yml.
+
 on:
-  push:
-    branches: [main]
   pull_request:
     branches: [main]
 
 env:
   CARGO_TERM_COLOR: always
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  check:
-    name: Check
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - run: cargo check --all-targets --all-features
-
-  test:
-    name: Test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test
-      - run: cargo test --all-features
-
   fmt:
     name: Format
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
@@ -40,177 +29,34 @@ jobs:
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+      - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets --all-features -- -D warnings
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test
+      - run: cargo test --all-features
 
   docs:
     name: Docs
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     env:
       RUSTDOCFLAGS: -D warnings
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - run: cargo doc --all-features --no-deps
-
-  # ---------------------------------------------------------------------------
-  # Live broker interop. The `tests/broker.rs` suite is `#[ignore]`d (so a plain
-  # `cargo test` stays green without Docker); these jobs run it for real against
-  # each broker. This is the signal that `ramqp` actually speaks AMQP 1.0 to the
-  # brokers people deploy — not just that it compiles.
-  # ---------------------------------------------------------------------------
-  interop-rabbitmq:
-    name: Interop (RabbitMQ 4.x)
-    runs-on: ubuntu-latest
-    services:
-      rabbitmq:
-        image: rabbitmq:4-management
-        ports:
-          - 5672:5672
-          - 15672:15672
-        options: >-
-          --health-cmd "rabbitmq-diagnostics -q ping"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 10
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Declare interop queue
-        # RabbitMQ does NOT auto-create a queue from an AMQP 1.0 attach, and the
-        # management plugin comes up a beat after the node answers pings — so
-        # retry until the HTTP API accepts the declaration.
-        run: |
-          for i in $(seq 1 30); do
-            if curl -fsS -u guest:guest -X PUT \
-                 http://localhost:15672/api/queues/%2F/ramqp_it \
-                 -H content-type:application/json -d '{"durable":true}'; then
-              echo "queue declared"; exit 0
-            fi
-            sleep 2
-          done
-          echo "management API never became ready"; exit 1
-      - name: Broker interop suite
-        env:
-          RAMQP_BROKER_URL: amqp://guest:guest@localhost:5672
-          RAMQP_BROKER_ADDRESS: /queues/ramqp_it
-        run: cargo test --test broker -- --ignored --test-threads=1
-
-  interop-artemis:
-    name: Interop (ActiveMQ Artemis)
-    runs-on: ubuntu-latest
-    services:
-      artemis:
-        image: apache/activemq-artemis:latest-alpine
-        ports:
-          - 5672:5672
-          - 61616:61616
-        env:
-          ARTEMIS_USER: admin
-          ARTEMIS_PASSWORD: admin
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Create ANYCAST queue
-        # Artemis auto-creates MULTICAST addresses (which drop messages sent
-        # before a subscriber exists), so pre-create an ANYCAST/queue-semantics
-        # address. The retry loop doubles as the readiness gate.
-        run: |
-          for i in $(seq 1 40); do
-            if docker exec ${{ job.services.artemis.id }} \
-                 /var/lib/artemis-instance/bin/artemis queue create \
-                 --name ramqp.it --address ramqp.it --anycast --durable \
-                 --preserve-on-no-consumers --auto-create-address \
-                 --url tcp://localhost:61616 --user admin --password admin --silent; then
-              echo "anycast queue created"; exit 0
-            fi
-            sleep 2
-          done
-          echo "Artemis never became ready"; exit 1
-      - name: Broker interop suite
-        env:
-          RAMQP_BROKER_URL: amqp://admin:admin@localhost:5672
-          RAMQP_BROKER_ADDRESS: ramqp.it
-        # Single-node Artemis holds connections for a 60s TTL, so the suite's
-        # rapid open/close churn makes it slow but stable; the suite already
-        # retries connects to absorb this.
-        run: cargo test --test broker -- --ignored --test-threads=1
-
-  # Our OWN broker: run the same client interop suite against ramqp-broker that
-  # we run against RabbitMQ and Artemis — apples-to-apples proof it speaks
-  # AMQP 1.0 to the ramqp client. No external service: build the daemon, run it,
-  # point the suite at it (the broker auto-declares queues, so no pre-declare).
-  interop-ramqp-broker:
-    name: Interop (ramqp-broker)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Build the broker daemon
-        run: cargo build -p ramqp-broker --bin ramqp-brokerd
-      - name: Run the client interop suite against ramqp-broker
-        env:
-          RAMQP_BROKER_URL: amqp://127.0.0.1:5672
-          RAMQP_BROKER_ADDRESS: /queues/interop
-        run: |
-          RAMQP_LISTEN=127.0.0.1:5672 target/debug/ramqp-brokerd &
-          broker=$!
-          for i in $(seq 1 30); do
-            if (exec 3<>/dev/tcp/127.0.0.1/5672) 2>/dev/null; then exec 3>&-; break; fi
-            sleep 1
-          done
-          cargo test --test broker -- --ignored --test-threads=1
-          status=$?
-          kill "$broker" 2>/dev/null || true
-          exit $status
-
-  # External-toolchain interop: an independent, third-party AMQP 1.0 client
-  # stack (Apache Qpid JMS, pure Java) exercising ramqp-broker — the JMS leg of
-  # broker.md Phase 10, alongside the Rust fe2o3-amqp leg in bench-compare. The
-  # runner fetches qpid-jms, compiles the client, and runs the #[ignore]d
-  # jms_interop test (which starts a loopback broker in-process).
-  interop-jms:
-    name: Interop (Qpid JMS -> ramqp-broker)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '21'
-      - name: Qpid JMS interop
-        run: ramqp-broker/tests/interop/jms/run.sh
-
-  # External-toolchain interop: Apache Qpid Proton (Python, the C-based AMQP 1.0
-  # engine) exercising ramqp-broker — a third independent stack after fe2o3-amqp
-  # (Rust) and Qpid JMS (Java). Installs proton on the runner; run.sh takes the
-  # host path.
-  interop-proton:
-    name: Interop (Qpid Proton -> ramqp-broker)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Install python3-qpid-proton
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq python3-qpid-proton
-      - name: Qpid Proton interop
-        run: ramqp-broker/tests/interop/proton/run.sh
-
-  # Process-level split-brain: a 3-node quorum cluster across Linux network
-  # namespaces, iptables-partitioned into majority/minority, asserting the
-  # majority stays available, the minority refuses (never silently accepts),
-  # and no committed message is lost on heal. Needs root (netns + iptables);
-  # the script self-elevates via sudo.
-  partition:
-    name: Partition (netns split-brain)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Network-partition test
-        run: ramqp-broker/tests/partition/run.sh
