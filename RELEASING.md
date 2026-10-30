@@ -85,9 +85,13 @@ Other manifest facts worth knowing:
    `cargo publish -p ramqp --dry-run`
    (the `ramqp` dry-run fails against the index until core is actually
    published — expected; it still validates the package contents).
-4. Tag `vX.Y.Z` and push the tag. `release.yml` tests, then publishes
-   **`ramqp-core` first, then `ramqp`** (in that order, with an index-refresh
-   wait between), then creates the GitHub release.
+4. Create the release: `gh release create vX.Y.Z --generate-notes` (this
+   creates the tag). Publishing the release triggers `release.yml`: the gate
+   (all-features tests, live-broker interop suites, network-partition test)
+   runs first, then it publishes **`ramqp-core` first, then `ramqp`, then
+   `ramqp-broker`** (in that order, with an index-refresh wait after core).
+   If the gate fails nothing is published; fix, then re-run via
+   `workflow_dispatch` with the tag.
 5. Verify: `docs.rs/ramqp` and `docs.rs/ramqp-core` build, and a scratch
    project with `ramqp = "X.Y"` compiles.
 
@@ -115,8 +119,8 @@ cadence — reset it to a deliberate value if/when it first publishes).
 2. **Stamp the CHANGELOG** `0.8.0` heading with today's date (Release step 1).
 3. **Confirm the `CARGO_REGISTRY_TOKEN` secret** exists (Prerequisites).
 4. **Dry-run** `cargo publish -p ramqp-core --dry-run` (Release step 3).
-5. **Tag `v0.8.0` and push the tag** → `release.yml` publishes `ramqp-core`
-   then `ramqp`, then creates the GitHub release.
+5. **`gh release create v0.8.0 --generate-notes`** → `release.yml` runs the
+   gate, then publishes `ramqp-core` then `ramqp`.
 
 Notes:
 
