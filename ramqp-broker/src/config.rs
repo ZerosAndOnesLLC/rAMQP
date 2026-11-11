@@ -76,16 +76,93 @@ pub struct BrokerConfig {
     /// page out to disk under `data_dir` (deep queues must not live in RAM —
     /// broker.md §3.1/§8). Ignored without a `data_dir`.
     pub resident_bytes_max: usize,
-    /// Management/metrics HTTP listen address (e.g. `127.0.0.1:15692`):
-    /// `GET /metrics` (Prometheus) and `GET /queues` (JSON). `None` (the
-    /// default) disables the endpoint. No auth — bind it to loopback or a
-    /// management network.
+    /// Management HTTP listen address (e.g. `127.0.0.1:15692`): metrics,
+    /// queue/exchange inspection, and the declare/delete admin API (see the
+    /// `mgmt` module docs). `None` (the default) disables the endpoint.
     pub management_listen: Option<String>,
+    /// Bearer token for the management API (`Authorization: Bearer
+    /// <token>`). Writes (`PUT`/`DELETE`) need this token or an admin
+    /// user's Basic credentials ([`crate::Authenticator::management_login`]);
+    /// with neither configured, the API is read-only.
+    pub management_token: Option<SecretString>,
+    /// Require credentials for management reads too (`GET`). Default
+    /// `false`, so Prometheus and autoscaler scrapes need no secret; turn it
+    /// on when the endpoint is reachable beyond a trusted network.
+    pub management_auth_reads: bool,
+    /// Serve the management endpoint over TLS with the [`BrokerConfig::tls`]
+    /// certificate (needs the `tls` or `fips` feature).
+    pub management_tls: bool,
+    /// An additional AMQP listener that speaks TLS (`amqps`, e.g.
+    /// `0.0.0.0:5671`) with the [`BrokerConfig::tls`] certificate; the main
+    /// listener stays plain (bind it to loopback for TLS-only). Needs the
+    /// `tls` or `fips` feature.
+    pub tls_listen: Option<String>,
+    /// Server certificate, key, and optional client-CA (mTLS) for the TLS
+    /// listeners.
+    pub tls: Option<TlsServerConfig>,
     /// Queue policies: `(name prefix, policy)` pairs, first match wins (an
     /// empty prefix matches every queue). Matched against the normalized
     /// queue name (no `/queues/` etc. prefix) at declaration. The management
     /// API (Phase 9) will supersede this interim surface.
     pub policies: Vec<(String, QueuePolicy)>,
+}
+
+/// Server-side TLS material, read from PEM files and **re-read when they
+/// change** (cert-manager rotates them in place): a new certificate applies
+/// to new handshakes without a restart. A failed reload keeps serving the
+/// previous certificate and logs the error.
+///
+/// Marked `#[non_exhaustive]`: construct via [`TlsServerConfig::new`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct TlsServerConfig {
+    /// PEM certificate chain (leaf first).
+    pub cert_file: std::path::PathBuf,
+    /// PEM private key (PKCS#8, PKCS#1, or SEC1).
+    pub key_file: std::path::PathBuf,
+    /// PEM CA bundle: when set, clients MUST present a certificate chaining
+    /// to it (mutual TLS). Required for the cluster fabric.
+    pub client_ca_file: Option<std::path::PathBuf>,
+    /// How often the files are checked for changes (default 10 s).
+    pub reload_interval: std::time::Duration,
+}
+
+impl TlsServerConfig {
+    /// TLS from a certificate chain and key file.
+    pub fn new(
+        cert_file: impl Into<std::path::PathBuf>,
+        key_file: impl Into<std::path::PathBuf>,
+    ) -> Self {
+        TlsServerConfig {
+            cert_file: cert_file.into(),
+            key_file: key_file.into(),
+            client_ca_file: None,
+            reload_interval: std::time::Duration::from_secs(10),
+        }
+    }
+}
+
+/// A secret string whose `Debug` output is redacted (config structs are
+/// logged; their secrets must not be).
+#[derive(Clone, PartialEq, Eq)]
+pub struct SecretString(String);
+
+impl SecretString {
+    /// Wrap a secret.
+    pub fn new(secret: impl Into<String>) -> Self {
+        SecretString(secret.into())
+    }
+
+    /// The secret itself.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for SecretString {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SecretString(<redacted>)")
+    }
 }
 
 /// Per-queue behavior policies: TTL, length bounds, dead-lettering.
@@ -175,6 +252,13 @@ pub struct ClusterMemberConfig {
     /// Replica count for newly declared quorum queues (capped at the current
     /// cluster size at declaration).
     pub replicas: u8,
+    /// Mutual TLS on the fabric (needs the `tls` or `fips` feature): every
+    /// node presents `cert_file` and requires peers to present a
+    /// certificate chaining to `client_ca_file` (mandatory here), both when
+    /// accepting and when dialing. Each node's certificate must carry the
+    /// host of its seed address (DNS or IP SAN) — peers verify it. All
+    /// nodes must agree: a TLS node and a plain node cannot talk.
+    pub tls: Option<TlsServerConfig>,
 }
 
 impl ClusterMemberConfig {
@@ -185,6 +269,7 @@ impl ClusterMemberConfig {
             listen: listen.into(),
             seeds,
             replicas: 3,
+            tls: None,
         }
     }
 }
@@ -205,6 +290,11 @@ impl Default for BrokerConfig {
             data_dir: None,
             resident_bytes_max: 64 * 1024 * 1024,
             management_listen: None,
+            management_token: None,
+            management_auth_reads: false,
+            management_tls: false,
+            tls_listen: None,
+            tls: None,
             policies: Vec::new(),
         }
     }

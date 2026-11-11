@@ -674,12 +674,21 @@ impl Session {
         payload: Option<Bytes>,
         transport: &mut FramedTransport<S>,
     ) -> Result<(), ConnectError> {
-        let Some(local) = self.remote_handles.resolve(transfer.handle) else {
-            return Ok(());
-        };
+        // Session-level accounting first: every transfer frame consumes the
+        // session window, including one for a link we already detached
+        // (pipelined behind our detach). Skipping it would drift
+        // next-incoming-id and eventually stall the peer's whole session.
         let need_session_flow = self
             .windows
             .record_incoming(transfer.delivery_id.unwrap_or(0));
+        let Some(local) = self.remote_handles.resolve(transfer.handle) else {
+            if need_session_flow {
+                self.windows.replenish_incoming();
+                let flow = self.windows.build_flow();
+                transport.queue_amqp(self.local_channel, &Performative::Flow(flow), None);
+            }
+            return Ok(());
+        };
 
         let local_channel = self.local_channel;
 
@@ -1302,6 +1311,25 @@ mod tests {
         assert_eq!(response.outgoing_window, 16);
         assert_eq!(response.handle_max, 64);
         assert_eq!(response.next_outgoing_id, 0);
+    }
+
+    /// A transfer for a link we no longer have (pipelined behind our
+    /// detach) still consumes the session window, so next-incoming-id stays
+    /// in step with the peer.
+    #[tokio::test]
+    async fn transfer_on_unmapped_handle_still_advances_the_session_window() {
+        let (mut session, _resp, _evt, mut transport, _far) = server_session(&peer_begin());
+        let before = session.windows.next_incoming_id;
+        let transfer = Transfer {
+            handle: 42,
+            delivery_id: Some(0),
+            ..Default::default()
+        };
+        session
+            .on_transfer(transfer, Some(Bytes::from_static(b"x")), &mut transport)
+            .await
+            .expect("ignored, not an error");
+        assert_eq!(session.windows.next_incoming_id, before.wrapping_add(1));
     }
 
     #[tokio::test]

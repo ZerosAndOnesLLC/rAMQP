@@ -16,8 +16,10 @@ protocol engine as the [`ramqp`](https://crates.io/crates/ramqp) client.
 ## Working today
 
 - **Any AMQP 1.0 client connects** — TCP acceptor, read-first server
-  handshake, SASL ANONYMOUS/PLAIN behind a pluggable `Authenticator`
-  (`AllowAll`, `StaticPlain` with constant-time comparison).
+  handshake, SASL ANONYMOUS/PLAIN/SCRAM-SHA-1/256/512 behind a pluggable
+  `Authenticator` (`StaticUsers` — the config-file backend: SCRAM verifiers
+  only, never plaintext, with per-user × vhost × address × operation
+  permissions; plus `AllowAll`, `StaticPlain`, `StaticScram`).
 - **Transient queues** — `/queues/<name>` (or bare names), auto-declared:
   one lock-free actor task per queue, competing consumers with round-robin
   dispatch, credit-based flow control, accept/release/modified/reject
@@ -31,6 +33,15 @@ protocol engine as the [`ramqp`](https://crates.io/crates/ramqp) client.
 - **Durable queues** — `/durable/<name>` (build with `--features store-redb`,
   run with `--data-dir <path>`): on-disk via redb, group-commit fsync (the
   accepted disposition is the durability confirm), full restart recovery.
+- **Exchanges** — RabbitMQ 4.x addressing, so AMQP 1.0 clients move
+  unchanged: publish to `/exchanges/<name>/<routing-key>` (or
+  `/exchanges/<name>` with the key in `properties.subject`). **fanout**,
+  **direct**, and **topic** (`*` / `#`) kinds; `amq.direct`, `amq.fanout`,
+  `amq.topic` exist in every vhost. A publish is confirmed once **every**
+  destination queue has confirmed it (rejected if any refuses); unroutable
+  messages are accepted and dropped, or go to the exchange's `alternate`
+  queue. Definitions persist (redb standalone, the metadata Raft group when
+  clustered) and binding changes apply to already-attached producers.
 - **Clustering with leader routing** — a metadata Raft group (replicated
   queue catalog + rendezvous placement) and an **inter-node fabric**: one
   multiplexed TCP connection per peer pair carrying every group's Raft
@@ -45,8 +56,13 @@ protocol engine as the [`ramqp`](https://crates.io/crates/ramqp) client.
 
 ```sh
 cargo install ramqp-broker            # installs the ramqp-brokerd daemon
-ramqp-brokerd --listen 0.0.0.0:5672
+ramqp-brokerd --config /etc/ramqp/broker.toml
+ramqp-brokerd --listen 127.0.0.1:5672   # quick local run, no auth
 ```
+
+On a **non-loopback** listener the daemon refuses to start without users
+unless you opt into an open broker with `--allow-anonymous`
+(`RAMQP_ALLOW_ANONYMOUS=1`).
 
 (or from a repo checkout:
 `cargo run -p ramqp-broker --bin ramqp-brokerd -- --listen 0.0.0.0:5672`)
@@ -74,6 +90,121 @@ node — e.g. the repo's example:
 RAMQP_URL=amqp://localhost:5672 RAMQP_ADDRESS=/queues/demo \
     cargo run -p ramqp --example produce_consume
 ```
+
+### Configuration file
+
+`--config <path>` (or `RAMQP_CONFIG`) loads a TOML file; environment
+variables and flags override it. It replaces RabbitMQ's `definitions.json`:
+
+```toml
+listen = "0.0.0.0:5672"
+data_dir = "/var/lib/ramqp"           # needs --features store-redb
+management_listen = "0.0.0.0:15692"
+management_token_file = "/etc/ramqp/mgmt-token"   # bearer token for admin writes
+allow_plain = true                    # PLAIN is checked against the SCRAM verifier
+
+[limits]
+max_connections = 16384
+
+[cluster]
+node_id = 1
+listen = "0.0.0.0:7472"
+seeds = ["1=broker-0.broker:7472", "2=broker-1.broker:7472", "3=broker-2.broker:7472"]
+
+[[users]]
+name = "orders"
+verifier_file = "/etc/ramqp/users/orders.scram"   # RFC 5803 line(s)
+
+[[users]]
+name = "ops"
+password_file = "/etc/ramqp/users/ops"   # derived into a verifier at load
+admin = true                              # management API (see below)
+
+[[permissions]]                 # deny by default
+user = "orders"                 # or "anonymous", or "*"
+vhost = ""                      # default vhost; "*" = all
+address = "/queues/orders.*"    # glob over the attach address
+operations = ["send", "receive"]
+
+[[policies]]                    # first match wins
+prefix = "orders."
+message_ttl_ms = 600000
+max_length = 100000
+overflow = "reject-publish"     # or "drop-head"
+dead_letter = "/quorum/dead"
+max_delivery_attempts = 5
+
+[[queues]]                      # declared at startup, idempotent
+address = "/quorum/orders.created"
+
+[[exchanges]]
+name = "events"
+type = "topic"                  # fanout | direct | topic
+alternate = "/queues/unroutable"   # optional: unroutable messages go here
+
+[[bindings]]
+exchange = "events"
+queue = "/quorum/orders.created"
+key = "order.#"
+```
+
+### TLS and FIPS
+
+Build with `--features tls` (rustls on ring) or, for FIPS 140-3,
+`--no-default-features --features fips,jemalloc,store-redb` (rustls **and**
+SCRAM hashing on AWS-LC's FIPS module; needs CMake and Go to build). The
+daemon logs `FIPS build: …` at startup and refuses to run if the module is
+not active (`ramqp_broker::fips_enabled()`).
+
+```toml
+listen = ""                        # optional: TLS-only (no plain listener); or --listen none
+
+[tls]
+listen = "0.0.0.0:5671"            # amqps
+cert_file = "/etc/ramqp/tls/tls.crt"
+key_file = "/etc/ramqp/tls/tls.key"
+client_ca_file = "/etc/ramqp/tls/ca.crt"   # optional: require client certificates (amqps only)
+management = true                  # management endpoint over TLS (never requires client certs)
+
+[cluster.tls]                      # mutual TLS on the fabric
+cert_file = "/etc/ramqp/fabric/tls.crt"
+key_file = "/etc/ramqp/fabric/tls.key"
+ca_file = "/etc/ramqp/fabric/ca.crt"       # a DEDICATED cluster CA
+```
+
+Certificates **and CA bundles** are re-read when they change (cert-manager
+rotation): new handshakes use them, and a broken file keeps the previous
+material. The fabric needs its **own CA** — the daemon refuses to share it
+with `client_ca_file`, since anything that CA signs could reach the fabric —
+and a peer's certificate must also name one of the seed hosts (DNS or IP
+SAN), so a stray certificate from the same CA is still refused. Flags:
+`--tls-listen`, `--tls-cert`, `--tls-key`, `--tls-client-ca`.
+
+### Management API
+
+With `management_listen` set, one small HTTP/1.1 endpoint serves metrics,
+inspection, and an idempotent admin API (the default vhost is `%2F`):
+
+| Request | Purpose |
+|---|---|
+| `GET /metrics` | Prometheus text (connections, RSS, per-queue gauges) |
+| `GET /queues` | every queue with ready / unacked / consumers |
+| `GET /queues/<vhost>/<name>[?kind=]` | one queue: `{"ready", "unacked", "messages", "consumers", …}` — point KEDA's `metrics-api` scaler at `ready`. Correct on **every** node (a non-leader asks the queue's leader); `503` when unknowable, never zeros |
+| `PUT /queues/<vhost>/<name>` `{"kind":"quorum"}` | declare (`transient` default); `201` created, `204` exists, `409` exists as another kind |
+| `DELETE /queues/<vhost>/<name>[?kind=]` | delete a transient or durable queue (consumers detached with `amqp:resource-deleted`); quorum → `501` for now |
+| `GET /exchanges`, `GET /exchanges/<vhost>/<name>` | definitions with bindings |
+| `PUT /exchanges/<vhost>/<name>` `{"type":"topic","alternate":"/queues/x"}` | declare; `409` on different arguments |
+| `DELETE /exchanges/<vhost>/<name>` | delete with its bindings |
+| `PUT` / `DELETE /bindings/<vhost>/<exchange>` `{"queue":"/queues/x","key":"a.*"}` | bind / unbind |
+
+Writes always need credentials: `Authorization: Bearer <token>` from
+`management_token_file` (`--management-token-file`), or HTTP Basic for a
+user with `admin = true`. Reads are open unless `management_auth_reads = true`.
+
+Secrets stay out of the file: point `verifier_file` / `password_file` at a
+mounted Kubernetes Secret. Generate a verifier with
+`echo -n "$PASSWORD" | ramqp-brokerd hash-password [--mechanism SCRAM-SHA-512]`.
+The daemon also shuts down gracefully on `SIGTERM`.
 
 Or embed it (`ramqp-broker = "0.9"` in `Cargo.toml`; add the `store-redb`
 feature for `/durable/*` queues):

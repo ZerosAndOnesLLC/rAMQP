@@ -493,18 +493,44 @@ impl Proxy {
                     _ => {}
                 }
             }
-            QueueMsg::Stats { reply } => {
-                // Local leader: real stats from the actor; remote: only the
-                // proxy-side consumer count is known.
-                if let Some(Downstream::Local { queue }) = &self.downstream {
-                    let _ = queue.tx.send(QueueMsg::Stats { reply }).await;
-                } else {
-                    let _ = reply.send(crate::queue::QueueStats {
-                        ready: 0,
-                        unacked: 0,
-                        consumers: self.subs.len(),
+            QueueMsg::Stats { reply, forward } => match &self.downstream {
+                // This node leads: the actor's real stats.
+                Some(Downstream::Local { queue }) => {
+                    let _ = queue
+                        .tx
+                        .send(QueueMsg::Stats {
+                            reply,
+                            forward: false,
+                        })
+                        .await;
+                }
+                // Another node leads: ask it (single-queue lookups), or stay
+                // silent (node-local scrapes must not report zeros or
+                // double-count across nodes).
+                Some(Downstream::Remote { conn }) if forward => {
+                    let conn = conn.clone();
+                    let queue = self.name.clone();
+                    tokio::spawn(async move {
+                        if let Ok(body) = conn
+                            .call(RequestKind::QueueStats { queue }, Bytes::new())
+                            .await
+                            && let Ok(Some((ready, unacked, consumers))) =
+                                crate::serde_bin::from_slice::<Option<(u64, u64, u64)>>(&body)
+                        {
+                            let _ = reply.send(crate::queue::QueueStats {
+                                ready: ready as usize,
+                                unacked: unacked as usize,
+                                consumers: consumers as usize,
+                            });
+                        }
                     });
                 }
+                // Remote without forwarding, or unbound mid-failover.
+                _ => drop(reply),
+            },
+            // Clustered quorum queues cannot be deleted yet.
+            QueueMsg::Delete { reply } => {
+                let _ = reply.send(false);
             }
             QueueMsg::Unsubscribe { sub } => {
                 let Ok(key) = u32::try_from(sub) else {
@@ -704,8 +730,9 @@ impl Proxy {
                 body,
                 ..
             } => self.forward_delivery(key, msg_id, body),
-            // Publish acks ride per-publish channels, not this one.
-            ConnCmd::SettleIncoming { .. } => {}
+            // Publish acks ride per-publish channels, not this one; quorum
+            // actors are never deleted.
+            ConnCmd::SettleIncoming { .. } | ConnCmd::QueueDeleted { .. } => {}
         }
     }
 
@@ -801,6 +828,7 @@ mod tests {
             policies: Vec::new(),
             dlx: None,
             persist: None,
+            tls: None,
         })
         .await
         .expect("bootstrap");
@@ -814,7 +842,10 @@ mod tests {
         let (tx, rx) = oneshot::channel();
         queue
             .tx
-            .send(QueueMsg::Stats { reply: tx })
+            .send(QueueMsg::Stats {
+                reply: tx,
+                forward: false,
+            })
             .await
             .expect("stats send");
         rx.await.expect("stats reply")

@@ -5,6 +5,121 @@ All notable changes to ramqp will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Server TLS** (issue #37 §4; features `tls` — rustls/ring — or `fips`): an
+  `amqps` listener (`BrokerConfig::tls_listen` + `TlsServerConfig`), the
+  management endpoint over TLS (`management_tls`), optional client-certificate
+  verification (mTLS), and certificate **hot reload** from disk (a failed
+  reload keeps the old certificate). Optional **mutual TLS on the cluster
+  fabric** (`ClusterMemberConfig::tls`). `[tls]` config section and
+  `--tls-*` flags.
+- **FIPS build** (`fips`): rustls on AWS-LC's FIPS 140-3 provider and SCRAM
+  hashing on the same module via the new `ramqp-core` feature **`scram-fips`**
+  (SHA/HMAC/PBKDF2 and nonce randomness on AWS-LC; no RustCrypto, no ring).
+  `ramqp_broker::fips_enabled()`; the daemon refuses to start a `fips` build
+  whose module is inactive. A FIPS CI job runs both crates' suites. RFC 7677
+  SCRAM-SHA-256 known-answer test added (runs on both backends).
+- **Admin API** on the management listener (issue #37 §3): `PUT`/`DELETE`
+  for queues, exchanges, and bindings (idempotent: `201` created, `204`
+  already so, `409` different arguments), `GET /queues/<vhost>/<name>` for
+  one queue's ready/unacked/consumers (KEDA `metrics-api`), and
+  `GET /exchanges[/<vhost>/<name>]`. Writes need a bearer token
+  (`BrokerConfig::management_token`, `management_token_file`,
+  `--management-token-file`) or Basic credentials of an admin user
+  (`Authenticator::management_login`); `management_auth_reads` protects
+  reads too. Bounded request bodies, still no HTTP dependency.
+- **Queue deletion** for transient and durable queues: consumers are
+  detached with `amqp:resource-deleted`, producers on their next publish,
+  and a durable queue's rows (and name) are purged. Quorum-queue deletion
+  answers `501` for now.
+- `SecretString` (redacted `Debug`) for secrets in `BrokerConfig`.
+- **Exchange routing** (issue #37 §1) with RabbitMQ 4.x AMQP 1.0 addressing:
+  producers publish to `/exchanges/<name>/<routing-key>` or `/exchanges/<name>`
+  (routing key from `properties.subject`). Kinds: fanout, direct, topic
+  (`*`/`#`); `amq.direct`/`amq.fanout`/`amq.topic` built in per vhost.
+  Bindings route to transient, quorum, or durable queues; a queue matched by
+  several bindings gets one copy. Unroutable messages are accepted and
+  dropped, or routed to an optional `alternate` queue. Unsettled publishes
+  are confirmed after every destination confirms (rejected if any refuses).
+  Transactional publishes stage one enqueue per destination. Definitions
+  persist in redb (standalone) or the metadata Raft group (clustered, synced
+  to every node's routing view), and changes apply to attached producers.
+  `Broker::declare_exchange` / `delete_exchange` / `bind_queue` /
+  `unbind_queue`; `[[exchanges]]` and `[[bindings]]` config-file sections.
+- **`ramqp-brokerd` config file** (`--config` / `RAMQP_CONFIG`, TOML; issue
+  #37 §2): listeners, data dir, management listener, limits, cluster
+  membership, **users** (RFC 5803 SCRAM verifiers from a file or inline, or
+  a password file derived into a verifier at load — never plaintext at
+  rest), **permissions** (user × vhost × address glob × send/receive,
+  deny-by-default), **policies** per vhost + name prefix (every
+  `QueuePolicy` field), and **pre-declared queues** (idempotent across
+  restarts). Flags and env vars override the file.
+- `StaticUsers` authenticator (the config-file backend): SCRAM-SHA-1/256/512
+  per stored verifier, PLAIN checked against the same verifier, opt-in
+  ANONYMOUS, admin flag, `Permission` grants. `auth::parse_scram_verifier` /
+  `format_scram_verifier` / `derive_scram_verifier` helpers.
+- `ramqp-brokerd hash-password` prints a verifier line from a password on
+  stdin.
+- `ramqp-brokerd --management-listen` flag (previously env-only) and
+  `--allow-anonymous`; the daemon now also shuts down gracefully on
+  `SIGTERM`.
+- `Broker::declare_queue` and `BoundBroker::broker`.
+
+### Fixed (review of the issue #37 work, before release)
+- Exchange publishes whose destination queue cannot be resolved are now
+  **rejected** (nothing published, nothing cached) instead of accepted while
+  silently skipping that queue; a deleted exchange **detaches** its producers
+  (`amqp:resource-deleted`) instead of accepting and dropping.
+- Deleting a queue also removes the bindings to it, and answers everything
+  queued behind the delete (publishes refused, racing subscribes detached)
+  so no producer waits forever or leaks credit.
+- `GET /queues/<vhost>/<name>` follows a clustered queue to its leader and
+  returns `503` (never zeros) when stats are unknowable; node-local
+  `/metrics` and `/queues` omit queues another node leads.
+- Fabric mutual TLS has its own `[cluster.tls]` section and CA (refused if
+  it equals the amqps client CA), checks that a peer certificate names a
+  seed host, and management TLS never demands client certificates.
+- Client CA and cluster CA bundles reload on change, like certificates.
+- Startup topology from the config file is declared before the listener
+  accepts; configuration conflicts stop the daemon instead of retrying
+  forever.
+- Exchange metadata commands are proposed only once every cluster node
+  reports support (new fabric capability probe); metadata snapshots keep
+  the 0.9.x encoding until exchanges are used.
+- PLAIN and management Basic password checks (PBKDF2) run on the blocking
+  pool, bounded to one per CPU; verifier iterations are capped at 1,000,000;
+  the unknown-user decoy matches real users' parameters; failed management
+  logins are slowed.
+- Management requests: 3 s head deadline, TLS handshake bound, admin writes
+  run to completion even if the request times out, and the connection is
+  drained after the response so early `401`/`413` replies are not reset.
+- Exchange definitions persist one row per exchange; an unreadable row is
+  moved aside (`corrupt:`) instead of blocking every exchange.
+- Fan-out confirms are awaited in the connection (no task per message);
+  routing keys over 255 bytes are unroutable; multi-destination
+  transactional staging is all-or-nothing; `$`-prefixed queue names are
+  reserved.
+- `ramqp-core`: a transfer for an already-detached link still consumes the
+  session window (no next-incoming-id drift).
+- TLS-only mode: an empty plain listen address (`listen = ""`,
+  `--listen none`) binds only the amqps listener.
+- docs.rs builds without the `fips` feature (it needs CMake and Go).
+
+### Changed
+- `ramqp-broker`'s SCRAM backend is now a feature: **`rustcrypto`** (on by
+  default) or `fips`. Builds using `--no-default-features` must add
+  `rustcrypto` (or `fips`); a build with neither fails with a clear error.
+  Publishing needs `ramqp-core` released first (the `scram-fips` feature).
+- The metadata group's state gains exchange definitions; snapshots written
+  by 0.9.x still restore. **Upgrade every cluster node before declaring
+  exchanges** — an older node cannot apply the new metadata command.
+- **Breaking (daemon):** `ramqp-brokerd` refuses to start on a non-loopback
+  listener with no users configured unless `--allow-anonymous`
+  (`RAMQP_ALLOW_ANONYMOUS=1`, `allow_anonymous = true`) is given. It used to
+  log a warning and run open.
+
 ## [ramqp-broker 0.9.5] - 2026-10-05
 
 Broker-only patch release; `ramqp` (0.8.3) and `ramqp-core` (0.2.6) are

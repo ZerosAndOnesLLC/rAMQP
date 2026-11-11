@@ -4,11 +4,18 @@
 //! helpers are direction-agnostic: the client state machine (`ramqp`) derives
 //! proofs from a password, and the server side (`ramqp-broker`) verifies them
 //! against stored keys. Both use exactly these primitives.
+//!
+//! Backends: the RustCrypto crates (`scram`), or AWS-LC's FIPS 140-3
+//! module (`scram-fips`, which wins when both features are on) — the hash,
+//! HMAC, PBKDF2, and nonce randomness all go through the selected one.
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD_NO_PAD;
+#[cfg(not(feature = "scram-fips"))]
 use hmac::{Hmac, KeyInit, Mac};
+#[cfg(not(feature = "scram-fips"))]
 use sha1::Sha1;
+#[cfg(not(feature = "scram-fips"))]
 use sha2::{Digest, Sha256, Sha512};
 
 /// Which SCRAM hash function to use.
@@ -33,6 +40,7 @@ impl ScramMechanism {
     }
 
     /// The mechanism's hash function `H(data)`.
+    #[cfg(not(feature = "scram-fips"))]
     pub fn h(self, data: &[u8]) -> Vec<u8> {
         match self {
             ScramMechanism::Sha1 => Sha1::digest(data).to_vec(),
@@ -42,6 +50,7 @@ impl ScramMechanism {
     }
 
     /// The mechanism's `HMAC(key, msg)`.
+    #[cfg(not(feature = "scram-fips"))]
     pub fn hmac(self, key: &[u8], msg: &[u8]) -> Vec<u8> {
         match self {
             ScramMechanism::Sha1 => {
@@ -63,6 +72,7 @@ impl ScramMechanism {
     }
 
     /// `Hi(password, salt, iterations)` — PBKDF2 over the mechanism's HMAC.
+    #[cfg(not(feature = "scram-fips"))]
     pub fn pbkdf2(self, password: &[u8], salt: &[u8], iterations: u32) -> Vec<u8> {
         match self {
             ScramMechanism::Sha1 => {
@@ -82,16 +92,65 @@ impl ScramMechanism {
             }
         }
     }
+
+    /// The mechanism's hash function `H(data)` (AWS-LC FIPS).
+    #[cfg(feature = "scram-fips")]
+    pub fn h(self, data: &[u8]) -> Vec<u8> {
+        use aws_lc_rs::digest;
+        let alg = match self {
+            ScramMechanism::Sha1 => &digest::SHA1_FOR_LEGACY_USE_ONLY,
+            ScramMechanism::Sha256 => &digest::SHA256,
+            ScramMechanism::Sha512 => &digest::SHA512,
+        };
+        digest::digest(alg, data).as_ref().to_vec()
+    }
+
+    /// The mechanism's `HMAC(key, msg)` (AWS-LC FIPS).
+    #[cfg(feature = "scram-fips")]
+    pub fn hmac(self, key: &[u8], msg: &[u8]) -> Vec<u8> {
+        use aws_lc_rs::hmac;
+        let alg = match self {
+            ScramMechanism::Sha1 => hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY,
+            ScramMechanism::Sha256 => hmac::HMAC_SHA256,
+            ScramMechanism::Sha512 => hmac::HMAC_SHA512,
+        };
+        hmac::sign(&hmac::Key::new(alg, key), msg).as_ref().to_vec()
+    }
+
+    /// `Hi(password, salt, iterations)` — PBKDF2 (AWS-LC FIPS).
+    #[cfg(feature = "scram-fips")]
+    pub fn pbkdf2(self, password: &[u8], salt: &[u8], iterations: u32) -> Vec<u8> {
+        use aws_lc_rs::pbkdf2;
+        let (alg, len) = match self {
+            ScramMechanism::Sha1 => (pbkdf2::PBKDF2_HMAC_SHA1, 20),
+            ScramMechanism::Sha256 => (pbkdf2::PBKDF2_HMAC_SHA256, 32),
+            ScramMechanism::Sha512 => (pbkdf2::PBKDF2_HMAC_SHA512, 64),
+        };
+        let mut out = vec![0u8; len];
+        let iterations = std::num::NonZeroU32::new(iterations).unwrap_or(std::num::NonZeroU32::MIN);
+        pbkdf2::derive(alg, iterations, salt, password, &mut out);
+        out
+    }
 }
 
 /// Generate a fresh random nonce (256 bits of UUIDv4 entropy, base64, no
 /// padding — safe for the SCRAM attribute grammar).
+#[cfg(not(feature = "scram-fips"))]
 pub fn gen_nonce() -> String {
     let a = uuid::Uuid::new_v4();
     let b = uuid::Uuid::new_v4();
     let mut bytes = Vec::with_capacity(32);
     bytes.extend_from_slice(a.as_bytes());
     bytes.extend_from_slice(b.as_bytes());
+    STANDARD_NO_PAD.encode(bytes)
+}
+
+/// Generate a fresh random nonce: 256 bits from AWS-LC's FIPS DRBG,
+/// base64, no padding.
+#[cfg(feature = "scram-fips")]
+pub fn gen_nonce() -> String {
+    let mut bytes = [0u8; 32];
+    aws_lc_rs::rand::fill(&mut bytes).expect("AWS-LC DRBG");
     STANDARD_NO_PAD.encode(bytes)
 }
 

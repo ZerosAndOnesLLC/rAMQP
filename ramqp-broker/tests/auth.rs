@@ -336,3 +336,97 @@ async fn vhosts_isolate_queues() {
     conn_b.close().await.expect("close b");
     shutdown.shutdown();
 }
+
+/// Issue #37 §2: the config-file authenticator end to end — a verifier
+/// loaded from an RFC 5803 file serves SCRAM-SHA-512 AND PLAIN (checked
+/// against the verifier; no plaintext at rest), and its permissions are
+/// deny-by-default per address and operation.
+#[tokio::test]
+async fn config_file_users_and_permissions() {
+    use ramqp_broker::file_config::FileConfig;
+    let dir = tempfile::tempdir().unwrap();
+    let v = ramqp_broker::auth::derive_scram_verifier(
+        ramqp_core::sasl::scram::ScramMechanism::Sha512,
+        "orders-pw",
+        4096,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("orders.scram"),
+        ramqp_broker::auth::format_scram_verifier(
+            ramqp_core::sasl::scram::ScramMechanism::Sha512,
+            &v,
+        ),
+    )
+    .unwrap();
+    let cfg = FileConfig::from_toml(
+        r#"
+        [[users]]
+        name = "orders"
+        verifier_file = "orders.scram"
+        [[permissions]]
+        user = "orders"
+        address = "/queues/orders.*"
+        operations = ["send", "receive"]
+        "#,
+        dir.path(),
+    )
+    .unwrap();
+    let auth = Arc::new(cfg.authenticator().unwrap().unwrap());
+    let (addr, shutdown) = start_with(auth).await;
+
+    // SCRAM-SHA-512 against the file verifier.
+    let conn = ConnectionBuilder::new(format!("amqp://{addr}"))
+        .sasl(SaslProfile::Scram {
+            mechanism: ramqp::sasl::ScramMechanism::Sha512,
+            username: "orders".to_owned(),
+            password: "orders-pw".to_owned(),
+        })
+        .connect()
+        .await
+        .expect("scram-sha-512 connect");
+    let sess = conn.begin_session().await.expect("sess");
+    producer_send(&sess, "/queues/orders.created", "o1").await;
+    // Outside the granted glob: refused at the link.
+    let mut denied = sess
+        .create_consumer("/queues/billing")
+        .await
+        .expect("attach completes");
+    let refusal = tokio::time::timeout(Duration::from_secs(5), denied.recv())
+        .await
+        .expect("refusal arrives");
+    assert!(refusal.is_err(), "ungranted address must be refused");
+    conn.close().await.expect("close");
+
+    // PLAIN with the same password works (verified against the verifier).
+    let conn = ConnectionBuilder::new(format!("amqp://orders:orders-pw@{addr}"))
+        .connect()
+        .await
+        .expect("plain connect");
+    let sess = conn.begin_session().await.expect("sess");
+    let mut c = sess
+        .create_consumer("/queues/orders.created")
+        .await
+        .expect("consumer");
+    let d = c.recv().await.expect("delivery");
+    assert_eq!(text_of(&d), "o1");
+    c.accept(&d).await.expect("accept");
+    conn.close().await.expect("close");
+
+    // Wrong PLAIN password and anonymous: refused.
+    assert!(
+        ConnectionBuilder::new(format!("amqp://orders:nope@{addr}"))
+            .connect()
+            .await
+            .is_err()
+    );
+    assert!(
+        ConnectionBuilder::new(format!("amqp://{addr}"))
+            .sasl(SaslProfile::Anonymous)
+            .connect()
+            .await
+            .is_err(),
+        "anonymous is off unless allowed"
+    );
+    shutdown.shutdown();
+}

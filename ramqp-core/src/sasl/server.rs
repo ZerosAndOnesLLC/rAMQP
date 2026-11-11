@@ -29,10 +29,10 @@ pub fn parse_plain_response(data: &[u8]) -> Option<(Option<&str>, &str, &str)> {
     ))
 }
 
-#[cfg(feature = "scram")]
+#[cfg(any(feature = "scram", feature = "scram-fips"))]
 pub use scram_server::{ScramServer, ScramServerError, ScramVerifier};
 
-#[cfg(feature = "scram")]
+#[cfg(any(feature = "scram", feature = "scram-fips"))]
 mod scram_server {
     use bytes::Bytes;
 
@@ -357,7 +357,7 @@ mod tests {
         assert_eq!(parse_plain_response(b"\0user\0\xff\xfe"), None);
     }
 
-    #[cfg(feature = "scram")]
+    #[cfg(any(feature = "scram", feature = "scram-fips"))]
     mod scram {
         use super::super::{ScramServer, ScramServerError, ScramVerifier};
         use crate::sasl::scram::ScramMechanism;
@@ -389,6 +389,39 @@ mod tests {
 
             let server_final = s.on_client_final(CLIENT_FINAL).unwrap();
             assert_eq!(&server_final[..], b"v=rmF9pqV8S7suAoZWja4dJRkFsKQ=");
+        }
+
+        /// RFC 7677 §3 worked example (SCRAM-SHA-256), server side — pins
+        /// SHA-256/HMAC/PBKDF2 on whichever backend (`scram` or
+        /// `scram-fips`) is compiled in.
+        #[test]
+        fn rfc7677_sha256_server_vector() {
+            let mut s = ScramServer::with_nonce(
+                ScramMechanism::Sha256,
+                "%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0".into(),
+            );
+            let user = s
+                .on_client_first(b"n,,n=user,r=rOprNGfwEbeRWgbNEkqO")
+                .unwrap();
+            assert_eq!(user, "user");
+            let salt = STANDARD.decode("W22ZaJ0SNY7soEsUEjb6gQ==").unwrap();
+            let verifier =
+                ScramVerifier::derive(ScramMechanism::Sha256, "pencil", &salt, 4096).unwrap();
+            let challenge = s.server_first(verifier);
+            assert_eq!(
+                &challenge[..],
+                b"r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096"
+            );
+            let server_final = s
+                .on_client_final(
+                    b"c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,\
+                      p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ=",
+                )
+                .unwrap();
+            assert_eq!(
+                &server_final[..],
+                b"v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4="
+            );
         }
 
         #[test]

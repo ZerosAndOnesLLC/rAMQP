@@ -40,6 +40,12 @@
 #![warn(missing_docs)]
 #![warn(missing_debug_implementations)]
 
+#[cfg(not(any(feature = "rustcrypto", feature = "fips")))]
+compile_error!(
+    "ramqp-broker needs a crypto backend for SCRAM: enable `rustcrypto` (a default feature) \
+     or `fips` (e.g. `--no-default-features --features fips,jemalloc`)"
+);
+
 pub mod auth;
 mod broker;
 // Cluster internals (openraft glue, the fabric transport, the cluster node)
@@ -52,6 +58,8 @@ mod connection;
 mod dispatch;
 #[cfg(feature = "store-redb")]
 mod durable;
+pub mod exchange;
+pub mod file_config;
 mod mgmt;
 mod policy;
 mod proxy;
@@ -61,8 +69,30 @@ mod registry;
 mod serde_bin;
 #[cfg(feature = "store-redb")]
 mod store;
+#[cfg(any(feature = "tls", feature = "fips"))]
+mod tls;
 mod txn;
 
-pub use auth::{AllowAll, Authenticator, Credentials, Operation, StaticPlain, StaticScram};
+pub use auth::{
+    AllowAll, Authenticator, Credentials, Operation, Permission, StaticPlain, StaticScram,
+    StaticUsers,
+};
 pub use broker::{BoundBroker, Broker, ShutdownHandle};
-pub use config::{BrokerConfig, ClusterMemberConfig, OverflowBehavior, QueuePolicy};
+
+/// Whether this build runs its crypto — TLS and SCRAM — on AWS-LC's FIPS
+/// 140-3 module (the `fips` feature, verified at runtime through rustls's
+/// FIPS status of the active provider).
+pub fn fips_enabled() -> bool {
+    #[cfg(feature = "fips")]
+    {
+        tls::provider().fips()
+    }
+    #[cfg(not(feature = "fips"))]
+    {
+        false
+    }
+}
+pub use config::{
+    BrokerConfig, ClusterMemberConfig, OverflowBehavior, QueuePolicy, SecretString, TlsServerConfig,
+};
+pub use exchange::{ExchangeError, ExchangeKind};

@@ -41,6 +41,7 @@ use ramqp_core::txn::{declared_state, transactional_state, txn_state};
 
 use crate::auth::{Authenticator, Credentials, Operation};
 use crate::config::BrokerConfig;
+use crate::exchange::ExchangeKind;
 use crate::queue::{ConnCmd, PublishAck, QueueHandle, QueueMsg, SettleOutcome, SubId};
 use crate::registry::QueueRegistry;
 use crate::txn::{
@@ -101,7 +102,7 @@ async fn handshake<S: IoStream>(
     // 2. SASL layer (when chosen): mechanisms → init → outcome → AMQP header.
     let mut identity = None;
     if chosen == ProtocolHeader::SASL {
-        identity = server_sasl(&mut transport, auth).await?;
+        identity = server_sasl(&mut transport, &auth_arc).await?;
         let after = accept_header(transport.stream_mut(), &[ProtocolHeader::AMQP]).await?;
         debug_assert_eq!(after, ProtocolHeader::AMQP);
     }
@@ -184,6 +185,7 @@ async fn handshake<S: IoStream>(
         next_gen: 0,
         settlements: FuturesUnordered::new(),
         txns: TxnManager::default(),
+        fanout_acks: FuturesUnordered::new(),
         txn_results: FuturesUnordered::new(),
         next_session_id: 0,
         metrics: noop_metrics(),
@@ -201,8 +203,9 @@ async fn handshake<S: IoStream>(
 /// Returns the authenticated identity (`None` for ANONYMOUS).
 async fn server_sasl<S: IoStream>(
     transport: &mut FramedTransport<S>,
-    auth: &dyn Authenticator,
+    auth_arc: &Arc<dyn Authenticator>,
 ) -> Result<Option<String>, ConnectError> {
+    let auth = auth_arc.as_ref();
     transport
         .send_sasl(&SaslFrame::Mechanisms(SaslMechanisms {
             sasl_server_mechanisms: auth.mechanisms().iter().map(|m| Symbol::new(*m)).collect(),
@@ -230,14 +233,31 @@ async fn server_sasl<S: IoStream>(
         "ANONYMOUS" if auth.mechanisms().contains(&"ANONYMOUS") => {
             auth.verify(Credentials::Anonymous).then_some(None)
         }
-        "PLAIN" if auth.mechanisms().contains(&"PLAIN") => init
-            .initial_response
-            .as_deref()
-            .and_then(parse_plain_response)
-            .and_then(|(_authzid, authcid, passwd)| {
-                auth.verify(Credentials::Plain { authcid, passwd })
-                    .then(|| Some(authcid.to_owned()))
-            }),
+        "PLAIN" if auth.mechanisms().contains(&"PLAIN") => {
+            match init
+                .initial_response
+                .as_deref()
+                .and_then(parse_plain_response)
+            {
+                Some((_authzid, authcid, passwd)) => {
+                    let (authcid, passwd) = (authcid.to_owned(), passwd.to_owned());
+                    // Verifier-backed PLAIN runs PBKDF2: keep it off the
+                    // async workers (and bounded) so login floods cannot
+                    // stall the message path.
+                    let auth = auth_arc.clone();
+                    let ok = crate::auth::run_password_check(move || {
+                        auth.verify(Credentials::Plain {
+                            authcid: &authcid,
+                            passwd: &passwd,
+                        })
+                        .then_some(authcid)
+                    })
+                    .await;
+                    ok.map(Some)
+                }
+                None => None,
+            }
+        }
         _ if scram.is_some() && auth.mechanisms().contains(&mechanism.as_str()) => {
             // RFC 5802 server flow: client-first → challenge → client-final
             // → outcome carrying the server-final signature.
@@ -380,6 +400,14 @@ enum Binding {
         /// acks are not draining runs out of credit and stops (backpressure).
         acked_since_grant: u32,
     },
+    /// Peer sender → an exchange: each message routes to the bound queues.
+    ExchangeProducer {
+        route: Box<ExchangeRoute>,
+        /// This binding's generation.
+        epoch: u64,
+        /// As for [`Binding::Producer`].
+        acked_since_grant: u32,
+    },
     /// Peer sender → the transaction coordinator (declare/discharge).
     Coordinator,
     /// Peer receiver → our sender → subscribed to `queue` as `sub`.
@@ -394,6 +422,178 @@ enum Binding {
         /// cannot re-arm demand that in-flight deliveries already cover.
         granted: u32,
     },
+}
+
+/// A producer link's view of its exchange: the routing key (fixed by the
+/// address, or per message from `properties.subject`) and the resolved
+/// destination queues, cached while the exchange definitions are unchanged.
+struct ExchangeRoute {
+    exchange: String,
+    /// Fixed routing key from `/exchanges/<name>/<key>`; `None` = keyless.
+    key: Option<String>,
+    /// The definitions version the caches below reflect.
+    version: u64,
+    /// The exchange's kind at `version` (`None` = it no longer exists).
+    kind: Option<ExchangeKind>,
+    /// Fixed-key (or fanout) destinations, once resolved at `version`.
+    fixed: Option<Arc<[QueueHandle]>>,
+    /// Keyless: destinations per routing key (bounded; cleared on change).
+    by_key: HashMap<String, Arc<[QueueHandle]>>,
+}
+
+/// Bound on a keyless route's per-key cache (cleared when exceeded).
+const ROUTE_CACHE_MAX: usize = 1024;
+
+impl ExchangeRoute {
+    fn new(exchange: String, key: Option<String>) -> Self {
+        ExchangeRoute {
+            exchange,
+            key,
+            version: u64::MAX,
+            kind: None,
+            fixed: None,
+            by_key: HashMap::new(),
+        }
+    }
+}
+
+/// Where one message from an exchange producer goes.
+enum Routed {
+    /// These queues (empty = unroutable: accepted and dropped).
+    Targets(Arc<[QueueHandle]>),
+    /// The exchange no longer exists: the producer link is detached.
+    ExchangeGone,
+    /// A destination queue could not be resolved right now (cluster
+    /// election, queue cap, store not openable). Nothing is published and
+    /// nothing is cached; the message is rejected so the producer retries —
+    /// accepting it would silently skip that queue.
+    Unavailable(String),
+}
+
+/// Resolve `message`'s destinations through `route`: one atomic version
+/// check per message while the cached route is current; recomputed (and the
+/// destination queues resolved, declaring them on first use) after any
+/// topology change or when a cached queue actor has died. Only a COMPLETE
+/// resolution is cached.
+async fn resolve_route(
+    registry: &QueueRegistry,
+    vhost: &str,
+    route: &mut ExchangeRoute,
+    message: &bytes::Bytes,
+) -> Routed {
+    for _ in 0..2 {
+        let version = registry.exchanges().version();
+        if version != route.version {
+            route.version = version;
+            route.kind =
+                crate::exchange::lookup(&registry.exchanges().snapshot(), vhost, &route.exchange)
+                    .map(|d| d.kind);
+            route.fixed = None;
+            route.by_key.clear();
+        }
+        let Some(kind) = route.kind else {
+            return Routed::ExchangeGone;
+        };
+        let keyed = route.key.is_some() || kind == ExchangeKind::Fanout;
+        let routing_key = if keyed {
+            if let Some(t) = &route.fixed {
+                if t.iter().all(|q| !q.tx.is_closed()) {
+                    return Routed::Targets(t.clone());
+                }
+                route.fixed = None;
+                continue;
+            }
+            route.key.clone().unwrap_or_default()
+        } else {
+            let subject = crate::exchange::message_subject(message).unwrap_or_default();
+            // Routing keys are bounded (as in AMQP 0-9-1/RabbitMQ): an
+            // oversized subject is unroutable — never matched or cached.
+            if subject.len() > crate::exchange::MAX_KEY_LEN {
+                return Routed::Targets(Arc::from([]));
+            }
+            if let Some(t) = route.by_key.get(&subject) {
+                if t.iter().all(|q| !q.tx.is_closed()) {
+                    return Routed::Targets(t.clone());
+                }
+                route.by_key.remove(&subject);
+                continue;
+            }
+            subject
+        };
+        let destinations: Vec<String> = {
+            let defs = registry.exchanges().snapshot();
+            match crate::exchange::lookup(&defs, vhost, &route.exchange) {
+                Some(def) => {
+                    let hits = def.route(&routing_key);
+                    if hits.is_empty() {
+                        def.alternate.iter().cloned().collect()
+                    } else {
+                        hits.into_iter().map(str::to_owned).collect()
+                    }
+                }
+                None => return Routed::ExchangeGone,
+            }
+        };
+        let mut handles = Vec::with_capacity(destinations.len());
+        for dest in &destinations {
+            match registry.resolve_in(vhost, dest).await {
+                Some(h) => handles.push(h),
+                None => {
+                    tracing::warn!(
+                        exchange = %route.exchange,
+                        destination = %dest,
+                        "exchange destination unavailable; rejecting the publish"
+                    );
+                    return Routed::Unavailable(format!(
+                        "destination {dest} of exchange {} is unavailable; retry",
+                        route.exchange
+                    ));
+                }
+            }
+        }
+        let handles: Arc<[QueueHandle]> = handles.into();
+        if keyed {
+            route.fixed = Some(handles.clone());
+        } else {
+            if route.by_key.len() >= ROUTE_CACHE_MAX {
+                route.by_key.clear();
+            }
+            route.by_key.insert(routing_key, handles.clone());
+        }
+        return Routed::Targets(handles);
+    }
+    Routed::Unavailable(format!(
+        "destinations of exchange {} keep stopping; retry",
+        route.exchange
+    ))
+}
+
+/// The disposition for a transactional publish's staging result.
+fn staged_publish_state(
+    staged: crate::txn::PublishStage,
+    txn_id: ramqp_core::txn::TxnId,
+) -> DeliveryState {
+    use crate::txn::PublishStage;
+    match staged {
+        PublishStage::Staged => transactional_state(
+            txn_id,
+            Some(ramqp_core::types::messaging::Outcome::Accepted(
+                Accepted::default(),
+            )),
+        ),
+        PublishStage::UnknownTxn => DeliveryState::Rejected(Rejected {
+            error: Some(AmqpError::new(
+                TransactionError::UnknownId,
+                Some("unknown transaction".to_owned()),
+            )),
+        }),
+        PublishStage::Capped => DeliveryState::Rejected(Rejected {
+            error: Some(AmqpError::new(
+                AmqpCondition::ResourceLimitExceeded,
+                Some("transaction staging cap reached".to_owned()),
+            )),
+        }),
+    }
 }
 
 /// How a consumer's terminal state resolves a dispatched message: applied
@@ -456,6 +656,9 @@ struct BrokerConnection<S: IoStream> {
     settlements: FuturesUnordered<std::pin::Pin<Box<dyn Future<Output = SettlementResult> + Send>>>,
     /// Open transactions (staged work; dropped = rolled back).
     txns: TxnManager,
+    /// Fan-out publishes awaiting every destination's confirm; each resolves
+    /// to the single settlement for its delivery.
+    fanout_acks: FuturesUnordered<std::pin::Pin<Box<dyn Future<Output = ConnCmd> + Send>>>,
     /// In-flight transaction commits awaiting their staged work.
     txn_results: FuturesUnordered<std::pin::Pin<Box<dyn Future<Output = TxnDone> + Send>>>,
     next_session_id: u64,
@@ -510,6 +713,14 @@ impl<S: IoStream> BrokerConnection<S> {
                             Ok(next) => { self.handle_cmd(next); drained += 1; }
                             Err(_) => break,
                         }
+                    }
+                    self.flush().await?;
+                }
+
+                Some(cmd) = self.fanout_acks.next() => {
+                    self.handle_cmd(cmd);
+                    while let Some(Some(next)) = self.fanout_acks.next().now_or_never() {
+                        self.handle_cmd(next);
                     }
                     self.flush().await?;
                 }
@@ -751,6 +962,26 @@ impl<S: IoStream> BrokerConnection<S> {
     /// the stale command would deliver/settle against the wrong queue).
     fn handle_cmd(&mut self, cmd: ConnCmd) {
         match cmd {
+            ConnCmd::QueueDeleted {
+                channel,
+                handle,
+                binding_gen,
+            } => {
+                let live = matches!(
+                    self.bindings.get(&(channel, handle)),
+                    Some(Binding::Consumer { epoch, .. }) if *epoch == binding_gen
+                );
+                if live {
+                    self.detach_with_error(
+                        channel,
+                        handle,
+                        AmqpError::new(
+                            AmqpCondition::ResourceDeleted,
+                            Some("the queue was deleted".to_owned()),
+                        ),
+                    );
+                }
+            }
             ConnCmd::Deliver {
                 channel,
                 handle,
@@ -829,7 +1060,8 @@ impl<S: IoStream> BrokerConnection<S> {
                 // would settle an unrelated delivery-id on the new link).
                 let live = matches!(
                     self.bindings.get(&(channel, handle)),
-                    Some(Binding::Producer { epoch, .. }) if *epoch == binding_gen
+                    Some(Binding::Producer { epoch, .. } | Binding::ExchangeProducer { epoch, .. })
+                        if *epoch == binding_gen
                 );
                 if !live {
                     return;
@@ -861,6 +1093,17 @@ impl<S: IoStream> BrokerConnection<S> {
         }
     }
 
+    /// Detach one of our links with an error (its queue went away) and drop
+    /// its binding. Unsettled consumer deliveries resolve as requeues via
+    /// their settlement futures — moot for a deleted queue.
+    fn detach_with_error(&mut self, channel: u16, handle: u32, error: AmqpError) {
+        self.bindings.remove(&(channel, handle));
+        if let Some(session) = self.sessions.get_mut(&channel) {
+            let (reply, _) = oneshot::channel();
+            session.detach_link(handle, true, Some(error), reply, &mut self.transport);
+        }
+    }
+
     /// Batched producer-credit replenishment: count one consumed credit against
     /// the producer link and, once half the window is consumed, grant that much
     /// back via a `flow`. Called once per settled/acked publish so credit tracks
@@ -868,9 +1111,14 @@ impl<S: IoStream> BrokerConnection<S> {
     fn replenish_producer_credit(&mut self, channel: u16, handle: u32) {
         let threshold = (self.config.initial_credit / 2).max(1);
         let grant = match self.bindings.get_mut(&(channel, handle)) {
-            Some(Binding::Producer {
-                acked_since_grant, ..
-            }) => {
+            Some(
+                Binding::Producer {
+                    acked_since_grant, ..
+                }
+                | Binding::ExchangeProducer {
+                    acked_since_grant, ..
+                },
+            ) => {
                 *acked_since_grant += 1;
                 if *acked_since_grant >= threshold {
                     std::mem::take(acked_since_grant)
@@ -1221,6 +1469,14 @@ impl<S: IoStream> BrokerConnection<S> {
             );
             return;
         }
+        if let Some(a) = address.as_deref()
+            && a.starts_with("/exchanges/")
+        {
+            let a = a.to_owned();
+            self.accept_exchange_attach(local, remote_channel, attach, &a)
+                .await;
+            return;
+        }
         let queue = match address.as_deref() {
             Some(a) => self.registry.resolve_in(&self.vhost, a).await,
             None => None,
@@ -1320,6 +1576,262 @@ impl<S: IoStream> BrokerConnection<S> {
         tracing::debug!(handle = accepted.handle.0, role = ?accepted.role, "link bound");
     }
 
+    /// Accept a producer attach to an exchange (`/exchanges/<name>[/<key>]`).
+    /// Consumers are refused: they consume from the queues bound to it.
+    async fn accept_exchange_attach(
+        &mut self,
+        local: u16,
+        remote_channel: u16,
+        attach: Attach,
+        address: &str,
+    ) {
+        let refusal = if attach.role == Role::Receiver {
+            Some(AmqpError::new(
+                AmqpCondition::NotAllowed,
+                Some(format!(
+                    "cannot consume from exchange address {address}; consume from a queue bound to it"
+                )),
+            ))
+        } else {
+            match crate::exchange::parse_exchange_address(address) {
+                None => Some(AmqpError::new(
+                    AmqpCondition::InvalidField,
+                    Some(format!("malformed exchange address {address}")),
+                )),
+                Some(_) if !self.registry.ensure_exchanges_loaded().await => Some(AmqpError::new(
+                    AmqpCondition::InternalError,
+                    Some("exchange definitions not loaded yet; retry".to_owned()),
+                )),
+                Some((name, key)) => {
+                    let exists = crate::exchange::lookup(
+                        &self.registry.exchanges().snapshot(),
+                        &self.vhost,
+                        &name,
+                    )
+                    .is_some();
+                    if exists && crate::registry::QueueRegistry::valid_vhost(&self.vhost) {
+                        let session = self.sessions.get_mut(&local).expect("bound channel");
+                        match session.accept_peer_attach(
+                            attach,
+                            CreditMode::Manual,
+                            self.config.initial_credit,
+                            self.config.max_message_size,
+                            self.link_events_tx.clone(),
+                            &mut self.transport,
+                        ) {
+                            Ok(a) => {
+                                let epoch = self.next_gen;
+                                self.next_gen += 1;
+                                self.bindings.insert(
+                                    (local, a.handle.0),
+                                    Binding::ExchangeProducer {
+                                        route: Box::new(ExchangeRoute::new(name, key)),
+                                        epoch,
+                                        acked_since_grant: 0,
+                                    },
+                                );
+                                tracing::debug!(handle = a.handle.0, %address, "exchange producer bound");
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "attach rejected; ending session");
+                                self.end_session_with_error(
+                                    local,
+                                    remote_channel,
+                                    AmqpError::new(
+                                        AmqpCondition::ResourceLimitExceeded,
+                                        Some(e.to_string()),
+                                    ),
+                                )
+                                .await;
+                            }
+                        }
+                        return;
+                    }
+                    Some(AmqpError::new(
+                        AmqpCondition::NotFound,
+                        Some(format!("no exchange {name:?}")),
+                    ))
+                }
+            }
+        };
+        if let Some(error) = refusal {
+            let session = self.sessions.get_mut(&local).expect("bound channel");
+            session.refuse_peer_attach(&attach, error, &mut self.transport);
+        }
+    }
+
+    /// Route one delivery from an exchange producer to its destinations.
+    ///
+    /// Confirms are aggregated: an unsettled publish is accepted only once
+    /// EVERY destination queue has confirmed it (each its own durability
+    /// confirm — Raft commit, fsync), and rejected if any refused it. Like
+    /// RabbitMQ, a rejection does not undo the copies other queues already
+    /// took: a retry may duplicate there. A message routed nowhere (and
+    /// without an alternate) is accepted and dropped. If a destination cannot
+    /// be resolved the message goes nowhere and is rejected; if the exchange
+    /// was deleted the link is detached (`amqp:resource-deleted`).
+    async fn publish_via_exchange(&mut self, channel: u16, d: ramqp_core::proto::IncomingDelivery) {
+        let handle = d.handle.0;
+        let Some(Binding::ExchangeProducer { route, epoch, .. }) =
+            self.bindings.get_mut(&(channel, handle))
+        else {
+            return;
+        };
+        let epoch = *epoch;
+        let targets = match resolve_route(&self.registry, &self.vhost, route, &d.message).await {
+            Routed::Targets(t) => t,
+            Routed::ExchangeGone => {
+                self.detach_with_error(
+                    channel,
+                    handle,
+                    AmqpError::new(
+                        AmqpCondition::ResourceDeleted,
+                        Some("the exchange was deleted".to_owned()),
+                    ),
+                );
+                return;
+            }
+            Routed::Unavailable(why) => {
+                if !d.settled
+                    && let Some(session) = self.sessions.get_mut(&channel)
+                {
+                    session.send_disposition(
+                        handle,
+                        d.delivery_id,
+                        None,
+                        DeliveryState::Rejected(Rejected {
+                            error: Some(AmqpError::new(AmqpCondition::InternalError, Some(why))),
+                        }),
+                        true,
+                        &mut self.transport,
+                    );
+                }
+                self.replenish_producer_credit(channel, handle);
+                return;
+            }
+        };
+
+        if let Some(ts) = d.state.as_ref().and_then(txn_state) {
+            // All destinations stage, or none do.
+            let staged = self.txns.stage_publishes(
+                &ts.txn_id,
+                targets
+                    .iter()
+                    .map(|q| StagedPublish {
+                        queue: q.tx.clone(),
+                        queue_name: q.name.clone(),
+                        body: d.message.clone(),
+                    })
+                    .collect(),
+            );
+            if let Some(session) = self.sessions.get_mut(&channel) {
+                session.send_disposition(
+                    handle,
+                    d.delivery_id,
+                    None,
+                    staged_publish_state(staged, ts.txn_id),
+                    true,
+                    &mut self.transport,
+                );
+            }
+            self.replenish_producer_credit(channel, handle);
+            return;
+        }
+
+        let delivery_id = d.delivery_id.value();
+        let settle = |accepted| ConnCmd::SettleIncoming {
+            channel,
+            handle,
+            binding_gen: epoch,
+            delivery_id,
+            accepted,
+        };
+        if d.settled {
+            for q in targets.iter() {
+                let _ =
+                    q.tx.send(QueueMsg::Publish {
+                        body: d.message.clone(),
+                        ack: None,
+                    })
+                    .await;
+            }
+            self.replenish_producer_credit(channel, handle);
+            return;
+        }
+        match targets.len() {
+            // Unroutable: accepted and dropped (through the ack path so
+            // credit replenishes in order with real confirms).
+            0 => {
+                let _ = self.cmd_tx.send(settle(true));
+            }
+            // One destination: the queue confirms straight to us.
+            1 => {
+                let ack = PublishAck {
+                    conn: self.cmd_tx.clone(),
+                    channel,
+                    handle,
+                    binding_gen: epoch,
+                    delivery_id,
+                };
+                let sent = targets[0]
+                    .tx
+                    .send(QueueMsg::Publish {
+                        body: d.message,
+                        ack: Some(ack),
+                    })
+                    .await
+                    .is_ok();
+                if !sent {
+                    let _ = self.cmd_tx.send(settle(false));
+                }
+            }
+            // Fan-out: collect every destination's confirm, then settle once
+            // (awaited in the connection's own future set — no task per
+            // message).
+            n => {
+                let (ack_tx, mut ack_rx) = mpsc::unbounded_channel::<ConnCmd>();
+                let mut sent = 0usize;
+                for q in targets.iter() {
+                    let ok =
+                        q.tx.send(QueueMsg::Publish {
+                            body: d.message.clone(),
+                            ack: Some(PublishAck {
+                                conn: ack_tx.clone(),
+                                channel,
+                                handle,
+                                binding_gen: epoch,
+                                delivery_id,
+                            }),
+                        })
+                        .await
+                        .is_ok();
+                    sent += usize::from(ok);
+                }
+                drop(ack_tx);
+                let mut accepted = sent == n;
+                self.fanout_acks.push(Box::pin(async move {
+                    for _ in 0..sent {
+                        match ack_rx.recv().await {
+                            Some(ConnCmd::SettleIncoming { accepted: a, .. }) => accepted &= a,
+                            // A queue stopped before confirming.
+                            _ => {
+                                accepted = false;
+                                break;
+                            }
+                        }
+                    }
+                    ConnCmd::SettleIncoming {
+                        channel,
+                        handle,
+                        binding_gen: epoch,
+                        delivery_id,
+                        accepted,
+                    }
+                }));
+            }
+        }
+    }
+
     /// Drain the link events emitted synchronously by the session call we just
     /// made, routing them to queues. `channel` is the session they came from.
     async fn drain_link_events(&mut self, channel: u16) {
@@ -1327,6 +1839,13 @@ impl<S: IoStream> BrokerConnection<S> {
             match event {
                 LinkEvent::Delivery(d) => {
                     let handle = d.handle.0;
+                    if matches!(
+                        self.bindings.get(&(channel, handle)),
+                        Some(Binding::ExchangeProducer { .. })
+                    ) {
+                        self.publish_via_exchange(channel, d).await;
+                        continue;
+                    }
                     // Clone the sender + epoch out so the bindings borrow is
                     // released before the await / the credit replenishment.
                     let (queue_tx, queue_name, epoch) = match self.bindings.get(&(channel, handle))
@@ -1359,27 +1878,7 @@ impl<S: IoStream> BrokerConnection<S> {
                             },
                         );
                         if let Some(session) = self.sessions.get_mut(&channel) {
-                            use crate::txn::PublishStage;
-                            let state = match staged {
-                                PublishStage::Staged => transactional_state(
-                                    ts.txn_id,
-                                    Some(ramqp_core::types::messaging::Outcome::Accepted(
-                                        Accepted::default(),
-                                    )),
-                                ),
-                                PublishStage::UnknownTxn => DeliveryState::Rejected(Rejected {
-                                    error: Some(AmqpError::new(
-                                        TransactionError::UnknownId,
-                                        Some("unknown transaction".to_owned()),
-                                    )),
-                                }),
-                                PublishStage::Capped => DeliveryState::Rejected(Rejected {
-                                    error: Some(AmqpError::new(
-                                        AmqpCondition::ResourceLimitExceeded,
-                                        Some("transaction staging cap reached".to_owned()),
-                                    )),
-                                }),
-                            };
+                            let state = staged_publish_state(staged, ts.txn_id);
                             session.send_disposition(
                                 handle,
                                 d.delivery_id,
@@ -1410,7 +1909,22 @@ impl<S: IoStream> BrokerConnection<S> {
                         .await
                         .is_err()
                     {
-                        tracing::warn!(channel, handle, "publish to dead queue actor");
+                        // The queue actor is gone (deleted): detach the
+                        // producer so it learns instead of waiting on a
+                        // settlement that can never come.
+                        tracing::debug!(
+                            channel,
+                            handle,
+                            "publish to a stopped queue; detaching producer"
+                        );
+                        self.detach_with_error(
+                            channel,
+                            handle,
+                            AmqpError::new(
+                                AmqpCondition::ResourceDeleted,
+                                Some("the queue was deleted".to_owned()),
+                            ),
+                        );
                         continue;
                     }
                     // A pre-settled publish gets NO ack (no SettleIncoming), so

@@ -424,12 +424,17 @@ fn handle_msg(
                 }
             }
         }
-        QueueMsg::Stats { reply } => {
+        QueueMsg::Stats { reply, .. } => {
             let _ = reply.send(crate::queue::QueueStats {
                 ready: ready.len(),
                 unacked: inflight.len(),
                 consumers: subs.len(),
             });
+        }
+        // Deleting a quorum queue means tearing down its Raft group and
+        // on-disk log on every replica: not supported yet.
+        QueueMsg::Delete { reply } => {
+            let _ = reply.send(false);
         }
         QueueMsg::Unsubscribe { sub } => {
             subs.retain(|s| s.id != sub);

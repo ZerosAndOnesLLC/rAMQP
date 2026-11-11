@@ -21,10 +21,26 @@ use crate::cluster::network::UnreachableNetwork;
 use crate::cluster::node::ClusterNode;
 use crate::cluster::queue_group::QueueRaft;
 use crate::config::{BrokerConfig, QueuePolicy};
+use crate::exchange::{ExchangeError, ExchangeOp, ExchangeRegistry};
 use crate::policy::{DeadLetterSender, EffectivePolicy};
 use crate::proxy;
-use crate::queue::{self, QueueHandle};
+use crate::queue::{self, QueueHandle, QueueMsg};
 use crate::quorum;
+
+/// The store key prefix for standalone exchange definitions.
+#[cfg(feature = "store-redb")]
+const EXCHANGE_ROW: &str = "exchange:";
+
+/// Why a queue deletion did not happen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QueueDeleteError {
+    /// No such queue.
+    NotFound,
+    /// This kind cannot be deleted (quorum queues, for now).
+    Unsupported,
+    /// The deletion failed (store error); the queue is unchanged.
+    Failed,
+}
 
 /// How a resolved address wants its queue backed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,6 +102,16 @@ pub(crate) struct QueueRegistry {
     policies: Vec<(String, QueuePolicy)>,
     /// The dead-letter router, wired in right after construction.
     dlx: OnceLock<DeadLetterSender>,
+    /// Exchange definitions (the routing view).
+    exchanges: ExchangeRegistry,
+    /// Serializes standalone topology changes (read-modify-persist-swap).
+    exchange_write: tokio::sync::Mutex<()>,
+    /// Whether the routing view reflects the persisted definitions. False
+    /// only for a standalone broker with a store that has not been read yet
+    /// (e.g. the previous instance still held its lock at bind); until then
+    /// exchange attaches and changes are refused rather than served from an
+    /// empty view.
+    exchanges_loaded: std::sync::atomic::AtomicBool,
 }
 
 impl QueueRegistry {
@@ -104,7 +130,184 @@ impl QueueRegistry {
             resident_bytes_max: config.resident_bytes_max,
             policies: config.policies.clone(),
             dlx: OnceLock::new(),
+            exchanges: ExchangeRegistry::default(),
+            exchange_write: tokio::sync::Mutex::new(()),
+            exchanges_loaded: std::sync::atomic::AtomicBool::new(
+                !cfg!(feature = "store-redb") || config.data_dir.is_none(),
+            ),
         }
+    }
+
+    /// The exchange routing view.
+    pub fn exchanges(&self) -> &ExchangeRegistry {
+        &self.exchanges
+    }
+
+    /// Apply a topology change: through the metadata group when clustered,
+    /// else locally (persisted to the store when one is configured). Returns
+    /// whether it changed anything; on return this node's routing view
+    /// reflects it.
+    pub async fn exchange_op(&self, op: ExchangeOp) -> Result<bool, ExchangeError> {
+        crate::exchange::validate(&op)?;
+        if let Some(node) = self.cluster.get() {
+            let (changed, epoch) = node.exchange_op(op).await?;
+            // The commit may not have applied on this node yet: wait for it
+            // so the caller's next attach sees the change.
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            while node.exchanges_epoch() < epoch && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            self.sync_exchanges();
+            return Ok(changed);
+        }
+        let _serial = self.exchange_write.lock().await;
+        if !self.load_exchanges_locked().await {
+            return Err(ExchangeError::Unavailable(
+                "persisted exchange definitions not loaded yet (store unavailable); retry"
+                    .to_owned(),
+            ));
+        }
+        let current = self.exchanges.snapshot();
+        let mut next = (*current).clone();
+        let changed = crate::exchange::apply_op(&mut next, &op)?;
+        if changed {
+            self.persist_exchanges(&current, &next).await?;
+            self.exchanges.replace(next);
+        }
+        Ok(changed)
+    }
+
+    /// Whether the routing view is authoritative, loading the persisted
+    /// definitions first if that has not happened yet (standalone with a
+    /// store). `false` = not loadable right now; the caller refuses.
+    pub async fn ensure_exchanges_loaded(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        if self.exchanges_loaded.load(Ordering::Acquire) || self.cluster.get().is_some() {
+            return true;
+        }
+        let _serial = self.exchange_write.lock().await;
+        self.load_exchanges_locked().await
+    }
+
+    /// [`Self::ensure_exchanges_loaded`] with `exchange_write` held.
+    async fn load_exchanges_locked(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        if self.exchanges_loaded.load(Ordering::Acquire) || self.cluster.get().is_some() {
+            return true;
+        }
+        match self.read_persisted_exchanges().await {
+            Ok(defs) => {
+                if let Some(defs) = defs {
+                    self.exchanges.replace(defs);
+                }
+                self.exchanges_loaded.store(true, Ordering::Release);
+                true
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "exchange definitions not loadable yet");
+                false
+            }
+        }
+    }
+
+    /// Clustered: refresh the routing view from the applied metadata state.
+    pub fn sync_exchanges(&self) {
+        if let Some(node) = self.cluster.get() {
+            let epoch = node.exchanges_epoch();
+            self.exchanges
+                .replace_if_newer(epoch, || node.exchange_state().1);
+        }
+    }
+
+    /// Standalone: persist what changed between `before` and `after` (one
+    /// row per exchange; no-op without a store).
+    #[cfg(feature = "store-redb")]
+    async fn persist_exchanges(
+        &self,
+        before: &crate::exchange::Defs,
+        after: &crate::exchange::Defs,
+    ) -> Result<(), ExchangeError> {
+        if self.data_dir.is_none() {
+            return Ok(());
+        }
+        let store = self
+            .store()
+            .await
+            .ok_or_else(|| ExchangeError::Unavailable("durable store not openable".to_owned()))?;
+        let mut puts = Vec::new();
+        for (k, def) in after {
+            if before.get(k) != Some(def) {
+                let blob = serde_json::to_vec(def)
+                    .map_err(|e| ExchangeError::Unavailable(e.to_string()))?;
+                puts.push((format!("{EXCHANGE_ROW}{k}"), blob));
+            }
+        }
+        let deletes: Vec<String> = before
+            .keys()
+            .filter(|k| !after.contains_key(*k))
+            .map(|k| format!("{EXCHANGE_ROW}{k}"))
+            .collect();
+        tokio::task::spawn_blocking(move || store.write_definitions(&puts, &deletes))
+            .await
+            .map_err(|e| ExchangeError::Unavailable(e.to_string()))?
+            .map_err(ExchangeError::Unavailable)
+    }
+
+    #[cfg(not(feature = "store-redb"))]
+    async fn persist_exchanges(
+        &self,
+        _before: &crate::exchange::Defs,
+        _after: &crate::exchange::Defs,
+    ) -> Result<(), ExchangeError> {
+        Ok(())
+    }
+
+    /// Read the persisted standalone definitions (`None` = none stored). A
+    /// row that does not parse is moved aside (`corrupt:<key>`) with a loud
+    /// error instead of blocking every exchange: the config file's startup
+    /// declarations — or the admin API — can restore it.
+    #[cfg(feature = "store-redb")]
+    async fn read_persisted_exchanges(&self) -> Result<Option<crate::exchange::Defs>, String> {
+        let store = self.store().await.ok_or_else(|| {
+            "durable store not openable (previous instance still holds the lock?)".to_owned()
+        })?;
+        let rows = store.definitions(EXCHANGE_ROW)?;
+        if rows.is_empty() {
+            return Ok(None);
+        }
+        let mut defs = crate::exchange::Defs::new();
+        let mut quarantine = Vec::new();
+        for (key, blob) in rows {
+            match serde_json::from_slice::<crate::exchange::ExchangeDef>(&blob) {
+                Ok(def) => {
+                    defs.insert(key[EXCHANGE_ROW.len()..].to_owned(), def);
+                }
+                Err(e) => {
+                    tracing::error!(
+                        row = %key,
+                        error = %e,
+                        "corrupt exchange definition moved aside; redeclare the exchange"
+                    );
+                    quarantine.push((key, blob));
+                }
+            }
+        }
+        if !quarantine.is_empty() {
+            let puts: Vec<(String, Vec<u8>)> = quarantine
+                .iter()
+                .map(|(k, b)| (format!("corrupt:{k}"), b.clone()))
+                .collect();
+            let deletes: Vec<String> = quarantine.into_iter().map(|(k, _)| k).collect();
+            tokio::task::spawn_blocking(move || store.write_definitions(&puts, &deletes))
+                .await
+                .map_err(|e| e.to_string())??;
+        }
+        Ok(Some(defs))
+    }
+
+    #[cfg(not(feature = "store-redb"))]
+    async fn read_persisted_exchanges(&self) -> Result<Option<crate::exchange::Defs>, String> {
+        Ok(None)
     }
 
     /// Wire the dead-letter router (once, right after construction).
@@ -194,6 +397,21 @@ impl QueueRegistry {
         (!name.is_empty()).then_some((QueueKind::Transient, name))
     }
 
+    /// Whether `address` explicitly names a queue (`/queues/`, `/quorum/`,
+    /// `/durable/` with a non-empty name) — the strict form declarations
+    /// require (bare names are accepted only at attach, for compatibility).
+    pub fn is_queue_address(address: &str) -> bool {
+        ["/queues/", "/quorum/", "/durable/"]
+            .iter()
+            .any(|p| address.strip_prefix(p).is_some_and(|n| !n.is_empty()))
+    }
+
+    /// Whether a vhost name is usable as a namespace (no `/`, no control
+    /// characters).
+    pub fn valid_vhost(vhost: &str) -> bool {
+        !vhost.contains('/') && !vhost.chars().any(char::is_control)
+    }
+
     /// Resolve an address in the default namespace — broker-INTERNAL callers
     /// only (the dead-letter router, management). Unlike client resolution,
     /// this accepts qualified names containing `/`: a per-vhost policy
@@ -214,7 +432,9 @@ impl QueueRegistry {
     pub async fn resolve_in(&self, vhost: &str, address: &str) -> Option<QueueHandle> {
         let (kind, bare) = Self::parse_address(address)?;
         let valid = |s: &str| !s.contains('/') && !s.chars().any(char::is_control);
-        if !valid(bare) || !valid(vhost) {
+        // `$`-prefixed names are reserved for broker pseudo-addresses (the
+        // transaction coordinator authorizes as `$coordinator`).
+        if !valid(bare) || !valid(vhost) || bare.starts_with('$') {
             tracing::debug!(
                 vhost,
                 address,
@@ -230,6 +450,154 @@ impl QueueRegistry {
             &qualified
         };
         self.resolve_name(kind, name, vhost).await
+    }
+
+    /// The registry key for a kind + namespace-qualified name.
+    fn key_for(kind: QueueKind, name: &str) -> String {
+        match kind {
+            QueueKind::Transient => format!("t:{name}"),
+            QueueKind::Quorum => format!("q:{name}"),
+            QueueKind::Durable => format!("d:{name}"),
+        }
+    }
+
+    /// The namespace-qualified name (`<vhost>/<name>`, or `<name>` in the
+    /// default vhost), or `None` if either part is invalid.
+    pub fn qualify(vhost: &str, bare: &str) -> Option<String> {
+        let valid = |s: &str| !s.contains('/') && !s.chars().any(char::is_control);
+        if bare.is_empty() || !valid(bare) || !valid(vhost) || bare.starts_with('$') {
+            return None;
+        }
+        Some(if vhost.is_empty() {
+            bare.to_owned()
+        } else {
+            format!("{vhost}/{bare}")
+        })
+    }
+
+    /// The declared (live) queue of `kind` with this qualified name.
+    pub fn lookup(&self, kind: QueueKind, qualified: &str) -> Option<QueueHandle> {
+        let map = self.queues.lock().expect("registry lock");
+        map.get(&Self::key_for(kind, qualified))
+            .and_then(|c| c.get().cloned())
+            .filter(|h| !h.tx.is_closed())
+    }
+
+    /// Find a declared queue (of `kind`, or any kind preferring quorum,
+    /// durable, transient). A durable queue with persisted messages but no
+    /// live actor (not attached since a restart) is recovered so callers see
+    /// its real contents.
+    pub async fn find_queue(
+        &self,
+        kind: Option<QueueKind>,
+        qualified: &str,
+    ) -> Option<(QueueKind, QueueHandle)> {
+        let kinds = match kind {
+            Some(k) => vec![k],
+            None => vec![QueueKind::Quorum, QueueKind::Durable, QueueKind::Transient],
+        };
+        for k in &kinds {
+            if let Some(h) = self.lookup(*k, qualified) {
+                return Some((*k, h));
+            }
+        }
+        // A clustered quorum queue declared anywhere is in the replicated
+        // catalog: serve it here too (a leader-following proxy), so a lookup
+        // works on every node, not only where something attached.
+        if kinds.contains(&QueueKind::Quorum)
+            && let Some(node) = self.cluster.get()
+            && node.has_queue(qualified)
+        {
+            let vhost = qualified.split_once('/').map_or("", |(v, _)| v);
+            if let Some(h) = self.resolve_name(QueueKind::Quorum, qualified, vhost).await {
+                return Some((QueueKind::Quorum, h));
+            }
+        }
+        #[cfg(feature = "store-redb")]
+        if kinds.contains(&QueueKind::Durable)
+            && self.data_dir.is_some()
+            && let Some(store) = self.store().await
+            && store.has_queue(qualified).unwrap_or(false)
+        {
+            let vhost = qualified.split_once('/').map_or("", |(v, _)| v);
+            if let Some(h) = self
+                .resolve_name(QueueKind::Durable, qualified, vhost)
+                .await
+            {
+                return Some((QueueKind::Durable, h));
+            }
+        }
+        None
+    }
+
+    /// Which kinds currently have a live queue under this qualified name.
+    pub fn kinds_of(&self, qualified: &str) -> Vec<QueueKind> {
+        [QueueKind::Quorum, QueueKind::Durable, QueueKind::Transient]
+            .into_iter()
+            .filter(|k| self.lookup(*k, qualified).is_some())
+            .collect()
+    }
+
+    /// Delete a queue (management API). Transient and durable queues
+    /// detach their consumers (`amqp:resource-deleted`), drop their
+    /// messages (a durable queue purges its rows), and stop; the next
+    /// attach to the address declares a fresh, empty queue.
+    pub async fn delete_queue(
+        &self,
+        kind: QueueKind,
+        qualified: &str,
+    ) -> Result<(), QueueDeleteError> {
+        if kind == QueueKind::Quorum {
+            return Err(QueueDeleteError::Unsupported);
+        }
+        let (_, handle) = self
+            .find_queue(Some(kind), qualified)
+            .await
+            .ok_or(QueueDeleteError::NotFound)?;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if handle
+            .tx
+            .send(QueueMsg::Delete { reply: tx })
+            .await
+            .is_err()
+        {
+            return Err(QueueDeleteError::NotFound);
+        }
+        match rx.await {
+            Ok(true) => {
+                let key = Self::key_for(kind, qualified);
+                {
+                    let mut map = self.queues.lock().expect("registry lock");
+                    if map
+                        .get(&key)
+                        .and_then(|c| c.get())
+                        .is_some_and(|h| h.tx.same_channel(&handle.tx))
+                    {
+                        map.remove(&key);
+                    }
+                }
+                // Drop the bindings that target it, or the next exchange
+                // publish would re-declare it (and it would fill unconsumed).
+                let (vhost, bare) = qualified.split_once('/').unwrap_or(("", qualified));
+                let prefix = match kind {
+                    QueueKind::Transient => "/queues/",
+                    QueueKind::Quorum => "/quorum/",
+                    QueueKind::Durable => "/durable/",
+                };
+                if let Err(e) = self
+                    .exchange_op(ExchangeOp::UnbindDestination {
+                        vhost: vhost.to_owned(),
+                        destination: format!("{prefix}{bare}"),
+                    })
+                    .await
+                {
+                    tracing::warn!(queue = %qualified, error = %e, "could not remove the deleted queue's bindings");
+                }
+                Ok(())
+            }
+            Ok(false) => Err(QueueDeleteError::Failed),
+            Err(_) => Err(QueueDeleteError::NotFound),
+        }
     }
 
     /// Count declared queues belonging to `vhost` (any kind). Keys are
@@ -254,11 +622,7 @@ impl QueueRegistry {
     async fn resolve_name(&self, kind: QueueKind, name: &str, vhost: &str) -> Option<QueueHandle> {
         // Kind-qualified key: `/queues/foo`, `/quorum/foo`, and
         // `/durable/foo` are distinct queues.
-        let key = match kind {
-            QueueKind::Transient => format!("t:{name}"),
-            QueueKind::Quorum => format!("q:{name}"),
-            QueueKind::Durable => format!("d:{name}"),
-        };
+        let key = Self::key_for(kind, name);
         // Bounded retry so a queue that dies on spawn can't loop forever.
         for _ in 0..3 {
             // Brief lock: get or create this key's init cell, then release. A
@@ -491,6 +855,45 @@ async fn spawn_quorum_group(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review L10: an unreadable definitions row is moved aside (with an
+    /// error) instead of blocking every exchange; good rows still load.
+    #[cfg(feature = "store-redb")]
+    #[tokio::test]
+    async fn corrupt_exchange_rows_are_moved_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = BrokerConfig {
+            data_dir: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        };
+        let r = QueueRegistry::new(&config);
+        let store = r.store().await.expect("store opens");
+        let good = crate::exchange::ExchangeDef {
+            kind: crate::exchange::ExchangeKind::Topic,
+            alternate: None,
+            bindings: Vec::new(),
+        };
+        store
+            .write_definitions(
+                &[
+                    (
+                        "exchange:/good".to_owned(),
+                        serde_json::to_vec(&good).unwrap(),
+                    ),
+                    ("exchange:/bad".to_owned(), b"{oops".to_vec()),
+                ],
+                &[],
+            )
+            .unwrap();
+        assert!(r.ensure_exchanges_loaded().await, "loading is not blocked");
+        let defs = r.exchanges().snapshot();
+        assert_eq!(defs.get("/good"), Some(&good));
+        assert!(!defs.contains_key("/bad"));
+        let rows = store.definitions("exchange:").unwrap();
+        assert_eq!(rows.len(), 1, "the corrupt row left the live set");
+        let aside = store.definitions("corrupt:").unwrap();
+        assert_eq!(aside[0].0, "corrupt:exchange:/bad");
+    }
 
     #[test]
     fn address_normalization() {

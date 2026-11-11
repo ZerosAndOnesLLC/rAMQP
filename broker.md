@@ -388,6 +388,10 @@ in the metadata group.
   an address convention (RabbitMQ-4.x-style `/queues/<name>`, `/exchanges/...`, or
   a simpler flat namespace) — decide early; document it. Encodes queue type
   (quorum|transient) at declaration.
+  **Decided (issue #37):** RabbitMQ-4.x v2 addressing — `/queues/<name>`
+  (plus `/quorum/` and `/durable/` for the replicated / on-disk kinds) and
+  `/exchanges/<name>[/<routing-key>]` for pub/sub, so 1.0 clients written
+  against RabbitMQ 4.x move unchanged.
 - **Queues / topics.** Ordered queues; optional pub/sub (topic) fan-out. Queue
   storage is contiguous/index-addressed for cache-friendliness (§3.2).
 - **Message store.** For **quorum** queues: the Raft state machine + snapshots
@@ -594,8 +598,9 @@ Ordered by how much they threaten the plan. Status as of Phases 0–9 complete
 - **Spill-segment shipping** — a paged quorum queue's snapshot keeps bodies
   external (node-local), so follower catch-up *via snapshot* is unsupported;
   log-replay catch-up works.
-- **Fabric authentication** — inter-node RPCs are currently unauthenticated (bind
-  the fabric to a trusted network); a fabric-level auth/mTLS story is owed before a
-  hostile-network deployment.
-- **Management surface** — read-only today (`/metrics`, `/queues`); queue
-  delete + a richer admin protocol are the next slice.
+- ✅ **Fabric authentication** — optional mutual TLS on the fabric
+  (`ClusterMemberConfig::tls`, issue #37); without it the fabric must still sit
+  on a trusted network.
+- ✅ **Management surface** — admin API (declare/delete queues, exchanges,
+  bindings; per-queue stats) landed with issue #37. Still open: deleting
+  **quorum** queues (Raft group + log teardown on every replica).

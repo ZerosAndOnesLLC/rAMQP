@@ -49,6 +49,18 @@ jobs:
       - run: cargo test
       - run: cargo test --all-features
 
+  fips:
+    name: FIPS build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # AWS-LC's FIPS module builds with CMake + Go (both on ubuntu-latest).
+      - run: cargo test -p ramqp-core --no-default-features --features scram-fips
+      - run: cargo test -p ramqp-broker --no-default-features --features fips,jemalloc,store-redb
+
   docs:
     name: Docs
     runs-on: ubuntu-latest

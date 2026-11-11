@@ -36,6 +36,11 @@ const RAFT_LOG: TableDefinition<(u64, u64), &[u8]> = TableDefinition::new("raft_
 /// inline, atomic with the pointer — or `"snap_path"` — a file path for
 /// large paged-queue blobs).
 const RAFT_META: TableDefinition<(u64, &str), &[u8]> = TableDefinition::new("raft_meta");
+/// Standalone topology definitions: `exchange:<vhost>/<name>` → JSON of
+/// that exchange (one row each, so a change rewrites only its own row;
+/// unreadable rows are moved aside under `corrupt:`). A clustered node
+/// keeps these in the metadata Raft group instead.
+const DEFINITIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("definitions");
 
 /// How many operations one commit may absorb.
 const COMMIT_BATCH_MAX: usize = 1024;
@@ -54,6 +59,15 @@ pub(crate) enum StoreOp {
     Remove { queue: u64, msg_id: u64 },
     /// Count a failed delivery attempt (requeue with penalty).
     Fail { queue: u64, msg_id: u64 },
+    /// Remove every stored message of a queue (queue deletion); `done`
+    /// fires once that is on disk.
+    PurgeQueue {
+        queue: u64,
+        /// The queue's name: its name → id row is removed too, so a later
+        /// declare allocates a fresh id.
+        name: String,
+        done: oneshot::Sender<bool>,
+    },
     /// Durably append Raft log entries; `done` fires once fsynced.
     RaftAppend {
         group: u64,
@@ -96,7 +110,8 @@ impl StoreOp {
             | StoreOp::RaftVote { done, .. }
             | StoreOp::RaftTruncate { done, .. }
             | StoreOp::RaftPurge { done, .. }
-            | StoreOp::RaftSnapshot { done, .. } => Some(done),
+            | StoreOp::RaftSnapshot { done, .. }
+            | StoreOp::PurgeQueue { done, .. } => Some(done),
             StoreOp::Remove { .. } | StoreOp::Fail { .. } => None,
         }
     }
@@ -131,6 +146,7 @@ impl Store {
             txn.open_table(RAFT_GROUPS).map_err(|e| e.to_string())?;
             txn.open_table(RAFT_LOG).map_err(|e| e.to_string())?;
             txn.open_table(RAFT_META).map_err(|e| e.to_string())?;
+            txn.open_table(DEFINITIONS).map_err(|e| e.to_string())?;
             txn.commit().map_err(|e| e.to_string())?;
         }
         let (writer, rx) = mpsc::channel(4096);
@@ -150,6 +166,13 @@ impl Store {
             .send(op)
             .await
             .map_err(|_| "store writer stopped".to_owned())
+    }
+
+    /// Whether a durable queue with this name was ever declared.
+    pub fn has_queue(&self, name: &str) -> Result<bool, String> {
+        let txn = self.db.begin_read().map_err(|e| e.to_string())?;
+        let table = txn.open_table(QUEUES).map_err(|e| e.to_string())?;
+        Ok(table.get(name).map_err(|e| e.to_string())?.is_some())
     }
 
     /// The stable id for a queue name, allocating one on first use.
@@ -184,6 +207,45 @@ impl Store {
         };
         txn.commit().map_err(|e| e.to_string())?;
         Ok(id)
+    }
+
+    /// Every definitions row whose key starts with `prefix`.
+    pub fn definitions(&self, prefix: &str) -> Result<Vec<(String, Vec<u8>)>, String> {
+        let txn = self.db.begin_read().map_err(|e| e.to_string())?;
+        let table = txn.open_table(DEFINITIONS).map_err(|e| e.to_string())?;
+        let mut out = Vec::new();
+        for entry in table.range(prefix..).map_err(|e| e.to_string())? {
+            let (k, v) = entry.map_err(|e| e.to_string())?;
+            let key = k.value();
+            if !key.starts_with(prefix) {
+                break;
+            }
+            out.push((key.to_owned(), v.value().to_vec()));
+        }
+        Ok(out)
+    }
+
+    /// Durably write and delete definitions rows in one fsynced transaction
+    /// (topology changes are rare and must not wait behind the message
+    /// group-commit). Blocking: call from `spawn_blocking`.
+    pub fn write_definitions(
+        &self,
+        puts: &[(String, Vec<u8>)],
+        deletes: &[String],
+    ) -> Result<(), String> {
+        let txn = self.db.begin_write().map_err(|e| e.to_string())?;
+        {
+            let mut table = txn.open_table(DEFINITIONS).map_err(|e| e.to_string())?;
+            for (k, v) in puts {
+                table
+                    .insert(k.as_str(), v.as_slice())
+                    .map_err(|e| e.to_string())?;
+            }
+            for k in deletes {
+                table.remove(k.as_str()).map_err(|e| e.to_string())?;
+            }
+        }
+        txn.commit().map_err(|e| e.to_string())
     }
 
     /// Recovery scan: every stored `(msg_id, failures, enqueued_ms,
@@ -436,6 +498,7 @@ fn apply_batch(db: &Database, batch: &[StoreOp]) -> Result<(), String> {
         let mut raft_log = txn.open_table(RAFT_LOG).map_err(|e| e.to_string())?;
         let mut raft_meta = txn.open_table(RAFT_META).map_err(|e| e.to_string())?;
         let mut table = txn.open_table(MESSAGES).map_err(|e| e.to_string())?;
+        let mut queues = txn.open_table(QUEUES).map_err(|e| e.to_string())?;
         for op in batch {
             match op {
                 StoreOp::RaftAppend { group, entries, .. } => {
@@ -510,6 +573,12 @@ fn apply_batch(db: &Database, batch: &[StoreOp]) -> Result<(), String> {
                 }
                 StoreOp::Remove { queue, msg_id } => {
                     table.remove((*queue, *msg_id)).map_err(|e| e.to_string())?;
+                }
+                StoreOp::PurgeQueue { queue, name, .. } => {
+                    table
+                        .retain_in((*queue, 0)..=(*queue, u64::MAX), |_, _| false)
+                        .map_err(|e| e.to_string())?;
+                    queues.remove(name.as_str()).map_err(|e| e.to_string())?;
                 }
                 StoreOp::Fail { queue, msg_id } => {
                     let updated = table

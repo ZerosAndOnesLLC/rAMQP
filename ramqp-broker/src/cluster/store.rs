@@ -63,11 +63,24 @@ pub trait ReplicatedState: Default + Debug + Clone + Send + Sync + 'static {
     fn restore_snapshot(&mut self, bytes: &[u8]) -> Result<(), String>;
 }
 
-/// The metadata group's state: the replicated queue catalog.
+/// The metadata group's state: the replicated queue catalog and the
+/// exchange topology.
 #[derive(Debug, Clone, Default, Serialize, serde::Deserialize)]
 pub struct MetaState {
     /// Queue name → replicated description.
     pub catalog: BTreeMap<String, QueueSpec>,
+    /// Exchange definitions (with their bindings).
+    pub exchanges: crate::exchange::Defs,
+    /// Bumped on every applied exchange change, so nodes can tell whether
+    /// their local routing view is current.
+    pub exchanges_epoch: u64,
+}
+
+/// The pre-exchange (0.9.x) snapshot encoding, still readable so a node
+/// upgraded in place restores its catalog.
+#[derive(serde::Deserialize)]
+struct LegacyMetaState {
+    catalog: BTreeMap<String, QueueSpec>,
 }
 
 impl ReplicatedState for MetaState {
@@ -75,6 +88,15 @@ impl ReplicatedState for MetaState {
     type Response = MetaResponse;
 
     fn apply(&mut self, command: &Self::Command) -> Self::Response {
+        if let MetaCommand::Exchange(op) = command {
+            let result = crate::exchange::apply_op(&mut self.exchanges, op).map(|changed| {
+                if changed {
+                    self.exchanges_epoch += 1;
+                }
+                (changed, self.exchanges_epoch)
+            });
+            return MetaResponse::Exchange(result);
+        }
         meta::apply(&mut self.catalog, command)
     }
 
@@ -83,11 +105,33 @@ impl ReplicatedState for MetaState {
     }
 
     fn snapshot_bytes(&self) -> Result<Vec<u8>, String> {
+        // Until exchanges are used, keep the 0.9.x encoding: a node not yet
+        // upgraded (rolling upgrade, or a rollback) can still install it.
+        if self.exchanges.is_empty() && self.exchanges_epoch == 0 {
+            #[derive(Serialize)]
+            struct Legacy<'a> {
+                catalog: &'a BTreeMap<String, QueueSpec>,
+            }
+            return crate::serde_bin::to_vec(&Legacy {
+                catalog: &self.catalog,
+            })
+            .map_err(|e| e.to_string());
+        }
         crate::serde_bin::to_vec(self).map_err(|e| e.to_string())
     }
 
     fn restore_snapshot(&mut self, bytes: &[u8]) -> Result<(), String> {
-        *self = crate::serde_bin::from_slice(bytes).map_err(|e| e.to_string())?;
+        *self = match crate::serde_bin::from_slice(bytes) {
+            Ok(state) => state,
+            Err(e) => {
+                let legacy: LegacyMetaState =
+                    crate::serde_bin::from_slice(bytes).map_err(|_| e.to_string())?;
+                MetaState {
+                    catalog: legacy.catalog,
+                    ..Default::default()
+                }
+            }
+        };
         Ok(())
     }
 }
@@ -402,6 +446,16 @@ impl MetaStore {
     /// A point-in-time copy of the applied queue catalog.
     pub fn catalog(&self) -> BTreeMap<String, QueueSpec> {
         self.with_state(|s| s.catalog.clone())
+    }
+
+    /// The applied exchange-definitions epoch.
+    pub fn exchanges_epoch(&self) -> u64 {
+        self.with_state(|s| s.exchanges_epoch)
+    }
+
+    /// A point-in-time copy of the exchange definitions and their epoch.
+    pub fn exchanges(&self) -> (u64, crate::exchange::Defs) {
+        self.with_state(|s| (s.exchanges_epoch, s.exchanges.clone()))
     }
 }
 
@@ -799,6 +853,54 @@ mod tests {
     use super::super::meta::{MetaCommand, QueueSpec, QueueType};
     use super::super::network::UnreachableNetwork;
     use super::*;
+
+    /// A metadata snapshot written before exchanges existed (0.9.x: the
+    /// catalog alone) still restores after an in-place upgrade; a current
+    /// snapshot round-trips with its exchange state.
+    #[test]
+    fn meta_snapshot_restores_legacy_and_current_formats() {
+        #[derive(Serialize)]
+        struct Legacy {
+            catalog: BTreeMap<String, QueueSpec>,
+        }
+        let spec = QueueSpec {
+            queue_type: QueueType::Quorum,
+            replicas: 3,
+            placement: vec![1, 2, 3],
+        };
+        let legacy = crate::serde_bin::to_vec(&Legacy {
+            catalog: BTreeMap::from([("orders".to_owned(), spec.clone())]),
+        })
+        .unwrap();
+        // Until exchanges are used, a snapshot keeps the legacy encoding so
+        // an older node can still install it (review M2).
+        let unused = MetaState {
+            catalog: BTreeMap::from([("orders".to_owned(), spec.clone())]),
+            ..Default::default()
+        };
+        assert_eq!(unused.snapshot_bytes().unwrap(), legacy);
+        let mut state = MetaState::default();
+        state.restore_snapshot(&legacy).expect("legacy restores");
+        assert_eq!(state.catalog.get("orders"), Some(&spec));
+        assert!(state.exchanges.is_empty());
+
+        let op = crate::exchange::ExchangeOp::Declare {
+            vhost: String::new(),
+            name: "events".into(),
+            kind: crate::exchange::ExchangeKind::Topic,
+            alternate: None,
+        };
+        assert_eq!(
+            state.apply(&MetaCommand::Exchange(op)),
+            MetaResponse::Exchange(Ok((true, 1)))
+        );
+        let bytes = state.snapshot_bytes().unwrap();
+        let mut back = MetaState::default();
+        back.restore_snapshot(&bytes).unwrap();
+        assert_eq!(back.exchanges_epoch, 1);
+        assert!(back.exchanges.contains_key("/events"));
+        assert_eq!(back.catalog.get("orders"), Some(&spec));
+    }
 
     /// Reopen the redb store, waiting out the writer thread's lock release
     /// (a real restart is a process boundary).

@@ -69,7 +69,15 @@ pub struct NodeSettings {
     /// On-disk Raft hard-state persistence (`store-redb` + `data_dir`):
     /// groups recover their log/vote/snapshot across restarts.
     pub persist: Option<Arc<dyn super::store::RaftPersistFactory>>,
+    /// Fabric mutual TLS (see [`crate::config::ClusterMemberConfig::tls`]).
+    pub tls: Option<crate::config::TlsServerConfig>,
 }
+
+/// Capability bit: applies `MetaCommand::Exchange` (and the extended
+/// metadata snapshot).
+const CAP_EXCHANGES: u64 = 1;
+/// What this node supports (answered to `RequestKind::Capabilities`).
+const CAPABILITIES: u64 = CAP_EXCHANGES;
 
 /// One local member of a per-queue Raft group.
 struct GroupMember {
@@ -97,6 +105,9 @@ pub struct ClusterNode {
     /// which then answers the leader's appends with conflicts below its
     /// matched index ("follower log reversion", an openraft panic).
     stopping: std::sync::atomic::AtomicBool,
+    /// Every voter has confirmed it understands exchange metadata commands
+    /// (checked before the first one is proposed; sticky once true).
+    exchanges_capable: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for ClusterNode {
@@ -157,7 +168,13 @@ impl ClusterNode {
                  for durable clustering"
             );
         }
-        let peers = Arc::new(fabric::Peers::default());
+        let fabric_tls = match &settings.tls {
+            Some(tls) => Some(Arc::new(
+                fabric::FabricTls::new(tls).map_err(std::io::Error::other)?,
+            )),
+            None => None,
+        };
+        let peers = Arc::new(fabric::Peers::with_tls(fabric_tls.clone()));
         let raft_config = Arc::new(
             meta_raft_config()
                 .validate()
@@ -193,7 +210,9 @@ impl ClusterNode {
         // into every group (a high-term Vote alone is a cluster-wide
         // liveness DoS). Until fabric auth/TLS lands it MUST be confined to
         // an isolated, trusted network — say so loudly on any other bind.
-        if !fabric_addr.ip().is_loopback() {
+        if fabric_tls.is_some() {
+            tracing::info!(addr = %fabric_addr, "cluster fabric uses mutual TLS");
+        } else if !fabric_addr.ip().is_loopback() {
             tracing::warn!(
                 addr = %fabric_addr,
                 "cluster fabric is listening on a non-loopback address with NO authentication \
@@ -215,9 +234,15 @@ impl ClusterNode {
             shutdown,
             settings,
             stopping: std::sync::atomic::AtomicBool::new(false),
+            exchanges_capable: std::sync::atomic::AtomicBool::new(false),
         });
 
-        tokio::spawn(serve_fabric(listener, node.clone(), shutdown_rx));
+        tokio::spawn(serve_fabric(
+            listener,
+            fabric_tls,
+            node.clone(),
+            shutdown_rx,
+        ));
 
         // The lowest seed id proposes the initial membership, retrying until
         // a quorum of seeds is reachable. Initializing an already-initialized
@@ -684,8 +709,112 @@ impl ClusterNode {
         }
     }
 
+    /// Commit a topology change through the metadata group. Returns
+    /// whether it changed anything and the resulting definitions epoch.
+    pub(crate) async fn exchange_op(
+        &self,
+        op: crate::exchange::ExchangeOp,
+    ) -> Result<(bool, u64), crate::exchange::ExchangeError> {
+        use crate::exchange::{ExchangeError, ExchangeOp};
+        self.ensure_exchange_capable().await?;
+        let removes = matches!(op, ExchangeOp::Delete { .. } | ExchangeOp::Unbind { .. });
+        let (result, ambiguous) = self.meta_write_tracked(MetaCommand::Exchange(op)).await;
+        match result {
+            // A retry after an ambiguous failure may find its own earlier
+            // attempt already applied: the requested state holds, so a
+            // removal reporting "not found" succeeded.
+            Ok(MetaResponse::Exchange(Err(ExchangeError::NotFound(_)))) if ambiguous && removes => {
+                Ok((true, self.exchanges_epoch()))
+            }
+            Ok(MetaResponse::Exchange(result)) => result,
+            Ok(other) => Err(ExchangeError::Unavailable(format!(
+                "unexpected metadata response {other:?}"
+            ))),
+            Err(e) => Err(ExchangeError::Unavailable(e)),
+        }
+    }
+
+    /// Refuse exchange commands until every metadata voter runs a version
+    /// that can apply them: an older node would fail to decode the log entry
+    /// (or a snapshot carrying exchange state). Checked over the fabric
+    /// (`RequestKind::Capabilities`, which an older node cannot answer).
+    async fn ensure_exchange_capable(&self) -> Result<(), crate::exchange::ExchangeError> {
+        use std::sync::atomic::Ordering;
+        if self.exchanges_capable.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        for (id, addr) in self.voters() {
+            if id == self.node_id {
+                continue;
+            }
+            let capable = async {
+                let conn = self.peers.client(id, &addr).conn().await.ok()?;
+                let reply = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    conn.call(RequestKind::Capabilities, Bytes::new()),
+                )
+                .await
+                .ok()?
+                .ok()?;
+                crate::serde_bin::from_slice::<u64>(&reply).ok()
+            }
+            .await
+            .is_some_and(|caps| caps & CAP_EXCHANGES != 0);
+            if !capable {
+                return Err(crate::exchange::ExchangeError::Unavailable(format!(
+                    "cluster node {id} does not support exchanges yet: upgrade every node \
+                     before declaring exchanges or bindings"
+                )));
+            }
+        }
+        self.exchanges_capable.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// Whether the replicated catalog has this queue.
+    pub(crate) fn has_queue(&self, name: &str) -> bool {
+        self.meta_store.catalog().contains_key(name)
+    }
+
+    /// This node's applied exchange definitions and their epoch.
+    pub(crate) fn exchange_state(&self) -> (u64, crate::exchange::Defs) {
+        self.meta_store.exchanges()
+    }
+
+    /// This node's applied exchange-definitions epoch.
+    pub(crate) fn exchanges_epoch(&self) -> u64 {
+        self.meta_store.exchanges_epoch()
+    }
+
+    /// Fires whenever the metadata group's state advances (applies, leader
+    /// changes) — the trigger for re-syncing derived local views.
+    pub(crate) fn meta_changes(
+        &self,
+    ) -> tokio::sync::watch::Receiver<openraft::RaftMetrics<NodeId, BasicNode>> {
+        self.meta.metrics()
+    }
+
     /// Commit a catalog write, forwarding to the metadata leader if needed.
     pub async fn meta_write(&self, cmd: MetaCommand) -> Result<MetaResponse, String> {
+        self.meta_write_tracked(cmd).await.0
+    }
+
+    /// [`Self::meta_write`], also reporting whether an attempt failed
+    /// AMBIGUOUSLY before the final one (it may have been applied anyway).
+    pub(crate) async fn meta_write_tracked(
+        &self,
+        cmd: MetaCommand,
+    ) -> (Result<MetaResponse, String>, bool) {
+        let mut ambiguous = false;
+        let result = self.meta_write_inner(cmd, &mut ambiguous).await;
+        (result, ambiguous)
+    }
+
+    async fn meta_write_inner(
+        &self,
+        cmd: MetaCommand,
+        ambiguous: &mut bool,
+    ) -> Result<MetaResponse, String> {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         let mut hint: Option<(NodeId, Option<String>)> = None;
         loop {
@@ -702,6 +831,7 @@ impl ClusterNode {
                     hint = next.map(|id| (id, None));
                 }
                 Err(MetaWriteError::Other(e)) => {
+                    *ambiguous = true;
                     tracing::debug!(error = %e, "meta write retry");
                 }
             }
@@ -947,6 +1077,7 @@ where
 /// Accept fabric connections until shutdown.
 async fn serve_fabric(
     listener: TcpListener,
+    tls: Option<Arc<fabric::FabricTls>>,
     node: Arc<ClusterNode>,
     mut shutdown: watch::Receiver<bool>,
 ) {
@@ -956,7 +1087,7 @@ async fn serve_fabric(
                 match accepted {
                     Ok((stream, _peer)) => {
                         let _ = stream.set_nodelay(true);
-                        tokio::spawn(handle_conn(stream, node.clone()));
+                        tokio::spawn(accept_conn(stream, tls.clone(), node.clone()));
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "fabric accept error; continuing");
@@ -967,6 +1098,62 @@ async fn serve_fabric(
             _ = shutdown.changed() => return,
         }
     }
+}
+
+/// Complete an inbound fabric connection: the TLS handshake (requiring a
+/// cluster-CA client certificate) when configured, then serve it.
+#[cfg(any(feature = "tls", feature = "fips"))]
+async fn accept_conn(
+    stream: tokio::net::TcpStream,
+    tls: Option<Arc<fabric::FabricTls>>,
+    node: Arc<ClusterNode>,
+) {
+    match tls {
+        Some(tls) => {
+            match tokio::time::timeout(Duration::from_secs(10), tls.acceptor.accept(stream)).await {
+                Ok(Ok(stream)) => {
+                    // Chain verification proved the CA; also require the
+                    // certificate to name a seed host (cluster membership).
+                    let hosts: Vec<_> = node
+                        .settings
+                        .seeds
+                        .iter()
+                        .filter_map(|(_, addr)| crate::tls::server_name(addr).ok())
+                        .collect();
+                    let member = stream
+                        .get_ref()
+                        .1
+                        .peer_certificates()
+                        .and_then(|c| c.first())
+                        .is_some_and(|leaf| crate::tls::names_one_of(leaf, &hosts));
+                    if !member {
+                        tracing::warn!(
+                            "fabric peer certificate names no cluster seed host; refused"
+                        );
+                        return;
+                    }
+                    let (r, w) = tokio::io::split(stream);
+                    handle_conn(r, w, node).await;
+                }
+                Ok(Err(e)) => tracing::warn!(error = %e, "fabric TLS handshake refused"),
+                Err(_) => tracing::warn!("fabric TLS handshake timed out"),
+            }
+        }
+        None => {
+            let (r, w) = stream.into_split();
+            handle_conn(r, w, node).await;
+        }
+    }
+}
+
+#[cfg(not(any(feature = "tls", feature = "fips")))]
+async fn accept_conn(
+    stream: tokio::net::TcpStream,
+    _tls: Option<Arc<fabric::FabricTls>>,
+    node: Arc<ClusterNode>,
+) {
+    let (r, w) = stream.into_split();
+    handle_conn(r, w, node).await;
 }
 
 /// A queue-bound command from this connection, delivered in order by the
@@ -1002,8 +1189,11 @@ struct LeaderSubs {
 }
 
 /// Serve one inbound fabric connection.
-async fn handle_conn(stream: tokio::net::TcpStream, node: Arc<ClusterNode>) {
-    let (mut reader, writer_half) = stream.into_split();
+async fn handle_conn<R, W>(mut reader: R, writer_half: W, node: Arc<ClusterNode>)
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     let writer = spawn_writer(writer_half);
     let subs: Arc<std::sync::Mutex<LeaderSubs>> =
         Arc::new(std::sync::Mutex::new(LeaderSubs::default()));
@@ -1188,6 +1378,47 @@ async fn handle_request(
                     &writer,
                     corr,
                     crate::serde_bin::to_vec(&ok).map_err(|e| e.to_string()),
+                );
+            });
+        }
+        RequestKind::Capabilities => {
+            send_reply(
+                writer,
+                corr,
+                crate::serde_bin::to_vec(&CAPABILITIES).map_err(|e| e.to_string()),
+            );
+        }
+        RequestKind::QueueStats { queue } => {
+            let node = node.clone();
+            let writer = writer.clone();
+            tokio::spawn(async move {
+                let stats = match node.leader_actor(&queue).await {
+                    Ok(handle) => {
+                        let (tx, rx) = oneshot::channel();
+                        if handle
+                            .tx
+                            .send(QueueMsg::Stats {
+                                reply: tx,
+                                forward: false,
+                            })
+                            .await
+                            .is_ok()
+                        {
+                            tokio::time::timeout(Duration::from_secs(2), rx)
+                                .await
+                                .ok()
+                                .and_then(Result::ok)
+                                .map(|s| (s.ready as u64, s.unacked as u64, s.consumers as u64))
+                        } else {
+                            None
+                        }
+                    }
+                    Err(_) => None,
+                };
+                send_reply(
+                    &writer,
+                    corr,
+                    crate::serde_bin::to_vec(&stats).map_err(|e| e.to_string()),
                 );
             });
         }
@@ -1478,6 +1709,7 @@ mod tests {
                 policies: Vec::new(),
                 dlx: None,
                 persist: None,
+                tls: None,
             })
             .await
             .expect("bootstrap");
