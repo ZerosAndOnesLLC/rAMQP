@@ -192,6 +192,10 @@ jobs:
         with:
           distribution: temurin
           java-version: '21'
+      # Downloaded test clients live under target/, which rust-cache restores
+      # — sometimes as a directory without its files. Start them clean.
+      - name: Clear cached interop downloads
+        run: rm -rf target/interop
       - name: Qpid JMS interop
         run: ramqp-broker/tests/interop/jms/run.sh
 
@@ -253,6 +257,10 @@ jobs:
           python-version: '3.13'
       - name: Install Qpid Proton (python-qpid-proton)
         run: python -m pip install --quiet python-qpid-proton
+      # Downloaded test clients live under target/, which rust-cache restores
+      # — sometimes as a directory without its files. Start them clean.
+      - name: Clear cached interop downloads
+        run: rm -rf target/interop
       - name: Feature interop matrix
         run: ramqp-broker/tests/interop/matrix/run.sh
 

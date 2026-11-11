@@ -18,7 +18,9 @@ CLASSES="$CACHE/classes"
 
 mkdir -p "$CACHE" "$CLASSES"
 
-if [ ! -d "$LIB" ]; then
+# Check for the client jar itself, not the directory: CI caches target/,
+# and a restored cache can hold the directory without its jars.
+if ! compgen -G "$LIB/qpid-jms-client-*.jar" >/dev/null; then
     echo ">> downloading qpid-jms $QPID_JMS_VERSION (binary distribution) ..."
     url="https://repo1.maven.org/maven2/org/apache/qpid/apache-qpid-jms/$QPID_JMS_VERSION/apache-qpid-jms-$QPID_JMS_VERSION-bin.tar.gz"
     curl -fsSL -o "$CACHE/qpid-jms.tar.gz" "$url"
