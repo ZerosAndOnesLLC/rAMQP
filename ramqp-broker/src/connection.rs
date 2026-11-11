@@ -33,7 +33,7 @@ use ramqp_core::types::definitions::{
     AmqpError as AmqpCondition, ConnectionError, Error as AmqpError, ErrorCondition, Role,
     TransactionError,
 };
-use ramqp_core::types::messaging::{Accepted, DeliveryState, Rejected, TargetArchetype};
+use ramqp_core::types::messaging::{Accepted, DeliveryState, Rejected, Released, TargetArchetype};
 use ramqp_core::types::performatives::{Attach, Begin, Close, End, Performative};
 use ramqp_core::types::sasl::{SaslCode, SaslFrame, SaslMechanisms, SaslOutcome};
 
@@ -474,7 +474,7 @@ impl ExchangeRoute {
 
 /// Where one message from an exchange producer goes.
 enum Routed {
-    /// These queues (empty = unroutable: accepted and dropped).
+    /// These queues (empty = unroutable: settled `released`).
     Targets(Arc<[QueueHandle]>),
     /// The exchange no longer exists: the producer link is detached.
     ExchangeGone,
@@ -697,7 +697,29 @@ impl<S: IoStream> BrokerConnection<S> {
     async fn run(&mut self) -> Result<(), ConnectError> {
         // A shutdown receiver that is inert (pending forever) when absent.
         let mut shutdown = self.shutdown.take();
+        // An authenticated user is disconnected when it is deleted (checked
+        // now too: it may have been deleted during the handshake).
+        let users = self
+            .identity
+            .as_ref()
+            .and_then(|_| self.registry.runtime_users().cloned());
+        let mut revoked = users.as_ref().map(|u| u.revocations());
+        if let (Some(u), Some(me)) = (&users, self.identity.as_deref())
+            && !u.has_user(me)
+        {
+            return Err(ConnectError::msg(ErrorKind::Sasl, "the user was deleted"));
+        }
         loop {
+            let revocation = async {
+                match revoked.as_mut() {
+                    Some(rx) => {
+                        if rx.changed().await.is_err() {
+                            std::future::pending::<()>().await;
+                        }
+                    }
+                    None => std::future::pending().await,
+                }
+            };
             let shutdown_changed = async {
                 match shutdown.as_mut() {
                     Some(rx) => {
@@ -708,6 +730,22 @@ impl<S: IoStream> BrokerConnection<S> {
             };
             tokio::select! {
                 biased;
+
+                () = revocation => {
+                    if let Some(rx) = revoked.as_mut() {
+                        rx.borrow_and_update();
+                    }
+                    let gone = match (&users, self.identity.as_deref()) {
+                        (Some(u), Some(me)) => !u.has_user(me),
+                        _ => false,
+                    };
+                    if gone {
+                        return Err(ConnectError::msg(
+                            ErrorKind::Sasl,
+                            "the user was deleted",
+                        ));
+                    }
+                }
 
                 frame = self.transport.read_frame() => {
                     let frame = frame?;
@@ -1063,6 +1101,31 @@ impl<S: IoStream> BrokerConnection<S> {
                     };
                     (queue_tx, sub, msg_id, action)
                 }));
+            }
+            ConnCmd::ReleaseIncoming {
+                channel,
+                handle,
+                binding_gen,
+                delivery_id,
+            } => {
+                let live = matches!(
+                    self.bindings.get(&(channel, handle)),
+                    Some(Binding::ExchangeProducer { epoch, .. }) if *epoch == binding_gen
+                );
+                if !live {
+                    return;
+                }
+                if let Some(session) = self.sessions.get_mut(&channel) {
+                    session.send_disposition(
+                        handle,
+                        DeliveryId(delivery_id),
+                        None,
+                        DeliveryState::Released(Released::default()),
+                        true,
+                        &mut self.transport,
+                    );
+                }
+                self.replenish_producer_credit(channel, handle);
             }
             ConnCmd::SettleIncoming {
                 channel,
@@ -1492,6 +1555,29 @@ impl<S: IoStream> BrokerConnection<S> {
             );
             return;
         }
+        // Strict grants: reaching a durable/quorum queue through its
+        // `/queues/` alias also needs a grant on its explicit address.
+        if self.config.strict_queue_grants
+            && let Some(a) = address.as_deref()
+            && let Some(explicit) = self.registry.explicit_address_of(&self.vhost, a).await
+            && !self
+                .auth
+                .authorize(self.identity.as_deref(), &self.vhost, &explicit, operation)
+        {
+            tracing::debug!(identity = ?self.identity, address = %a, %explicit, ?operation, "attach denied (strict queue grants)");
+            let session = self.sessions.get_mut(&local).expect("bound channel");
+            session.refuse_peer_attach(
+                &attach,
+                AmqpError::new(
+                    AmqpCondition::UnauthorizedAccess,
+                    Some(format!(
+                        "not authorized to {operation:?} on {explicit} (reached through {a})"
+                    )),
+                ),
+                &mut self.transport,
+            );
+            return;
+        }
         if let Some(a) = address.as_deref()
             && a.starts_with("/exchanges/")
         {
@@ -1501,23 +1587,43 @@ impl<S: IoStream> BrokerConnection<S> {
             return;
         }
         let queue = match address.as_deref() {
-            Some(a) => self.registry.resolve_in(&self.vhost, a).await,
-            None => None,
+            Some(a) => self.registry.resolve_client(&self.vhost, a).await,
+            None => Err(crate::registry::ResolveError::Invalid),
         };
-        let Some(queue) = queue else {
-            tracing::debug!(name = %attach.name, ?address, "attach to unresolvable address");
-            // Refuse just this link (attach null-terminus + detach not-found);
-            // sibling links and the session stay up.
-            let session = self.sessions.get_mut(&local).expect("bound channel");
-            session.refuse_peer_attach(
-                &attach,
-                AmqpError::new(
-                    AmqpCondition::NotFound,
-                    Some(format!("no queue for address {address:?}")),
-                ),
-                &mut self.transport,
-            );
-            return;
+        let queue = match queue {
+            Ok(q) => q,
+            Err(why) => {
+                tracing::debug!(name = %attach.name, ?address, ?why, "attach to unresolvable address");
+                let (condition, text) = match why {
+                    crate::registry::ResolveError::Ambiguous(kinds) => (
+                        AmqpCondition::NotAllowed,
+                        format!(
+                            "several queues share the name in {address:?} ({kinds:?}): \
+                             address one explicitly as /quorum/<name> or /durable/<name>"
+                        ),
+                    ),
+                    crate::registry::ResolveError::OtherKind(kind) => (
+                        AmqpCondition::NotAllowed,
+                        format!(
+                            "{address:?}: a {kind:?} queue already uses that name \
+                             (use /queues/<name> to reach it)"
+                        ),
+                    ),
+                    _ => (
+                        AmqpCondition::NotFound,
+                        format!("no queue for address {address:?}"),
+                    ),
+                };
+                // Refuse just this link (attach null-terminus + detach);
+                // sibling links and the session stay up.
+                let session = self.sessions.get_mut(&local).expect("bound channel");
+                session.refuse_peer_attach(
+                    &attach,
+                    AmqpError::new(condition, Some(text)),
+                    &mut self.transport,
+                );
+                return;
+            }
         };
 
         let peer_role = attach.role;
@@ -1785,7 +1891,9 @@ impl<S: IoStream> BrokerConnection<S> {
     /// confirm — Raft commit, fsync), and rejected if any refused it. Like
     /// RabbitMQ, a rejection does not undo the copies other queues already
     /// took: a retry may duplicate there. A message routed nowhere (and
-    /// without an alternate) is accepted and dropped. If a destination cannot
+    /// without an alternate) is settled `released`, as RabbitMQ 4.x does (in
+    /// a transaction: a transactional state with outcome `released`). If a
+    /// destination cannot
     /// be resolved the message goes nowhere and is rejected; if the exchange
     /// was deleted the link is detached (`amqp:resource-deleted`).
     async fn publish_via_exchange(&mut self, channel: u16, d: ramqp_core::proto::IncomingDelivery) {
@@ -1830,6 +1938,27 @@ impl<S: IoStream> BrokerConnection<S> {
         };
 
         if let Some(ts) = d.state.as_ref().and_then(txn_state) {
+            // Routed nowhere: nothing to stage — say so (`released`), as
+            // outside a transaction.
+            if targets.is_empty() {
+                if let Some(session) = self.sessions.get_mut(&channel) {
+                    session.send_disposition(
+                        handle,
+                        d.delivery_id,
+                        None,
+                        transactional_state(
+                            ts.txn_id,
+                            Some(ramqp_core::types::messaging::Outcome::Released(
+                                Released::default(),
+                            )),
+                        ),
+                        true,
+                        &mut self.transport,
+                    );
+                }
+                self.replenish_producer_credit(channel, handle);
+                return;
+            }
             // All destinations stage, or none do.
             let staged = self.txns.stage_publishes(
                 &ts.txn_id,
@@ -1877,10 +2006,16 @@ impl<S: IoStream> BrokerConnection<S> {
             return;
         }
         match targets.len() {
-            // Unroutable: accepted and dropped (through the ack path so
+            // Unroutable: settled `released`, as RabbitMQ 4.x does, so the
+            // producer knows it reached no queue (through the ack path so
             // credit replenishes in order with real confirms).
             0 => {
-                let _ = self.cmd_tx.send(settle(true));
+                let _ = self.cmd_tx.send(ConnCmd::ReleaseIncoming {
+                    channel,
+                    handle,
+                    binding_gen: epoch,
+                    delivery_id,
+                });
             }
             // One destination: the queue confirms straight to us.
             1 => {

@@ -38,6 +38,16 @@ async fn start_cluster(n: usize) -> Vec<Node> {
 /// in between: a lost race (bind fails) tears the attempt down and retries
 /// on fresh ports instead of failing the test.
 async fn start_cluster_with(n: usize, configure: impl Fn(u64, &mut BrokerConfig)) -> Vec<Node> {
+    start_cluster_with_users(n, configure, || None::<ramqp_broker::auth::StaticUsers>).await
+}
+
+/// [`start_cluster_with`] where every node also uses the runtime user store
+/// over `users()` (when it returns users).
+async fn start_cluster_with_users<U: Into<Option<ramqp_broker::auth::StaticUsers>>>(
+    n: usize,
+    configure: impl Fn(u64, &mut BrokerConfig),
+    users: impl Fn() -> U,
+) -> Vec<Node> {
     'attempt: for _ in 0..5 {
         let fabric_addrs = reserve_addrs(n).await;
         let seeds: Vec<(u64, String)> = (1..=n as u64).zip(fabric_addrs).collect();
@@ -50,7 +60,10 @@ async fn start_cluster_with(n: usize, configure: impl Fn(u64, &mut BrokerConfig)
                 seeds.clone(),
             ));
             configure(*id, &mut config);
-            let broker = Broker::new(config);
+            let mut broker = Broker::new(config);
+            if let Some(u) = users().into() {
+                broker = broker.with_runtime_users(u);
+            }
             let bound = match broker.clone().bind("127.0.0.1:0").await {
                 Ok(b) => b,
                 Err(e) => {
@@ -732,6 +745,117 @@ async fn deleting_a_clustered_quorum_queue() {
         .unwrap();
     assert_eq!(text_of(&d), "new", "only the new incarnation's message");
     c2.accept(&d).await.unwrap();
+    for n in &nodes {
+        n.shutdown.shutdown();
+    }
+}
+
+/// Runtime definitions replicate: a user and its grants created through
+/// one node log in on another, and a quorum queue's own policy (declared
+/// through one node) is applied wherever the queue's leader runs.
+#[tokio::test(flavor = "multi_thread")]
+async fn runtime_users_and_queue_policies_replicate() {
+    use ramqp::types::messaging::Modified;
+    use ramqp_broker::auth::{Permission, StaticUsers};
+    let mgmt_by_node = std::sync::Mutex::new(std::collections::BTreeMap::new());
+    let nodes = start_cluster_with_users(
+        3,
+        |id, config| {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = l.local_addr().unwrap().to_string();
+            config.management_listen = Some(addr.clone());
+            config.management_token =
+                Some(ramqp_broker::SecretString::new("cluster-test-token-0123"));
+            mgmt_by_node.lock().unwrap().insert(id, addr);
+        },
+        || {
+            StaticUsers::new()
+                .with_password("ops", "ops-pw")
+                .with_admin("ops")
+                .with_permission(Permission::new("ops", "*", "*", true, true))
+        },
+    )
+    .await;
+    let mgmt: Vec<String> = mgmt_by_node.into_inner().unwrap().into_values().collect();
+
+    // Created through node 0.
+    let (s, body) = mgmt_call(
+        &mgmt[0],
+        "PUT",
+        "/users/reader",
+        r#"{"password":"reader-pw"}"#,
+    )
+    .await;
+    assert_eq!(s, 201, "{body}");
+    let (s, body) = mgmt_call(
+        &mgmt[0],
+        "PUT",
+        "/permissions/%2F/reader",
+        r#"[{"address":"/queues/*","operations":["send","receive"]},
+            {"address":"/quorum/*","operations":["send","receive"]}]"#,
+    )
+    .await;
+    assert_eq!(s, 201, "{body}");
+    let (s, body) = mgmt_call(
+        &mgmt[0],
+        "PUT",
+        "/queues/%2F/work",
+        r#"{"kind":"quorum","dead_letter":"/quorum/work.dlq","max_delivery_attempts":1}"#,
+    )
+    .await;
+    assert_eq!(s, 201, "{body}");
+
+    // Used through node 2 (definitions apply on every node).
+    let mut conn = None;
+    for _ in 0..50 {
+        if let Ok(c) =
+            ConnectionBuilder::new(format!("amqp://reader:reader-pw@{}", nodes[2].amqp_addr))
+                .connect()
+                .await
+        {
+            conn = Some(c);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let conn = conn.expect("the runtime user logs in on another node");
+    let s = conn.begin_session().await.unwrap();
+    s.create_producer("/queues/work")
+        .await
+        .unwrap()
+        .send(Message::text("job"))
+        .await
+        .unwrap();
+    let mut c = s.create_consumer("/queues/work").await.unwrap();
+    let d = tokio::time::timeout(Duration::from_secs(10), c.recv())
+        .await
+        .expect("in time")
+        .unwrap();
+    c.modify(
+        &d,
+        Modified {
+            delivery_failed: Some(true),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let mut dlq = s.create_consumer("/quorum/work.dlq").await.unwrap();
+    let dead = tokio::time::timeout(Duration::from_secs(10), dlq.recv())
+        .await
+        .expect("dead-lettered by the queue's own policy")
+        .unwrap();
+    assert_eq!(text_of(&dead), "job");
+    dlq.accept(&dead).await.unwrap();
+
+    // Deleted through node 1: the open connection on node 2 closes.
+    let (s, _) = mgmt_call(&mgmt[1], "DELETE", "/users/reader", "").await;
+    assert_eq!(s, 204);
+    let closed = tokio::time::timeout(Duration::from_secs(10), c.recv()).await;
+    assert!(
+        matches!(closed, Ok(Err(_))),
+        "connection closed: {closed:?}"
+    );
     for n in &nodes {
         n.shutdown.shutdown();
     }

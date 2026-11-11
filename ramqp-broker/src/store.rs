@@ -192,6 +192,18 @@ impl Store {
     }
 
     /// Whether a durable queue with this name was ever declared.
+    pub fn queue_names(&self) -> Result<Vec<String>, String> {
+        let txn = self.db.begin_read().map_err(|e| e.to_string())?;
+        let table = txn.open_table(QUEUES).map_err(|e| e.to_string())?;
+        let mut out = Vec::new();
+        for entry in table.iter().map_err(|e| e.to_string())? {
+            let (k, _) = entry.map_err(|e| e.to_string())?;
+            out.push(k.value().to_owned());
+        }
+        Ok(out)
+    }
+
+    /// Whether a durable queue with this name was declared (has a row).
     pub fn has_queue(&self, name: &str) -> Result<bool, String> {
         let txn = self.db.begin_read().map_err(|e| e.to_string())?;
         let table = txn.open_table(QUEUES).map_err(|e| e.to_string())?;

@@ -59,6 +59,17 @@ impl Broker {
         self
     }
 
+    /// Authenticate with `users` (the configuration's) plus users and
+    /// permissions created through the management API (`PUT /users/...`,
+    /// `PUT /permissions/...`), which persist (store / metadata group).
+    /// Deleting a runtime user closes its open connections.
+    pub fn with_runtime_users(mut self, users: crate::auth::StaticUsers) -> Self {
+        let users = Arc::new(crate::runtime_users::RuntimeUsers::new(users));
+        self.registry.set_runtime_users(users.clone());
+        self.auth = users;
+        self
+    }
+
     /// Bind a TCP listener (e.g. `"0.0.0.0:5672"` or `"127.0.0.1:0"`). An
     /// empty `addr` binds no plain listener — TLS-only, which needs
     /// [`BrokerConfig::tls_listen`].
@@ -116,6 +127,8 @@ impl Broker {
             })
             .await?;
             self.registry.set_cluster(node.clone());
+            self.registry.install_policy_resolver();
+            self.registry.sync_defs();
             // Keep this node's exchange routing view in step with the
             // metadata group: re-sync whenever it applies something.
             let mut changes = node.meta_changes();
@@ -133,6 +146,7 @@ impl Broker {
                         return;
                     };
                     registry.sync_exchanges();
+                    registry.sync_defs();
                     let incarnations = node_for_watch.incarnations();
                     if seen_incarnations.as_ref() != Some(&incarnations) {
                         registry.reconcile_quorum().await;
@@ -155,6 +169,24 @@ impl Broker {
         } else {
             // Standalone: finish any quorum-queue delete a crash interrupted.
             self.registry.gc_quorum_groups().await;
+            // Runtime definitions (per-queue policies, users, permissions):
+            // retried in the background if the store is not openable yet.
+            if let Err(e) = self.registry.load_defs().await {
+                tracing::warn!(error = %e, "runtime definitions not loaded yet; retrying");
+                let weak = Arc::downgrade(&self.registry);
+                tokio::spawn(async move {
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        let Some(registry) = weak.upgrade() else {
+                            return;
+                        };
+                        if registry.load_defs().await.is_ok() {
+                            tracing::info!("runtime definitions loaded");
+                            return;
+                        }
+                    }
+                });
+            }
         }
         if self.registry.cluster().is_none() && !self.registry.ensure_exchanges_loaded().await {
             // Standalone with a store that is not openable yet (e.g. the
@@ -250,6 +282,23 @@ impl Broker {
         self.registry.cluster()?.resolve_queue_leader(name).await
     }
 
+    /// Wait until the runtime definitions are loaded (standalone with a
+    /// store; immediate otherwise). Queues are not declared before. `true`
+    /// once loaded, `false` on timeout.
+    #[doc(hidden)]
+    pub async fn definitions_ready(&self, timeout: std::time::Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if self.registry.ensure_defs_loaded().await {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
     /// Wait until the cluster (when configured) has formed. `true` once a
     /// metadata leader exists; `false` on timeout or when not clustered.
     #[doc(hidden)]
@@ -271,11 +320,19 @@ impl Broker {
                  /quorum/<name> or /durable/<name>)"
             ));
         }
-        self.registry
-            .resolve_in(vhost, address)
-            .await
-            .map(|_| ())
-            .ok_or_else(|| format!("could not declare {address:?} in vhost {vhost:?}"))
+        // Explicit: `/queues/<name>` here declares a TRANSIENT queue (it
+        // never means "whatever exists", unlike a client attach).
+        let (kind, name) = QueueRegistry::parse_address(address)
+            .ok_or_else(|| format!("{address:?} is not a queue address"))?;
+        match self.registry.declare_in(vhost, kind, name).await {
+            Ok(_) => Ok(()),
+            Err(crate::registry::ResolveError::OtherKind(existing)) => Err(format!(
+                "{address:?}: a {existing:?} queue already uses that name in vhost {vhost:?}"
+            )),
+            Err(e) => Err(format!(
+                "could not declare {address:?} in vhost {vhost:?}: {e:?}"
+            )),
+        }
     }
 
     /// Declare an exchange in `vhost`. Idempotent: redeclaring with the

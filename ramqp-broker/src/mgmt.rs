@@ -15,11 +15,20 @@
 //! Writes (always authenticated; idempotent — `201` created, `204` already
 //! so, `409` exists with different arguments):
 //! - `PUT /queues/<vhost>/<name>` body `{"kind": "quorum"}` (default
-//!   `transient`); `DELETE /queues/<vhost>/<name>[?kind=…]`.
+//!   `transient`), optionally with the queue's own policy fields
+//!   (`dead_letter`, `max_delivery_attempts`, ...);
+//!   `DELETE /queues/<vhost>/<name>[?kind=…]`.
 //! - `PUT /exchanges/<vhost>/<name>` body `{"type": "topic", "alternate":
 //!   "/queues/x"}`; `DELETE /exchanges/<vhost>/<name>`.
 //! - `PUT` / `DELETE /bindings/<vhost>/<exchange>` body `{"queue":
 //!   "/queues/x", "key": "order.*"}`.
+//! - `PUT /users/<name>` body `{"password": "..."}` or `{"verifier":
+//!   "SCRAM-SHA-256$..."}` (+ optional `"admin"`); `DELETE /users/<name>`.
+//! - `PUT` / `DELETE /permissions/<vhost>/<user>` body `[{"address":
+//!   "/queues/x", "operations": ["receive"]}]`.
+//!
+//! `GET /users` and `GET /permissions/<vhost>/<user>` always need
+//! credentials (see [`users`]).
 //!
 //! Path segments are percent-decoded; the default vhost is `%2F` (as in
 //! RabbitMQ's API). Credentials: `Authorization: Bearer <token>`
@@ -37,11 +46,13 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
+mod users;
+
 use crate::auth::Authenticator;
 use crate::config::SecretString;
 use crate::exchange::{ExchangeError, ExchangeKind, ExchangeOp};
 use crate::queue::{QueueHandle, QueueMsg, QueueStats};
-use crate::registry::{QueueDeleteError, QueueKind, QueueRegistry};
+use crate::registry::{DeclareError, Declared, QueueDeleteError, QueueKind, QueueRegistry};
 
 /// Broker-wide counters the endpoint exposes (updated with relaxed atomics —
 /// negligible next to a network frame).
@@ -423,7 +434,17 @@ async fn route(
         "PUT" | "DELETE" => true,
         _ => return Response::error(405, "method not allowed"),
     };
-    if (write || auth.auth_reads) && !authenticated_async(&req, auth).await {
+    // Who exists and who may do what is never public, whatever auth_reads
+    // says. Decided on the path as it is ROUTED (normalized, decoded), not
+    // its raw text: `//users` and `/%75sers` route to `/users` too.
+    let Some(seg) = segments(&req.path) else {
+        return Response::error(400, "malformed percent-encoding in path");
+    };
+    let private = matches!(
+        seg.first().map(String::as_str),
+        Some("users" | "permissions")
+    );
+    if (write || auth.auth_reads || private) && !authenticated_async(&req, auth).await {
         // Slow every failed attempt down (with the connection cap this
         // bounds guessing to a few hundred tries per second).
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
@@ -435,9 +456,6 @@ async fn route(
         r.content_type = "application/json";
         return r;
     }
-    let Some(seg) = segments(&req.path) else {
-        return Response::error(400, "malformed percent-encoding in path");
-    };
     let seg: Vec<&str> = seg.iter().map(String::as_str).collect();
     match (req.method.as_str(), seg.as_slice()) {
         ("GET", ["metrics"]) => Response {
@@ -454,6 +472,18 @@ async fn route(
         ("PUT", ["queues", vhost, name]) => put_queue(registry, &req, vhost_of(vhost), name).await,
         ("DELETE", ["queues", vhost, name]) => {
             delete_queue(registry, &req, vhost_of(vhost), name).await
+        }
+        ("GET", ["users"]) => users::list(registry),
+        ("PUT", ["users", name]) => users::put(registry, &req, name).await,
+        ("DELETE", ["users", name]) => users::delete(registry, name).await,
+        ("GET", ["permissions", vhost, user]) => {
+            users::get_permissions(registry, vhost_of(vhost), user)
+        }
+        ("PUT", ["permissions", vhost, user]) => {
+            users::put_permissions(registry, &req, vhost_of(vhost), user).await
+        }
+        ("DELETE", ["permissions", vhost, user]) => {
+            users::delete_permissions(registry, vhost_of(vhost), user).await
         }
         ("GET", ["exchanges"]) => list_exchanges(registry, None).await,
         ("GET", ["exchanges", vhost, name]) => {
@@ -612,6 +642,7 @@ async fn get_queue(registry: &QueueRegistry, req: &Request, vhost: &str, name: &
             "unacked": stats.unacked,
             "messages": stats.ready + stats.unacked,
             "consumers": stats.consumers,
+            "policy": registry.declared_policy(&qualified).map(|p| p.to_json()),
         }),
     )
 }
@@ -634,30 +665,37 @@ async fn put_queue(
         },
         Some(_) => return Response::error(400, "\"kind\" must be a string"),
     };
-    let Some(qualified) = QueueRegistry::qualify(vhost, name) else {
-        return Response::error(400, "invalid vhost or queue name");
+    // The queue's own policy (dead-letter target, retry budget, limits):
+    // part of the declaration, like `kind`.
+    let policy = match crate::defs::PolicySpec::from_json(&body) {
+        Ok(p) => p,
+        Err(e) => return Response::error(400, e),
     };
-    match registry.find_queue(None, &qualified).await {
-        Some((existing, _)) if existing == kind => return Response::empty(204),
-        Some((existing, _)) => {
-            return Response::error(
-                409,
-                format!("queue {name:?} exists as {}", kind_label(existing)),
-            );
-        }
-        None => {}
-    }
+    let (reg, vh, bare) = (registry.clone(), vhost.to_owned(), name.to_owned());
+    let outcome =
+        tokio::spawn(async move { reg.declare_with_policy(&vh, kind, &bare, policy).await })
+            .await
+            .unwrap_or_else(|e| Err(DeclareError::Unavailable(e.to_string())));
     let address = format!("{}{name}", kind_prefix(kind));
-    let (reg, vh, addr) = (registry.clone(), vhost.to_owned(), address.clone());
-    let declared = tokio::spawn(async move { reg.resolve_in(&vh, &addr).await.is_some() })
-        .await
-        .unwrap_or(false);
-    match declared.then_some(()) {
-        Some(_) => Response::empty(201),
-        None => Response::error(
-            503,
-            format!("could not declare {address} (limits, store, or cluster unavailable)"),
+    match outcome {
+        Ok(Declared::Created) => Response::empty(201),
+        Ok(Declared::Exists) => Response::empty(204),
+        Err(DeclareError::Invalid) => Response::error(400, "invalid vhost or queue name"),
+        Err(DeclareError::OtherKind(existing)) => Response::error(
+            409,
+            format!("queue {name:?} exists as {}", kind_label(existing)),
         ),
+        Err(DeclareError::PolicyConflict) => Response::error(
+            409,
+            format!("queue {name:?} exists with a different policy (delete it to change it)"),
+        ),
+        Err(DeclareError::ConfigPolicy) => Response::error(
+            409,
+            format!("queue {name:?} has its policy set in the configuration file"),
+        ),
+        Err(DeclareError::Unavailable(why)) => {
+            Response::error(503, format!("could not declare {address}: {why}"))
+        }
     }
 }
 

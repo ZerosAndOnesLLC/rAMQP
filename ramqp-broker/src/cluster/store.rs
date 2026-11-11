@@ -80,6 +80,19 @@ pub struct MetaState {
     /// re-declared after a delete never shares state with the old one, and
     /// every node can discard any group older than the current incarnation.
     pub incarnations: BTreeMap<String, u64>,
+    /// Runtime definitions (per-queue policies, users, permissions), by key.
+    pub defs: BTreeMap<String, Vec<u8>>,
+    /// Bumped on every applied definition change.
+    pub defs_epoch: u64,
+}
+
+/// The 0.11.0 snapshot encoding (no runtime definitions).
+#[derive(serde::Deserialize)]
+struct MetaStateV3 {
+    catalog: BTreeMap<String, QueueSpec>,
+    exchanges: crate::exchange::Defs,
+    exchanges_epoch: u64,
+    incarnations: BTreeMap<String, u64>,
 }
 
 /// The pre-exchange (0.9.x) snapshot encoding, still readable so a node
@@ -111,6 +124,21 @@ impl ReplicatedState for MetaState {
             });
             return MetaResponse::Exchange(result);
         }
+        if let MetaCommand::Def { key, value } = command {
+            let changed = match value {
+                Some(v) => {
+                    self.defs.get(key) != Some(v) && {
+                        self.defs.insert(key.clone(), v.clone());
+                        true
+                    }
+                }
+                None => self.defs.remove(key).is_some(),
+            };
+            if changed {
+                self.defs_epoch += 1;
+            }
+            return MetaResponse::Def(changed, self.defs_epoch);
+        }
         if let MetaCommand::DeleteQueue { name } = command {
             // Every node applies this, so every node moves the name to its
             // next incarnation in the same log position.
@@ -131,8 +159,28 @@ impl ReplicatedState for MetaState {
     fn snapshot_bytes(&self) -> Result<Vec<u8>, String> {
         // Use the oldest encoding that holds the state, so a node not yet
         // upgraded (rolling upgrade, or a rollback) can still install it:
-        // 0.9.x until exchanges are used, 0.10.0 until a queue is deleted.
-        if self.incarnations.is_empty() && !(self.exchanges.is_empty() && self.exchanges_epoch == 0)
+        // 0.9.x until exchanges are used, 0.10.0 until a queue is deleted,
+        // 0.11.0 until a runtime definition is written.
+        if self.defs.is_empty() && self.defs_epoch == 0 && !self.incarnations.is_empty() {
+            #[derive(Serialize)]
+            struct V3<'a> {
+                catalog: &'a BTreeMap<String, QueueSpec>,
+                exchanges: &'a crate::exchange::Defs,
+                exchanges_epoch: u64,
+                incarnations: &'a BTreeMap<String, u64>,
+            }
+            return crate::serde_bin::to_vec(&V3 {
+                catalog: &self.catalog,
+                exchanges: &self.exchanges,
+                exchanges_epoch: self.exchanges_epoch,
+                incarnations: &self.incarnations,
+            })
+            .map_err(|e| e.to_string());
+        }
+        let no_defs = self.defs.is_empty() && self.defs_epoch == 0;
+        if no_defs
+            && self.incarnations.is_empty()
+            && !(self.exchanges.is_empty() && self.exchanges_epoch == 0)
         {
             #[derive(Serialize)]
             struct V2<'a> {
@@ -147,7 +195,11 @@ impl ReplicatedState for MetaState {
             })
             .map_err(|e| e.to_string());
         }
-        if self.incarnations.is_empty() && self.exchanges.is_empty() && self.exchanges_epoch == 0 {
+        if no_defs
+            && self.incarnations.is_empty()
+            && self.exchanges.is_empty()
+            && self.exchanges_epoch == 0
+        {
             #[derive(Serialize)]
             struct Legacy<'a> {
                 catalog: &'a BTreeMap<String, QueueSpec>,
@@ -165,13 +217,23 @@ impl ReplicatedState for MetaState {
         // decoding is exact (trailing bytes fail), so the first match wins.
         *self = match crate::serde_bin::from_slice(bytes) {
             Ok(state) => state,
-            Err(e) => match crate::serde_bin::from_slice::<MetaStateV2>(bytes) {
-                Ok(v2) => MetaState {
-                    catalog: v2.catalog,
-                    exchanges: v2.exchanges,
-                    exchanges_epoch: v2.exchanges_epoch,
+            Err(e) => match crate::serde_bin::from_slice::<MetaStateV3>(bytes)
+                .map(|v3| MetaState {
+                    catalog: v3.catalog,
+                    exchanges: v3.exchanges,
+                    exchanges_epoch: v3.exchanges_epoch,
+                    incarnations: v3.incarnations,
                     ..Default::default()
-                },
+                })
+                .or_else(|_| {
+                    crate::serde_bin::from_slice::<MetaStateV2>(bytes).map(|v2| MetaState {
+                        catalog: v2.catalog,
+                        exchanges: v2.exchanges,
+                        exchanges_epoch: v2.exchanges_epoch,
+                        ..Default::default()
+                    })
+                }) {
+                Ok(state) => state,
                 Err(_) => {
                     let legacy: LegacyMetaState =
                         crate::serde_bin::from_slice(bytes).map_err(|_| e.to_string())?;
@@ -503,6 +565,11 @@ impl MetaStore {
         self.with_state(|s| s.catalog.clone())
     }
 
+    /// Whether the catalog has `name` (no copy of the catalog).
+    pub fn contains(&self, name: &str) -> bool {
+        self.with_state(|s| s.catalog.contains_key(name))
+    }
+
     /// A quorum queue's catalog entry and current incarnation, read together
     /// (one consistent applied state).
     pub fn queue(&self, name: &str) -> Option<(QueueSpec, u64)> {
@@ -511,6 +578,16 @@ impl MetaStore {
                 .get(name)
                 .map(|spec| (spec.clone(), s.incarnations.get(name).copied().unwrap_or(0)))
         })
+    }
+
+    /// The runtime definitions and their epoch (one consistent read).
+    pub fn defs(&self) -> (u64, BTreeMap<String, Vec<u8>>) {
+        self.with_state(|s| (s.defs_epoch, s.defs.clone()))
+    }
+
+    /// The applied runtime-definitions epoch.
+    pub fn defs_epoch(&self) -> u64 {
+        self.with_state(|s| s.defs_epoch)
     }
 
     /// A queue name's current incarnation (0 until it is first deleted).
@@ -1013,6 +1090,63 @@ mod tests {
         assert_eq!(back.incarnations.get("orders"), Some(&1));
         assert!(back.catalog.is_empty());
         assert!(back.exchanges.contains_key("/events"));
+
+        // No runtime definitions yet: the 0.11.0 encoding (a 0.11.0 node
+        // can install it).
+        #[derive(serde::Deserialize)]
+        struct V3 {
+            catalog: BTreeMap<String, QueueSpec>,
+            exchanges: crate::exchange::Defs,
+            exchanges_epoch: u64,
+            incarnations: BTreeMap<String, u64>,
+        }
+        let v3: V3 = crate::serde_bin::from_slice(&bytes).expect("0.11.0 shape");
+        assert_eq!(
+            (
+                v3.catalog.len(),
+                v3.exchanges.len(),
+                v3.exchanges_epoch,
+                v3.incarnations.len()
+            ),
+            (0, 1, 1, 1)
+        );
+
+        // Runtime definitions: set, unchanged re-set, remove; then the
+        // snapshot carries them and round-trips.
+        let def = |key: &str, value: Option<&[u8]>| MetaCommand::Def {
+            key: key.into(),
+            value: value.map(<[u8]>::to_vec),
+        };
+        assert_eq!(
+            state.apply(&def("user:a", Some(b"1"))),
+            MetaResponse::Def(true, 1)
+        );
+        assert_eq!(
+            state.apply(&def("user:a", Some(b"1"))),
+            MetaResponse::Def(false, 1)
+        );
+        assert_eq!(
+            state.apply(&def("user:b", Some(b"2"))),
+            MetaResponse::Def(true, 2)
+        );
+        assert_eq!(
+            state.apply(&def("user:b", None)),
+            MetaResponse::Def(true, 3)
+        );
+        assert_eq!(
+            state.apply(&def("user:b", None)),
+            MetaResponse::Def(false, 3)
+        );
+        let bytes = state.snapshot_bytes().unwrap();
+        assert!(
+            crate::serde_bin::from_slice::<V3>(&bytes).is_err(),
+            "newer encoding"
+        );
+        let mut back = MetaState::default();
+        back.restore_snapshot(&bytes).unwrap();
+        assert_eq!(back.defs.get("user:a").map(Vec::as_slice), Some(&b"1"[..]));
+        assert_eq!((back.defs.len(), back.defs_epoch), (1, 3));
+        assert_eq!(back.incarnations.get("orders"), Some(&1));
     }
 
     /// Reopen the redb store, waiting out the writer thread's lock release

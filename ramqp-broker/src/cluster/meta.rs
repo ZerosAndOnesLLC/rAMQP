@@ -52,6 +52,15 @@ pub enum MetaCommand {
     /// last so the existing variants keep their wire tags. Every node must
     /// run a version that knows this variant before exchanges are used.
     Exchange(crate::exchange::ExchangeOp),
+    /// Set (`Some`) or remove (`None`) one runtime definition — per-queue
+    /// policies, users, permissions (see `crate::defs`). Appended last;
+    /// every node must support it before one is proposed.
+    Def {
+        /// The definition key (`<kind>:<id>`).
+        key: String,
+        /// The encoded value, or `None` to remove it.
+        value: Option<Vec<u8>>,
+    },
 }
 
 /// The applied result of a [`MetaCommand`].
@@ -70,6 +79,9 @@ pub enum MetaResponse {
     /// The outcome of [`MetaCommand::Exchange`]: whether it changed the
     /// definitions, and the definitions epoch after applying it.
     Exchange(Result<(bool, u64), crate::exchange::ExchangeError>),
+    /// The outcome of [`MetaCommand::Def`]: whether it changed anything,
+    /// and the definitions epoch after applying it.
+    Def(bool, u64),
 }
 
 /// Why a forwarded catalog write failed (rides the fabric as a typed error).
@@ -111,7 +123,7 @@ pub(crate) fn apply(
                 MetaResponse::NotFound
             }
         }
-        // Applied by `MetaState::apply`, which owns the exchange state.
-        MetaCommand::Exchange(_) => MetaResponse::NotFound,
+        // Applied by `MetaState::apply`, which owns that state.
+        MetaCommand::Exchange(_) | MetaCommand::Def { .. } => MetaResponse::NotFound,
     }
 }

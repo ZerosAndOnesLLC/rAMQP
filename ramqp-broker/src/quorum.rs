@@ -263,7 +263,15 @@ async fn run(
         }
 
         expire_head(&name, &policy, &raft, &store, &mut ready, &mut commits);
-        dispatch(&name, &store, &mut inflight, &mut ready, &mut subs, &mut rr);
+        dispatch(
+            &name,
+            &store,
+            &failures,
+            &mut inflight,
+            &mut ready,
+            &mut subs,
+            &mut rr,
+        );
     }
     tracing::debug!(queue = %name, "quorum queue actor stopped");
 }
@@ -544,6 +552,7 @@ fn expire_head(
 fn dispatch(
     name: &str,
     store: &QueueStore,
+    failures: &HashMap<u64, u32>,
     inflight: &mut HashMap<u64, SubId>,
     ready: &mut BTreeSet<u64>,
     subs: &mut Vec<Subscriber>,
@@ -574,6 +583,14 @@ fn dispatch(
                 }
             },
         };
+        // The leader-local count is exact; the replicated one (which a new
+        // leader starts from) lags only its own pipelined increments.
+        let failed = failures.get(&msg_id).copied().unwrap_or_else(|| {
+            store
+                .with_state(|s| s.meta_of(msg_id).map(|(_, f)| f))
+                .unwrap_or(0)
+        });
+        let body = crate::redelivery::with_delivery_count(&body, failed);
         ready.remove(&msg_id);
         *rr = (idx + 1) % subs.len();
 

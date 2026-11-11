@@ -20,7 +20,22 @@ protocol engine as the [`ramqp`](https://crates.io/crates/ramqp) client.
   `Authenticator` (`StaticUsers` — the config-file backend: SCRAM verifiers
   only, never plaintext, with per-user × vhost × address × operation
   permissions; plus `AllowAll`, `StaticPlain`, `StaticScram`).
-- **Transient queues** — `/queues/<name>` (or bare names), auto-declared:
+- **Addresses** — `/queues/<name>` (RabbitMQ 4.x's address for any queue
+  type, or a bare name) reaches the queue declared under `<name>` **whatever
+  its kind**, and auto-declares a transient queue only when there is none.
+  `/quorum/<name>` and `/durable/<name>` name a kind explicitly (declaring
+  it on first use). A name holds one kind: declaring a second kind under it
+  is refused (`amqp:not-allowed` at attach, `409` in the admin API). A
+  declared quorum or durable queue takes precedence over an auto-declared
+  transient one (in a cluster, transient queues are node-local); should a
+  quorum and a durable queue share a name from an older version,
+  `/queues/<name>` refuses to guess. Authorization matches the address
+  as written, so grant the form clients use — and note that a grant on
+  `/queues/*` therefore reaches durable and quorum queues too (RabbitMQ 4.x
+  semantics). Set `strict_queue_grants = true` to keep `/queues/` grants to
+  transient queues: reaching a durable or quorum queue through `/queues/`
+  then also needs a grant on its `/durable/` or `/quorum/` address.
+- **Transient queues** — auto-declared at `/queues/<name>`:
   one lock-free actor task per queue, competing consumers with round-robin
   dispatch, credit-based flow control, accept/release/modified/reject
   settlement, redelivery on consumer failure, bounded depth (overflow →
@@ -38,9 +53,10 @@ protocol engine as the [`ramqp`](https://crates.io/crates/ramqp) client.
   `/exchanges/<name>` with the key in `properties.subject`). **fanout**,
   **direct**, and **topic** (`*` / `#`) kinds; `amq.direct`, `amq.fanout`,
   `amq.topic` exist in every vhost. A publish is confirmed once **every**
-  destination queue has confirmed it (rejected if any refuses); unroutable
-  messages are accepted and dropped, or go to the exchange's `alternate`
-  queue. Definitions persist (redb standalone, the metadata Raft group when
+  destination queue has confirmed it (rejected if any refuses); an
+  unroutable message is settled **`released`** (as RabbitMQ 4.x does, so a
+  producer can tell "reached no queue" from "delivered"), or goes to the
+  exchange's `alternate` queue (`accepted`). Definitions persist (redb standalone, the metadata Raft group when
   clustered) and binding changes apply to already-attached producers.
 - **Clustering with leader routing** — a metadata Raft group (replicated
   queue catalog + rendezvous placement) and an **inter-node fabric**: one
@@ -102,6 +118,7 @@ data_dir = "/var/lib/ramqp"           # needs --features store-redb
 management_listen = "0.0.0.0:15692"
 management_token_file = "/etc/ramqp/mgmt-token"   # bearer token for admin writes
 allow_plain = true                    # PLAIN is checked against the SCRAM verifier
+strict_queue_grants = false           # true: /queues/* grants cover transient queues only
 
 [limits]
 max_connections = 16384
@@ -131,11 +148,13 @@ prefix = "orders."
 message_ttl_ms = 600000
 max_length = 100000
 overflow = "reject-publish"     # or "drop-head"
-dead_letter = "/quorum/dead"
+dead_letter = "/quorum/dead"     # or "/quorum/{queue}.dlq": one per queue
 max_delivery_attempts = 5
 
 [[queues]]                      # declared at startup, idempotent
 address = "/quorum/orders.created"
+dead_letter = "/quorum/orders.created.dlq"   # optional: this queue's own policy
+max_delivery_attempts = 3                    # (any [[policies]] field)
 
 [[exchanges]]
 name = "events"
@@ -188,8 +207,10 @@ Qpid Proton (Python/C), rhea (Node.js), Azure go-amqp (Go), fe2o3-amqp (Rust)
 and RabbitMQ's own AMQP 1.0 client (see `tests/interop/`). Points worth
 knowing when moving clients over:
 
-- **Addresses** are RabbitMQ 4.x's: `/queues/<name>`, `/exchanges/<name>/<key>`.
-  Quorum and durable queues are `/quorum/<name>` and `/durable/<name>`.
+- **Addresses** are RabbitMQ 4.x's: `/queues/<name>` reaches a queue of any
+  kind (declare it as quorum or durable in the config file or admin API, and
+  clients keep using `/queues/<name>`), `/exchanges/<name>/<key>` publishes
+  through an exchange.
 - **SASL**: PLAIN works for every user (checked against the stored verifier);
   a SCRAM mechanism is offered only when every user has a verifier for it, so
   clients that pick the strongest offered never lock a user out. Users created
@@ -214,16 +235,39 @@ inspection, and an idempotent admin API (the default vhost is `%2F`):
 | `GET /metrics` | Prometheus text (connections, RSS, per-queue gauges) |
 | `GET /queues` | every queue with ready / unacked / consumers |
 | `GET /queues/<vhost>/<name>[?kind=]` | one queue: `{"ready", "unacked", "messages", "consumers", …}` — point KEDA's `metrics-api` scaler at `ready`. Correct on **every** node (a non-leader asks the queue's leader); `503` when unknowable, never zeros |
-| `PUT /queues/<vhost>/<name>` `{"kind":"quorum"}` | declare (`transient` default); `201` created, `204` exists, `409` exists as another kind |
+| `PUT /queues/<vhost>/<name>` `{"kind":"quorum"}` | declare (`transient` default); `201` created, `204` exists, `409` exists as another kind or with a different policy. Optional policy fields, as in `[[policies]]`: `dead_letter`, `max_delivery_attempts`, `message_ttl_ms`, `max_length`, `max_length_bytes`, `overflow` — the queue's own policy (`GET` shows it) |
 | `DELETE /queues/<vhost>/<name>[?kind=]` | delete a queue of any kind: consumers and producers are detached with `amqp:resource-deleted`, its messages and stored state removed, and its bindings dropped. A clustered quorum queue is deleted through the metadata group — every replica tears down its Raft member and purges its log and files (a replica that is down does so when it rejoins), and a re-declare of the same name is a fresh, empty queue. Clustered deletion needs every node on a version that supports it (`503` otherwise) |
 | `GET /exchanges`, `GET /exchanges/<vhost>/<name>` | definitions with bindings |
 | `PUT /exchanges/<vhost>/<name>` `{"type":"topic","alternate":"/queues/x"}` | declare; `409` on different arguments |
 | `DELETE /exchanges/<vhost>/<name>` | delete with its bindings |
 | `PUT` / `DELETE /bindings/<vhost>/<exchange>` `{"queue":"/queues/x","key":"a.*"}` | bind / unbind |
+| `GET /users` | users (`source`: `config` or `api`); never public |
+| `PUT /users/<name>` `{"password":"…"}` or `{"verifier":"SCRAM-SHA-256$…"}`, optional `"admin":true` | create or replace a runtime user (`201` / `204`). A password becomes SCRAM-SHA-256 and -512 verifiers on arrival and is never stored. Configuration users are read-only (`409`) |
+| `DELETE /users/<name>` | delete a runtime user and its permissions; its open connections close (`amqp:unauthorized-access`) |
+| `GET` / `PUT` / `DELETE /permissions/<vhost>/<user>` `[{"address":"/queues/jobs","operations":["receive"]}]` | a runtime user's grants in a vhost, the same address-glob × operation form as `[[permissions]]` (configuration users get theirs from the file: `409`) |
 
 Writes always need credentials: `Authorization: Bearer <token>` from
 `management_token_file` (`--management-token-file`), or HTTP Basic for a
-user with `admin = true`. Reads are open unless `management_auth_reads = true`.
+user with `admin = true`. Reads are open unless `management_auth_reads = true`
+(`/users` and `/permissions` always need credentials).
+
+Runtime users, permissions and per-queue policies persist: in the store
+(`data_dir`) standalone, in the metadata Raft group when clustered — where
+they need every node on a version that supports them (`503` otherwise).
+Without either they last until the broker stops. Runtime users need the
+built-in user store (`[[users]]` in the config file, or
+`Broker::with_runtime_users` when embedding).
+
+A queue's own policy (on `[[queues]]`, or in `PUT /queues/...`) overrides
+the prefix policies for that queue; its `dead_letter` is relative to the
+queue's vhost. A dead letter whose target name already holds another kind of
+queue (a consumer attached the dead-letter queue at `/queues/<name>` first,
+say) goes to that queue rather than being dropped. In a prefix policy, `{queue}` in
+`dead_letter` expands to each queue's name, giving every queue its own
+dead-letter companion; the companions themselves are not dead-lettered by
+that policy. Redeliveries after `modified{delivery-failed}` carry the
+failure count in `header.delivery-count` (AMQP 1.0 §3.2.1; added to any count
+the publisher set), so consumers can budget retries.
 
 Secrets stay out of the file: point `verifier_file` / `password_file` at a
 mounted Kubernetes Secret. Generate a verifier with

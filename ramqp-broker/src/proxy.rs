@@ -776,7 +776,9 @@ impl Proxy {
             } => self.forward_delivery(key, msg_id, body),
             // Publish acks ride per-publish channels, not this one; quorum
             // actors are never deleted.
-            ConnCmd::SettleIncoming { .. } | ConnCmd::QueueDeleted { .. } => {}
+            ConnCmd::SettleIncoming { .. }
+            | ConnCmd::ReleaseIncoming { .. }
+            | ConnCmd::QueueDeleted { .. } => {}
         }
     }
 

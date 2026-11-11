@@ -166,7 +166,11 @@ async fn direct_fanout_and_builtin_exchanges() {
         .create_producer("/exchanges/amq.direct/client-8")
         .await
         .unwrap();
-    assert!(accepted(&miss.send(Message::text("nobody")).await.unwrap()));
+    // Routed nowhere: released (RabbitMQ 4.x).
+    assert!(matches!(
+        miss.send(Message::text("nobody")).await.unwrap(),
+        DeliveryState::Released(_)
+    ));
 
     expect_exactly(&mut f1, &["all"]).await;
     expect_exactly(&mut f2, &["all"]).await;
@@ -176,7 +180,7 @@ async fn direct_fanout_and_builtin_exchanges() {
 }
 
 #[tokio::test]
-async fn unroutable_is_dropped_or_goes_to_alternate() {
+async fn unroutable_is_released_or_goes_to_alternate() {
     let (broker, addr, shutdown) = start(BrokerConfig::default()).await;
     broker
         .declare_exchange("", "plain", ExchangeKind::Direct, None)
@@ -188,8 +192,11 @@ async fn unroutable_is_dropped_or_goes_to_alternate() {
         .unwrap();
     let (conn, s) = session(addr).await;
     let p = s.create_producer("/exchanges/plain/nothing").await.unwrap();
-    // Accepted and dropped, like RabbitMQ.
-    assert!(accepted(&p.send(Message::text("void")).await.unwrap()));
+    // Released (it reached no queue), like RabbitMQ 4.x.
+    assert!(matches!(
+        p.send(Message::text("void")).await.unwrap(),
+        DeliveryState::Released(_)
+    ));
     let p = s.create_producer("/exchanges/alt/nothing").await.unwrap();
     assert!(accepted(&p.send(Message::text("caught")).await.unwrap()));
     let mut lost = s.create_consumer("/queues/lost").await.unwrap();
@@ -220,9 +227,13 @@ async fn unknown_exchange_and_exchange_consumers_are_refused() {
         .await
         .expect("refusal arrives");
     assert!(r.is_err(), "consuming from an exchange must be refused");
-    // The session survives the link refusals.
+    // The session survives the link refusals (`a` matches no binding, so
+    // the publish settles `released`).
     let ok = s.create_producer("/exchanges/events/a").await.unwrap();
-    assert!(accepted(&ok.send(Message::text("fine")).await.unwrap()));
+    assert!(matches!(
+        ok.send(Message::text("fine")).await.unwrap(),
+        DeliveryState::Released(_)
+    ));
     conn.close().await.unwrap();
     shutdown.shutdown();
 }

@@ -1,0 +1,840 @@
+//! RabbitMQ 4.x parity (issue #45): `/queues/<name>` finds any declared
+//! queue, `delivery-count` on redelivery, unroutable = `released`, per-queue
+//! policies and the `{queue}` dead-letter template, and runtime users and
+//! permissions.
+
+use std::time::Duration;
+
+use ramqp::types::messaging::{DeliveryState, Modified};
+use ramqp::{ConnectionBuilder, Message};
+use ramqp_broker::auth::StaticUsers;
+use ramqp_broker::{Broker, BrokerConfig, ExchangeKind, ShutdownHandle};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+const TOKEN: &str = "parity-test-token-0123";
+
+struct Running {
+    addr: std::net::SocketAddr,
+    mgmt: std::net::SocketAddr,
+    broker: Broker,
+    shutdown: ShutdownHandle,
+}
+
+/// A broker with a management endpoint (bearer [`TOKEN`]); `users` turns on
+/// the runtime user store over those configured users.
+async fn start(mut config: BrokerConfig, users: Option<StaticUsers>) -> Running {
+    for _ in 0..50 {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mgmt = l.local_addr().unwrap();
+        drop(l);
+        config.management_listen = Some(mgmt.to_string());
+        config.management_token = Some(ramqp_broker::SecretString::new(TOKEN));
+        let mut broker = Broker::new(config.clone());
+        if let Some(u) = users.clone() {
+            broker = broker.with_runtime_users(u);
+        }
+        // A previous instance's store lock frees asynchronously.
+        let Ok(bound) = broker.clone().bind("127.0.0.1:0").await else {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            continue;
+        };
+        let addr = bound.local_addr();
+        let shutdown = bound.shutdown_handle();
+        tokio::spawn(bound.run());
+        assert!(
+            broker.definitions_ready(Duration::from_secs(10)).await,
+            "definitions loaded"
+        );
+        return Running {
+            addr,
+            mgmt,
+            broker,
+            shutdown,
+        };
+    }
+    panic!("could not start a broker");
+}
+
+async fn http(addr: &std::net::SocketAddr, method: &str, path: &str, body: &str) -> (u16, String) {
+    http_auth(addr, method, path, body, Some(&format!("Bearer {TOKEN}"))).await
+}
+
+async fn http_auth(
+    addr: &std::net::SocketAddr,
+    method: &str,
+    path: &str,
+    body: &str,
+    auth: Option<&str>,
+) -> (u16, String) {
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let auth = auth
+        .map(|a| format!("authorization: {a}\r\n"))
+        .unwrap_or_default();
+    stream
+        .write_all(
+            format!(
+                "{method} {path} HTTP/1.1\r\nhost: x\r\n{auth}content-length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).await.unwrap();
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    let status = text
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let body = text
+        .split_once("\r\n\r\n")
+        .map(|(_, b)| b.to_owned())
+        .unwrap_or_default();
+    (status, body)
+}
+
+fn text(d: &ramqp::Delivery) -> String {
+    use ramqp::codec::Value;
+    use ramqp::types::messaging::Body;
+    match d.message().map(|m| m.body) {
+        Ok(Body::Value(Value::String(s))) => s,
+        other => format!("{other:?}"),
+    }
+}
+
+async fn recv(c: &mut ramqp::Consumer) -> Option<ramqp::Delivery> {
+    tokio::time::timeout(Duration::from_secs(5), c.recv())
+        .await
+        .ok()
+        .and_then(Result::ok)
+}
+
+fn delivery_failed() -> Modified {
+    Modified {
+        delivery_failed: Some(true),
+        ..Default::default()
+    }
+}
+
+// ---------------------------------------------------------------- gap 1
+
+/// `/queues/<name>` reaches the queue declared under `<name>`, whatever its
+/// kind — never a separate transient queue of the same name.
+#[cfg(feature = "store-redb")]
+#[tokio::test]
+async fn queues_address_finds_the_declared_queue_of_any_kind() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = BrokerConfig::default();
+    config.data_dir = Some(dir.path().to_path_buf());
+    let r = start(config, None).await;
+    for (kind, name) in [("durable", "jobs"), ("quorum", "orders")] {
+        let (s, body) = http(
+            &r.mgmt,
+            "PUT",
+            &format!("/queues/%2F/{name}"),
+            &format!(r#"{{"kind":"{kind}"}}"#),
+        )
+        .await;
+        assert_eq!(s, 201, "{body}");
+    }
+    let conn = ConnectionBuilder::new(format!("amqp://{}", r.addr))
+        .connect()
+        .await
+        .unwrap();
+    let s = conn.begin_session().await.unwrap();
+    for name in ["jobs", "orders"] {
+        s.create_producer(&format!("/queues/{name}"))
+            .await
+            .unwrap()
+            .send(Message::text(format!("via-queues-{name}")))
+            .await
+            .unwrap();
+    }
+    // The messages are in the declared durable / quorum queues.
+    let mut d = s.create_consumer("/durable/jobs").await.unwrap();
+    assert_eq!(
+        text(&recv(&mut d).await.expect("durable")),
+        "via-queues-jobs"
+    );
+    let mut q = s.create_consumer("/quorum/orders").await.unwrap();
+    assert_eq!(
+        text(&recv(&mut q).await.expect("quorum")),
+        "via-queues-orders"
+    );
+    // ... and no transient twin was created.
+    let (_, body) = http(&r.mgmt, "GET", "/queues", "").await;
+    assert!(!body.contains("\"kind\":\"transient\""), "{body}");
+    // Nothing declared: `/queues/<name>` still declares a transient queue.
+    s.create_producer("/queues/fresh").await.unwrap();
+    let (st, body) = http(&r.mgmt, "GET", "/queues/%2F/fresh", "").await;
+    assert!(
+        st == 200 && body.contains("\"kind\":\"transient\""),
+        "{body}"
+    );
+    conn.close().await.unwrap();
+    r.shutdown.shutdown();
+}
+
+/// A name holds one kind: an explicit `/quorum/` attach does not add a
+/// second kind beside an existing transient queue (after which
+/// `/queues/<name>` could no longer tell them apart).
+#[tokio::test]
+async fn a_second_kind_under_one_name_is_refused() {
+    let r = start(BrokerConfig::default(), None).await;
+    let conn = ConnectionBuilder::new(format!("amqp://{}", r.addr))
+        .connect()
+        .await
+        .unwrap();
+    let s = conn.begin_session().await.unwrap();
+    s.create_producer("/queues/twin")
+        .await
+        .unwrap()
+        .send(Message::text("t"))
+        .await
+        .unwrap();
+    // Refusals surface on first use.
+    let q = s.create_producer("/quorum/twin").await.unwrap();
+    assert!(
+        q.send(Message::text("q")).await.is_err(),
+        "second kind refused"
+    );
+    // The existing queue is untouched and still reached at /queues/.
+    let p = s.create_producer("/queues/twin").await.unwrap();
+    assert!(matches!(
+        p.send(Message::text("t2")).await.unwrap(),
+        DeliveryState::Accepted(_)
+    ));
+    let (_, body) = http(&r.mgmt, "GET", "/queues", "").await;
+    assert!(!body.contains("\"kind\":\"quorum\""), "{body}");
+    conn.close().await.unwrap();
+    r.shutdown.shutdown();
+}
+
+// ---------------------------------------------------------------- gap 2
+
+/// `header.delivery-count` counts failed attempts (AMQP 1.0 §3.2.1): a
+/// `delivery-failed` redelivery increments it; a plain release does not.
+#[tokio::test]
+async fn delivery_count_counts_failed_attempts_on_every_queue_kind() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = BrokerConfig::default();
+    config.data_dir = Some(dir.path().to_path_buf());
+    let r = start(config, None).await;
+    let conn = ConnectionBuilder::new(format!("amqp://{}", r.addr))
+        .connect()
+        .await
+        .unwrap();
+    let s = conn.begin_session().await.unwrap();
+    let addresses: &[&str] = if cfg!(feature = "store-redb") {
+        &["/queues/retry", "/durable/retry2", "/quorum/retry3"]
+    } else {
+        &["/queues/retry", "/quorum/retry3"]
+    };
+    for &address in addresses {
+        s.create_producer(address)
+            .await
+            .unwrap()
+            .send(Message::text("r"))
+            .await
+            .unwrap();
+        let mut c = s.create_consumer(address).await.unwrap();
+        let count =
+            |d: &ramqp::Delivery| d.message().unwrap().header.map_or(0, |h| h.delivery_count);
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            let d = recv(&mut c).await.expect("delivery");
+            seen.push(count(&d));
+            c.modify(&d, delivery_failed()).await.unwrap();
+        }
+        // A plain release is not a failed attempt.
+        let d = recv(&mut c).await.expect("delivery");
+        seen.push(count(&d));
+        c.release(&d).await.unwrap();
+        let d = recv(&mut c).await.expect("delivery");
+        seen.push(count(&d));
+        c.accept(&d).await.unwrap();
+        assert_eq!(seen, [0, 1, 2, 3, 3], "{address}");
+        assert_eq!(text(&d), "r", "the body is untouched");
+        c.detach().await.unwrap();
+    }
+    conn.close().await.unwrap();
+    r.shutdown.shutdown();
+}
+
+// ---------------------------------------------------------------- gap 3
+
+/// An exchange publish that matches no binding is settled `released`
+/// (RabbitMQ 4.x); with an alternate queue it is `accepted`.
+#[tokio::test]
+async fn unroutable_exchange_publish_is_released() {
+    let r = start(BrokerConfig::default(), None).await;
+    r.broker
+        .declare_exchange("", "plain", ExchangeKind::Direct, None)
+        .await
+        .unwrap();
+    r.broker
+        .declare_exchange(
+            "",
+            "with-alt",
+            ExchangeKind::Direct,
+            Some("/queues/unroutable"),
+        )
+        .await
+        .unwrap();
+    let conn = ConnectionBuilder::new(format!("amqp://{}", r.addr))
+        .connect()
+        .await
+        .unwrap();
+    let s = conn.begin_session().await.unwrap();
+    let p = s.create_producer("/exchanges/plain/nobody").await.unwrap();
+    for _ in 0..3 {
+        assert!(matches!(
+            p.send(Message::text("x")).await.unwrap(),
+            DeliveryState::Released(_)
+        ));
+    }
+    let p = s
+        .create_producer("/exchanges/with-alt/nobody")
+        .await
+        .unwrap();
+    assert!(matches!(
+        p.send(Message::text("y")).await.unwrap(),
+        DeliveryState::Accepted(_)
+    ));
+    let mut alt = s.create_consumer("/queues/unroutable").await.unwrap();
+    assert_eq!(text(&recv(&mut alt).await.expect("alternate")), "y");
+    conn.close().await.unwrap();
+    r.shutdown.shutdown();
+}
+
+// ---------------------------------------------------------------- gap 5
+
+/// A queue declared with its own dead-letter target and retry budget
+/// dead-letters there after the budget, keeps the policy over a restart,
+/// and refuses a re-declare with a different policy.
+#[cfg(feature = "store-redb")]
+#[tokio::test]
+async fn per_queue_policy_dead_letters_and_persists() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = BrokerConfig::default();
+    config.data_dir = Some(dir.path().to_path_buf());
+    let r = start(config.clone(), None).await;
+    let decl = r#"{"kind":"durable","dead_letter":"/durable/jobs.dlq","max_delivery_attempts":2}"#;
+    let (s, body) = http(&r.mgmt, "PUT", "/queues/%2F/jobs", decl).await;
+    assert_eq!(s, 201, "{body}");
+    assert_eq!(http(&r.mgmt, "PUT", "/queues/%2F/jobs", decl).await.0, 204);
+    let (s, _) = http(&r.mgmt, "PUT", "/queues/%2F/jobs", r#"{"kind":"durable"}"#).await;
+    assert_eq!(s, 409, "a different policy is refused");
+    let (_, body) = http(&r.mgmt, "GET", "/queues/%2F/jobs", "").await;
+    assert!(
+        body.contains("\"dead_letter\":\"/durable/jobs.dlq\""),
+        "{body}"
+    );
+    r.shutdown.shutdown();
+    drop(r); // releases the store
+
+    // After a restart the queue still uses its policy.
+    let r = start(config, None).await;
+    let conn = ConnectionBuilder::new(format!("amqp://{}", r.addr))
+        .connect()
+        .await
+        .unwrap();
+    let s = conn.begin_session().await.unwrap();
+    s.create_producer("/queues/jobs")
+        .await
+        .unwrap()
+        .send(Message::text("job-1"))
+        .await
+        .unwrap();
+    let mut c = s.create_consumer("/queues/jobs").await.unwrap();
+    for _ in 0..2 {
+        let d = recv(&mut c).await.expect("attempt");
+        c.modify(&d, delivery_failed()).await.unwrap();
+    }
+    let mut dlq = s.create_consumer("/durable/jobs.dlq").await.unwrap();
+    assert_eq!(text(&recv(&mut dlq).await.expect("dead-lettered")), "job-1");
+    conn.close().await.unwrap();
+    // Deleting the queue removes its policy: a re-declare states its own.
+    let (st, _) = http(&r.mgmt, "DELETE", "/queues/%2F/jobs", "").await;
+    assert_eq!(st, 204);
+    let (st, _) = http(&r.mgmt, "PUT", "/queues/%2F/jobs", r#"{"kind":"durable"}"#).await;
+    assert_eq!(st, 201);
+    r.shutdown.shutdown();
+}
+
+/// A prefix policy with `{queue}` gives every queue its own dead-letter
+/// companion.
+#[tokio::test]
+async fn dead_letter_template_gives_each_queue_its_companion() {
+    let mut config = BrokerConfig::default();
+    let mut p = ramqp_broker::QueuePolicy::default();
+    p.dead_letter = Some("/queues/{queue}.dlq".into());
+    p.max_delivery_attempts = Some(1);
+    config.policies = vec![("app.".into(), p)];
+    let r = start(config, None).await;
+    let conn = ConnectionBuilder::new(format!("amqp://{}", r.addr))
+        .connect()
+        .await
+        .unwrap();
+    let s = conn.begin_session().await.unwrap();
+    for q in ["app.a", "app.b"] {
+        s.create_producer(&format!("/queues/{q}"))
+            .await
+            .unwrap()
+            .send(Message::text(q))
+            .await
+            .unwrap();
+        let mut c = s.create_consumer(&format!("/queues/{q}")).await.unwrap();
+        let d = recv(&mut c).await.expect("delivery");
+        c.modify(&d, delivery_failed()).await.unwrap();
+        let mut dlq = s
+            .create_consumer(&format!("/queues/{q}.dlq"))
+            .await
+            .unwrap();
+        assert_eq!(text(&recv(&mut dlq).await.expect("own companion")), q);
+        // Delivered once (nothing else arrives).
+        let more = tokio::time::timeout(Duration::from_millis(300), dlq.recv()).await;
+        assert!(more.is_err(), "delivered once");
+    }
+    conn.close().await.unwrap();
+    r.shutdown.shutdown();
+}
+
+// ---------------------------------------------------------------- gap 4
+
+#[cfg(feature = "store-redb")]
+fn base_users() -> StaticUsers {
+    StaticUsers::new()
+        .with_password("ops", "ops-pw")
+        .with_admin("ops")
+        .with_permission(ramqp_broker::auth::Permission::new(
+            "ops", "*", "*", true, true,
+        ))
+}
+
+#[cfg(feature = "store-redb")]
+async fn login(
+    addr: std::net::SocketAddr,
+    user: &str,
+    password: &str,
+) -> Result<ramqp::Connection, String> {
+    ConnectionBuilder::new(format!("amqp://{user}:{password}@{addr}"))
+        .connect()
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// A user and its grants created at runtime: it logs in (PLAIN and SCRAM),
+/// reads only what it was granted, survives a restart, and deleting it
+/// closes its connections. Configuration users are read-only.
+#[cfg(feature = "store-redb")]
+#[tokio::test]
+async fn runtime_users_and_permissions() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = BrokerConfig::default();
+    config.data_dir = Some(dir.path().to_path_buf());
+    let r = start(config.clone(), Some(base_users())).await;
+
+    // Never public, even for reads.
+    assert_eq!(http_auth(&r.mgmt, "GET", "/users", "", None).await.0, 401);
+    let (s, body) = http(
+        &r.mgmt,
+        "PUT",
+        "/users/reader",
+        r#"{"password":"reader-pw"}"#,
+    )
+    .await;
+    assert_eq!(s, 201, "{body}");
+    assert_eq!(
+        http(&r.mgmt, "PUT", "/users/ops", r#"{"password":"x"}"#)
+            .await
+            .0,
+        409,
+        "configuration users are read-only"
+    );
+    let grants = r#"[{"address":"/queues/jobs","operations":["receive"]}]"#;
+    assert_eq!(
+        http(&r.mgmt, "PUT", "/permissions/%2F/reader", grants)
+            .await
+            .0,
+        201
+    );
+    let (_, body) = http(&r.mgmt, "GET", "/users", "").await;
+    assert!(
+        body.contains("\"name\":\"reader\"") && body.contains("\"source\":\"api\""),
+        "{body}"
+    );
+    r.shutdown.shutdown();
+    drop(r); // releases the store
+
+    // Persisted: the user and its grants survive a restart.
+    let r = start(config, Some(base_users())).await;
+    let ops = login(r.addr, "ops", "ops-pw").await.unwrap();
+    let os = ops.begin_session().await.unwrap();
+    os.create_producer("/queues/jobs")
+        .await
+        .unwrap()
+        .send(Message::text("for-reader"))
+        .await
+        .unwrap();
+
+    let reader = login(r.addr, "reader", "reader-pw")
+        .await
+        .expect("runtime user logs in");
+    let rs = reader.begin_session().await.unwrap();
+    let mut c = rs.create_consumer("/queues/jobs").await.unwrap();
+    assert_eq!(text(&recv(&mut c).await.expect("granted")), "for-reader");
+    // Refusals surface on first use.
+    let p = rs.create_producer("/queues/jobs").await.unwrap();
+    assert!(p.send(Message::text("no")).await.is_err(), "no send grant");
+    let mut other = rs.create_consumer("/queues/other").await.unwrap();
+    let denied = tokio::time::timeout(Duration::from_secs(5), other.recv()).await;
+    assert!(matches!(denied, Ok(Err(_))), "no grant there: {denied:?}");
+    // SCRAM works for a runtime user too.
+    let scram = ConnectionBuilder::new(format!("amqp://{}", r.addr))
+        .sasl(ramqp::sasl::SaslProfile::Scram {
+            mechanism: ramqp::sasl::ScramMechanism::Sha256,
+            username: "reader".into(),
+            password: "reader-pw".into(),
+        })
+        .connect()
+        .await;
+    assert!(scram.is_ok(), "{:?}", scram.err());
+    assert!(login(r.addr, "reader", "wrong").await.is_err());
+
+    // Deleted: its open connection closes, and it can no longer log in.
+    assert_eq!(http(&r.mgmt, "DELETE", "/users/reader", "").await.0, 204);
+    let closed = tokio::time::timeout(Duration::from_secs(5), c.recv()).await;
+    assert!(
+        matches!(closed, Ok(Err(_))),
+        "connection closed: {closed:?}"
+    );
+    assert!(login(r.addr, "reader", "reader-pw").await.is_err());
+    assert_eq!(
+        http(&r.mgmt, "GET", "/permissions/%2F/reader", "").await.0,
+        404,
+        "its permissions went with it"
+    );
+    assert_eq!(http(&r.mgmt, "DELETE", "/users/ops", "").await.0, 409);
+    ops.close().await.unwrap();
+    r.shutdown.shutdown();
+}
+
+/// A broker without the runtime user store says so.
+#[tokio::test]
+async fn runtime_users_need_the_user_store() {
+    let r = start(BrokerConfig::default(), None).await;
+    assert_eq!(
+        http(&r.mgmt, "PUT", "/users/x", r#"{"password":"p"}"#)
+            .await
+            .0,
+        501
+    );
+    r.shutdown.shutdown();
+}
+
+// ------------------------------------------------- review follow-ups (#46)
+
+/// `/users` and `/permissions` are never public — whatever form of the
+/// path routes to them (doubled slashes, percent-encoding).
+#[tokio::test]
+async fn user_endpoints_need_credentials_in_every_path_form() {
+    let r = start(
+        BrokerConfig::default(),
+        Some(StaticUsers::new().with_password("ops", "ops-pw")),
+    )
+    .await;
+    for path in [
+        "/users",
+        "//users",
+        "/%75sers",
+        "/users/",
+        "//permissions/%2F/ops",
+        "/%70ermissions/%2F/ops",
+    ] {
+        let (s, body) = http_auth(&r.mgmt, "GET", path, "", None).await;
+        assert_eq!(s, 401, "{path}: {body}");
+    }
+    r.shutdown.shutdown();
+}
+
+/// Standalone quorum queue on disk, not attached since a restart:
+/// `/queues/<name>` reaches it (never a new transient queue shadowing it).
+#[cfg(feature = "store-redb")]
+#[tokio::test]
+async fn queues_address_finds_an_on_disk_quorum_queue_after_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = BrokerConfig::default();
+    config.data_dir = Some(dir.path().to_path_buf());
+    let r = start(config.clone(), None).await;
+    let (s, body) = http(&r.mgmt, "PUT", "/queues/%2F/orders", r#"{"kind":"quorum"}"#).await;
+    assert_eq!(s, 201, "{body}");
+    let conn = ConnectionBuilder::new(format!("amqp://{}", r.addr))
+        .connect()
+        .await
+        .unwrap();
+    let s = conn.begin_session().await.unwrap();
+    s.create_producer("/queues/orders")
+        .await
+        .unwrap()
+        .send(Message::text("kept"))
+        .await
+        .unwrap();
+    conn.close().await.unwrap();
+    r.shutdown.shutdown();
+    drop(r);
+
+    let r = start(config, None).await;
+    let conn = ConnectionBuilder::new(format!("amqp://{}", r.addr))
+        .connect()
+        .await
+        .unwrap();
+    let s = conn.begin_session().await.unwrap();
+    let mut c = s.create_consumer("/queues/orders").await.unwrap();
+    assert_eq!(
+        text(&recv(&mut c).await.expect("persisted message")),
+        "kept"
+    );
+    let (_, body) = http(&r.mgmt, "GET", "/queues", "").await;
+    assert!(
+        !body.contains("\"kind\":\"transient\""),
+        "no shadow: {body}"
+    );
+    conn.close().await.unwrap();
+    r.shutdown.shutdown();
+}
+
+/// A dead letter reaches the dead-letter queue even when the name was first
+/// declared (by a consumer at `/queues/<name>`) as another kind than the
+/// policy's target names.
+#[tokio::test]
+async fn dead_letters_reach_a_dlq_declared_as_another_kind() {
+    let r = start(BrokerConfig::default(), None).await;
+    let decl = r#"{"kind":"quorum","dead_letter":"/quorum/jobs.dlq","max_delivery_attempts":1}"#;
+    assert_eq!(http(&r.mgmt, "PUT", "/queues/%2F/jobs", decl).await.0, 201);
+    let conn = ConnectionBuilder::new(format!("amqp://{}", r.addr))
+        .connect()
+        .await
+        .unwrap();
+    let s = conn.begin_session().await.unwrap();
+    // The DLQ consumer is there first, at the RabbitMQ address: transient.
+    let mut dlq = s.create_consumer("/queues/jobs.dlq").await.unwrap();
+    s.create_producer("/queues/jobs")
+        .await
+        .unwrap()
+        .send(Message::text("doomed"))
+        .await
+        .unwrap();
+    let mut c = s.create_consumer("/queues/jobs").await.unwrap();
+    let d = recv(&mut c).await.expect("delivery");
+    c.modify(&d, delivery_failed()).await.unwrap();
+    assert_eq!(
+        text(&recv(&mut dlq).await.expect("dead letter arrives")),
+        "doomed"
+    );
+    conn.close().await.unwrap();
+    r.shutdown.shutdown();
+}
+
+/// Concurrent first attaches of two kinds under one name never leave the
+/// name with both kinds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_declarations_keep_one_kind_per_name() {
+    let r = start(BrokerConfig::default(), None).await;
+    let addr = r.addr;
+    let mut tasks = Vec::new();
+    for i in 0..30 {
+        for kind in ["queues", "quorum"] {
+            tasks.push(tokio::spawn(async move {
+                let conn = ConnectionBuilder::new(format!("amqp://{addr}"))
+                    .connect()
+                    .await
+                    .unwrap();
+                let s = conn.begin_session().await.unwrap();
+                let p = s
+                    .create_producer(&format!("/{kind}/race{i}"))
+                    .await
+                    .unwrap();
+                let _ = p.send(Message::text("x")).await;
+                conn.close().await.ok();
+            }));
+        }
+    }
+    for t in tasks {
+        t.await.unwrap();
+    }
+    let conn = ConnectionBuilder::new(format!("amqp://{addr}"))
+        .connect()
+        .await
+        .unwrap();
+    let s = conn.begin_session().await.unwrap();
+    for i in 0..30 {
+        let p = s
+            .create_producer(&format!("/queues/race{i}"))
+            .await
+            .unwrap();
+        assert!(
+            p.send(Message::text("after")).await.is_ok(),
+            "race{i} still reachable at /queues/"
+        );
+    }
+    // The decisive check: no name is held by two queues.
+    let (_, body) = http(&r.mgmt, "GET", "/queues", "").await;
+    let listed: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let mut seen = std::collections::HashMap::new();
+    for q in listed.as_array().unwrap() {
+        *seen
+            .entry(q["name"].as_str().unwrap().to_owned())
+            .or_insert(0) += 1;
+    }
+    let doubled: Vec<_> = seen.iter().filter(|(_, n)| **n > 1).collect();
+    assert!(doubled.is_empty(), "names held by two kinds: {doubled:?}");
+    assert_eq!(seen.len(), 30);
+    conn.close().await.unwrap();
+    r.shutdown.shutdown();
+}
+
+/// A transactional publish that reaches no queue says so: a transactional
+/// state whose outcome is `released`.
+#[tokio::test]
+async fn transactional_unroutable_publish_is_released() {
+    use ramqp::types::messaging::Outcome;
+    let r = start(BrokerConfig::default(), None).await;
+    r.broker
+        .declare_exchange("", "tx", ExchangeKind::Direct, None)
+        .await
+        .unwrap();
+    let conn = ConnectionBuilder::new(format!("amqp://{}", r.addr))
+        .connect()
+        .await
+        .unwrap();
+    let s = conn.begin_session().await.unwrap();
+    let ctl = s.create_transaction_controller().await.unwrap();
+    let txn = ctl.declare().await.unwrap();
+    let p = s.create_producer("/exchanges/tx/nobody").await.unwrap();
+    let state = p
+        .send_with_state(
+            Message::text("x"),
+            ramqp::txn::transactional_state(txn.clone(), None),
+        )
+        .await
+        .unwrap();
+    let ts = ramqp_core::txn::txn_state(&state).expect("transactional state");
+    assert!(matches!(ts.outcome, Some(Outcome::Released(_))), "{ts:?}");
+    ctl.commit(txn).await.unwrap();
+    conn.close().await.unwrap();
+    r.shutdown.shutdown();
+}
+
+/// `strict_queue_grants`: a `/queues/*` grant does not reach a quorum queue
+/// through its `/queues/` alias; an explicit grant does.
+#[tokio::test]
+async fn strict_queue_grants_keep_queues_grants_to_transient() {
+    use ramqp_broker::auth::Permission;
+    let mut config = BrokerConfig::default();
+    config.strict_queue_grants = true;
+    let users = StaticUsers::new()
+        .with_password("ops", "ops-pw")
+        .with_admin("ops")
+        .with_password("app", "app-pw")
+        .with_permission(Permission::new("app", "*", "/queues/*", true, true));
+    let r = start(config, Some(users)).await;
+    assert_eq!(
+        http(
+            &r.mgmt,
+            "PUT",
+            "/queues/%2F/payments",
+            r#"{"kind":"quorum"}"#
+        )
+        .await
+        .0,
+        201
+    );
+    let conn = ConnectionBuilder::new(format!("amqp://app:app-pw@{}", r.addr))
+        .connect()
+        .await
+        .unwrap();
+    let s = conn.begin_session().await.unwrap();
+    let p = s.create_producer("/queues/payments").await.unwrap();
+    assert!(
+        p.send(Message::text("x")).await.is_err(),
+        "quorum needs its own grant"
+    );
+    let p = s.create_producer("/queues/scratch").await.unwrap();
+    assert!(
+        p.send(Message::text("y")).await.is_ok(),
+        "transient is covered"
+    );
+    conn.close().await.unwrap();
+    r.shutdown.shutdown();
+}
+
+/// Deleting two runtime users back to back closes both users' connections;
+/// grants cannot be given to configuration users; a non-admin runtime user
+/// cannot administer.
+#[tokio::test]
+async fn runtime_user_deletions_and_limits() {
+    let base = StaticUsers::new()
+        .with_password("ops", "ops-pw")
+        .with_admin("ops");
+    let r = start(BrokerConfig::default(), Some(base)).await;
+    for u in ["a", "b"] {
+        let body = format!(r#"{{"password":"{u}-pw"}}"#);
+        assert_eq!(
+            http(&r.mgmt, "PUT", &format!("/users/{u}"), &body).await.0,
+            201
+        );
+        let grant = r#"[{"address":"/queues/*","operations":["send","receive"]}]"#;
+        assert_eq!(
+            http(&r.mgmt, "PUT", &format!("/permissions/%2F/{u}"), grant)
+                .await
+                .0,
+            201
+        );
+    }
+    let grant = r#"[{"address":"/queues/*","operations":["send"]}]"#;
+    assert_eq!(
+        http(&r.mgmt, "PUT", "/permissions/%2F/ops", grant).await.0,
+        409
+    );
+    use base64::Engine;
+    let basic = base64::engine::general_purpose::STANDARD.encode("a:a-pw");
+    let (s, _) = http_auth(
+        &r.mgmt,
+        "PUT",
+        "/queues/%2F/q",
+        r#"{"kind":"transient"}"#,
+        Some(&format!("Basic {basic}")),
+    )
+    .await;
+    assert_eq!(s, 401, "a non-admin runtime user cannot administer");
+
+    let mut consumers = Vec::new();
+    let mut conns = Vec::new();
+    for u in ["a", "b"] {
+        let conn = ConnectionBuilder::new(format!("amqp://{u}:{u}-pw@{}", r.addr))
+            .connect()
+            .await
+            .unwrap();
+        let s = conn.begin_session().await.unwrap();
+        consumers.push(
+            s.create_consumer(&format!("/queues/{u}-inbox"))
+                .await
+                .unwrap(),
+        );
+        conns.push(conn);
+    }
+    // Back to back: neither deletion may be missed.
+    assert_eq!(http(&r.mgmt, "DELETE", "/users/a", "").await.0, 204);
+    assert_eq!(http(&r.mgmt, "DELETE", "/users/b", "").await.0, 204);
+    for c in &mut consumers {
+        let closed = tokio::time::timeout(Duration::from_secs(5), c.recv()).await;
+        assert!(
+            matches!(closed, Ok(Err(_))),
+            "connection closed: {closed:?}"
+        );
+    }
+    r.shutdown.shutdown();
+}

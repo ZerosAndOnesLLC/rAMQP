@@ -164,7 +164,7 @@ async fn quorum_overflow_rejects_the_publish() {
 }
 
 #[tokio::test]
-async fn transient_and_quorum_queues_coexist() {
+async fn a_name_holds_one_queue_kind() {
     let (addr, shutdown) = start(BrokerConfig::default()).await;
     let conn = ConnectionBuilder::new(format!("amqp://{addr}"))
         .connect()
@@ -172,16 +172,26 @@ async fn transient_and_quorum_queues_coexist() {
         .expect("connect");
     let session = conn.begin_session().await.expect("session");
 
-    // Same base name, different kinds — distinct queues.
-    let tp = session.create_producer("/queues/same").await.expect("tp");
+    // `/queues/<name>` reaches the quorum queue declared under the name.
     let qp = session.create_producer("/quorum/same").await.expect("qp");
-    tp.send(Message::text("transient")).await.expect("send t");
     qp.send(Message::text("quorum")).await.expect("send q");
-
-    let mut tc = session.create_consumer("/queues/same").await.expect("tc");
+    let tp = session.create_producer("/queues/same").await.expect("tp");
+    tp.send(Message::text("via-queues")).await.expect("send t");
     let mut qc = session.create_consumer("/quorum/same").await.expect("qc");
-    assert_eq!(text_of(&tc.recv().await.expect("t recv")), "transient");
     assert_eq!(text_of(&qc.recv().await.expect("q recv")), "quorum");
+    assert_eq!(text_of(&qc.recv().await.expect("q recv")), "via-queues");
+
+    // A transient queue's name cannot also become a quorum queue.
+    let t = session.create_producer("/queues/other").await.expect("t");
+    t.send(Message::text("x")).await.expect("transient");
+    let q = session
+        .create_producer("/quorum/other")
+        .await
+        .expect("attach");
+    assert!(
+        q.send(Message::text("y")).await.is_err(),
+        "a second kind under one name is refused"
+    );
 
     conn.close().await.expect("close");
     shutdown.shutdown();
