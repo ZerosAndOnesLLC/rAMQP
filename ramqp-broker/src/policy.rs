@@ -122,7 +122,8 @@ pub(crate) struct EffectivePolicy {
     /// `true` → drop the oldest ready message to admit a new one at the
     /// bound; `false` → reject the publish.
     pub drop_head: bool,
-    /// Dead-letter address for expired / dropped / exhausted messages.
+    /// Dead-letter address for expired / dropped / exhausted / rejected
+    /// messages.
     pub dead_letter: Option<String>,
     /// Failed-delivery cap before dead-lettering instead of requeueing.
     pub max_attempts: Option<u32>,
@@ -242,6 +243,12 @@ impl EffectivePolicy {
     /// Whether a message with this many failed attempts is out of retries.
     pub fn attempts_exhausted(&self, failures: u32) -> bool {
         self.max_attempts.is_some_and(|max| failures >= max)
+    }
+
+    /// Whether a dead message would actually reach a dead-letter queue (a
+    /// target is configured and the router is running).
+    pub fn dead_letters(&self) -> bool {
+        self.dead_letter.is_some() && self.dlx.is_some()
     }
 
     /// Route one dead message: to the dead-letter queue when configured,

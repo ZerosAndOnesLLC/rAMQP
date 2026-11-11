@@ -219,14 +219,9 @@ async fn unknown_exchange_and_exchange_consumers_are_refused() {
         Ok(p) => p.send(Message::text("x")).await.is_err(),
     };
     assert!(refused, "publishing to an undeclared exchange must fail");
-    let mut c = s
-        .create_consumer("/exchanges/events")
-        .await
-        .expect("attach completes");
-    let r = tokio::time::timeout(Duration::from_secs(5), c.recv())
-        .await
-        .expect("refusal arrives");
-    assert!(r.is_err(), "consuming from an exchange must be refused");
+    let r = s.create_consumer("/exchanges/events").await.err();
+    let r = r.expect("consuming from an exchange must be refused");
+    assert!(r.to_string().contains("amqp:not-allowed"), "{r}");
     // The session survives the link refusals (`a` matches no binding, so
     // the publish settles `released`).
     let ok = s.create_producer("/exchanges/events/a").await.unwrap();
@@ -516,14 +511,9 @@ async fn dollar_queue_names_are_reserved() {
         Err(ExchangeError::Invalid(_))
     ));
     let (conn, s) = session(addr).await;
-    let mut c = s
-        .create_consumer("$coordinator")
-        .await
-        .expect("attach completes");
-    let r = tokio::time::timeout(Duration::from_secs(5), c.recv())
-        .await
-        .expect("refusal arrives");
-    assert!(r.is_err(), "a `$` queue must not be auto-declared");
+    let r = s.create_consumer("$coordinator").await.err();
+    let r = r.expect("a `$` queue must not be auto-declared");
+    assert!(r.to_string().contains("amqp:not-found"), "{r}");
     conn.close().await.unwrap();
     shutdown.shutdown();
 }

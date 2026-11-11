@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-RabbitMQ 4.x parity (issue #45).
+RabbitMQ 4.x parity (issue #45), and its follow-ups (issue #47).
 
 **Upgrade note (access control):** `/queues/<name>` now reaches durable and
 quorum queues, and authorization matches the address as written — so an
@@ -47,6 +47,24 @@ transient queues.
   cleared), on transient, durable and quorum queues. Consumers budgeting
   retries on it saw every redelivery as the first attempt. A plain
   `released` does not count.
+- **A consumer's `rejected` is dead-lettered** (#47). It used to drop the
+  message even when the queue's policy (its own or a prefix policy) had a
+  `dead_letter` target. It now dead-letters with reason `rejected`, and
+  drops only when there is no target, as RabbitMQ 4.x does. The same goes
+  for `modified{undeliverable-here}`, which RabbitMQ 4.x treats like
+  `rejected` (it used to requeue). On transient, durable and quorum queues;
+  a durable queue removes its copy only after the dead letter is stored,
+  so a crash re-dead-letters it rather than losing it.
+- **Client: a refused attach fails the attach** (#47, `ramqp-core` /
+  `ramqp`). When the peer refuses a link (AMQP 1.0 §2.6.3: an `attach`
+  with a null source/target, then a `detach` with the reason),
+  `create_consumer`/`create_producer` returned `Ok` with a link that didn't
+  exist, and the refusal showed only on the first `recv`/`send`. They now
+  return a `LinkError` (kind `Detached`) carrying the peer's error, e.g.
+  `amqp:unauthorized-access`; without one, a generic "terminus refused".
+  With transparent reconnect, a link refused on re-attach is ended for its
+  handle (with that error) while the rest of the topology is restored,
+  instead of stalling the reconnect.
 
 ### Added
 - **Per-queue policies**: `PUT /queues/...` and `[[queues]]` accept the

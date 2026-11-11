@@ -2398,14 +2398,26 @@ fn outcome_to_settle(outcome: &ramqp_core::types::messaging::Outcome) -> SettleO
     match outcome {
         Outcome::Accepted(_) => SettleOutcome::Ack,
         Outcome::Released(_) => SettleOutcome::Requeue,
-        Outcome::Modified(m) => {
-            if m.delivery_failed.unwrap_or(false) {
-                SettleOutcome::RequeueFailed
-            } else {
-                SettleOutcome::Requeue
-            }
-        }
-        Outcome::Rejected(_) => SettleOutcome::Drop,
+        Outcome::Modified(m) => modified_to_settle(
+            m.delivery_failed.unwrap_or(false),
+            m.undeliverable_here.unwrap_or(false),
+        ),
+        Outcome::Rejected(_) => SettleOutcome::Reject,
+    }
+}
+
+/// Map a `modified` outcome onto a queue settlement. As in RabbitMQ 4.x,
+/// `undeliverable-here` means the message can't go back to this queue: it is
+/// dead-lettered like `rejected` (or dropped without a target), whatever
+/// `delivery-failed` says. Otherwise `delivery-failed` requeues with a
+/// failure counted, and a bare `modified` requeues like `released`.
+fn modified_to_settle(delivery_failed: bool, undeliverable_here: bool) -> SettleOutcome {
+    if undeliverable_here {
+        SettleOutcome::Reject
+    } else if delivery_failed {
+        SettleOutcome::RequeueFailed
+    } else {
+        SettleOutcome::Requeue
     }
 }
 
@@ -2414,14 +2426,11 @@ fn state_to_outcome(state: &DeliveryState) -> SettleOutcome {
     match state {
         DeliveryState::Accepted(_) => SettleOutcome::Ack,
         DeliveryState::Released(_) => SettleOutcome::Requeue,
-        DeliveryState::Modified(m) => {
-            if m.delivery_failed.unwrap_or(false) {
-                SettleOutcome::RequeueFailed
-            } else {
-                SettleOutcome::Requeue
-            }
-        }
-        DeliveryState::Rejected(_) => SettleOutcome::Drop,
+        DeliveryState::Modified(m) => modified_to_settle(
+            m.delivery_failed.unwrap_or(false),
+            m.undeliverable_here.unwrap_or(false),
+        ),
+        DeliveryState::Rejected(_) => SettleOutcome::Reject,
         // Non-terminal or unknown states shouldn't complete a settlement;
         // requeue is the safe default (at-least-once).
         _ => SettleOutcome::Requeue,

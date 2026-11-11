@@ -13,6 +13,10 @@
 //!
 //! `RAMQP_BROKER_URL` is required to run them: it is an error (not a silent
 //! no-op) to run the broker tests without it.
+//!
+//! `RAMQP_BROKER_REFUSED_ADDRESS` names an address the broker refuses to attach
+//! (e.g. `/queues/ramqp-missing` on RabbitMQ 4.x, which never auto-creates);
+//! the refused-attach test skips without it.
 
 use std::time::Duration;
 
@@ -314,4 +318,34 @@ async fn scram_sha256_auth() {
         }
         Err(e) => panic!("SCRAM-SHA-256 connect failed: {e}"),
     }
+}
+
+/// A link the broker refuses (null terminus + `detach`, AMQP 1.0 §2.6.3) fails
+/// `create_consumer`/`create_producer` with the broker's reason, instead of
+/// handing back a link that doesn't exist. The session survives.
+#[tokio::test]
+#[ignore = "requires a live AMQP 1.0 broker; set RAMQP_BROKER_URL and run with --ignored"]
+async fn refused_attach_fails_the_attach() {
+    let url = broker_url();
+    let Ok(refused) = std::env::var("RAMQP_BROKER_REFUSED_ADDRESS") else {
+        eprintln!("skipping refused-attach test: RAMQP_BROKER_REFUSED_ADDRESS unset");
+        return;
+    };
+    let conn = open_conn(&url).await;
+    let session = conn.begin_session().await.expect("begin");
+
+    let err = session.create_consumer(&refused).await.err();
+    let err = err.expect("a refused receiver attach is an error");
+    assert!(err.remote().is_some(), "carries the broker's reason: {err}");
+    let err = session.create_producer(&refused).await.err();
+    let err = err.expect("a refused sender attach is an error");
+    assert!(err.remote().is_some(), "carries the broker's reason: {err}");
+
+    // The refusals were link-scoped: the session still attaches.
+    let c = session
+        .create_consumer(&broker_address())
+        .await
+        .expect("session survives the refusals");
+    c.detach().await.ok();
+    conn.close().await.expect("close");
 }

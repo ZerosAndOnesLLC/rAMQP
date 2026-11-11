@@ -343,6 +343,19 @@ impl Session {
 
         if let Some(link) = self.links.get_mut(&local) {
             link.set_remote_handle(attach.handle);
+            // A refusal (§2.6.3): the peer answers with a null terminus on the
+            // side it was asked to resolve — `source` for a receiver we
+            // opened, `target` for a sender — and follows with a `detach`
+            // carrying the reason. Leave the attach pending:
+            // `on_peer_detach` fails it with that error, so the caller never
+            // gets a handle to a link that doesn't exist.
+            let refused = match link {
+                Link::Receiver(_) => attach.source.is_none(),
+                Link::Sender(_) => attach.target.is_none(),
+            };
+            if refused {
+                return;
+            }
             link.mark_attached();
             if let Link::Receiver(r) = link {
                 // Adopt the peer's agreed receiver settle mode (first vs second).
@@ -1143,8 +1156,15 @@ impl Session {
             self.handles.release(local);
             return;
         }
-        let events = self.links.get(&local).map(|l| l.events().clone());
-        if let Some(events) = events {
+        // A detach while our attach is still pending is a refusal: fail the
+        // attach with the peer's reason instead of handing out a dead link.
+        let pending = self
+            .links
+            .get_mut(&local)
+            .and_then(|l| l.take_pending_attach());
+        if let Some(reply) = pending {
+            let _ = reply.send(Err(refused_attach_error(detach.error.clone())));
+        } else if let Some(events) = self.links.get(&local).map(|l| l.events().clone()) {
             let _ = events.try_send(LinkEvent::Detached {
                 handle: Handle(local),
                 error: detach.error.clone(),
@@ -1185,6 +1205,15 @@ impl Session {
 }
 
 /// Build a link-level `flow` from the link credit + session windows.
+/// The error a refused attach fails with: the peer's `detach` error when it
+/// sent one (e.g. `amqp:unauthorized-access`), else a generic refusal.
+fn refused_attach_error(error: Option<AmqpError>) -> LinkError {
+    match error {
+        Some(e) => LinkError::from_remote(ErrorKind::Detached, RemoteError::new(e)),
+        None => LinkError::msg(ErrorKind::Detached, "terminus refused by peer"),
+    }
+}
+
 fn link_flow(handle: u32, credit: &LinkCredit, windows: &SessionWindows) -> Flow {
     let mut flow = windows.build_flow();
     flow.handle = Some(handle);
@@ -1518,6 +1547,164 @@ mod tests {
         }
         // The throwaway handle was released: the session can still attach links.
         assert!(!session.knows_link("bad", Role::Sender));
+    }
+
+    /// Our side of a refusal (#47): a receiver we attach is answered with a
+    /// null `source` then a `detach` carrying the reason. The attach must fail
+    /// with that reason, not resolve as attached.
+    #[tokio::test]
+    async fn refused_receiver_attach_fails_with_detach_error() {
+        let (mut session, _resp, _evt, mut transport, mut far) = server_session(&peer_begin());
+        let (link_tx, _link_rx) = mpsc::channel(16);
+        let (reply_tx, mut reply_rx) = tokio::sync::oneshot::channel();
+        session.attach_link(
+            Attach {
+                name: "r".into(),
+                role: Role::Receiver,
+                source: Some(crate::types::messaging::Source::new("/queues/b")),
+                ..Default::default()
+            },
+            CreditMode::Manual,
+            link_tx,
+            reply_tx,
+            &mut transport,
+        );
+        transport.flush().await.unwrap();
+        let _ = far.read_frame().await.unwrap(); // our attach
+
+        // Peer refuses: null source and target...
+        session.on_peer_attach(
+            Attach {
+                name: "r".into(),
+                handle: 7,
+                role: Role::Sender,
+                ..Default::default()
+            },
+            &mut transport,
+        );
+        assert!(
+            reply_rx.try_recv().is_err(),
+            "a null-terminus attach must not resolve the pending attach"
+        );
+
+        // ...then detaches with the reason.
+        session.on_peer_detach(
+            Detach {
+                handle: 7,
+                closed: true,
+                error: Some(AmqpError::new(
+                    crate::types::definitions::AmqpError::UnauthorizedAccess,
+                    Some("no receive grant".into()),
+                )),
+            },
+            &mut transport,
+        );
+        let err = reply_rx
+            .try_recv()
+            .expect("attach resolved by the detach")
+            .expect_err("a refused attach is an error");
+        assert_eq!(err.kind(), ErrorKind::Detached);
+        assert_eq!(
+            err.remote()
+                .expect("peer error carried")
+                .condition()
+                .as_str(),
+            "amqp:unauthorized-access"
+        );
+        // The detach is acknowledged and the link forgotten.
+        transport.flush().await.unwrap();
+        match far.read_frame().await.unwrap().body {
+            FrameBody::Amqp(Performative::Detach(d), _) => assert!(d.error.is_none()),
+            other => panic!("expected detach ack, got {other:?}"),
+        }
+        assert!(!session.knows_link("r", Role::Sender));
+    }
+
+    /// A refused sender (null `target`) whose detach carries no error still
+    /// fails, with a generic refusal.
+    #[tokio::test]
+    async fn refused_sender_attach_without_error_fails_generically() {
+        let (mut session, _resp, _evt, mut transport, _far) = server_session(&peer_begin());
+        let (link_tx, _link_rx) = mpsc::channel(16);
+        let (reply_tx, mut reply_rx) = tokio::sync::oneshot::channel();
+        session.attach_link(
+            Attach {
+                name: "s".into(),
+                role: Role::Sender,
+                target: Some(crate::types::messaging::TargetArchetype::Target(Box::new(
+                    crate::types::messaging::Target::new("/queues/b"),
+                ))),
+                ..Default::default()
+            },
+            CreditMode::Manual,
+            link_tx,
+            reply_tx,
+            &mut transport,
+        );
+        session.on_peer_attach(
+            Attach {
+                name: "s".into(),
+                handle: 3,
+                role: Role::Receiver,
+                // A refusing peer may still echo our source; only the target
+                // it was asked to resolve matters.
+                source: Some(crate::types::messaging::Source::new("me")),
+                ..Default::default()
+            },
+            &mut transport,
+        );
+        assert!(reply_rx.try_recv().is_err());
+        session.on_peer_detach(
+            Detach {
+                handle: 3,
+                closed: true,
+                error: None,
+            },
+            &mut transport,
+        );
+        let err = reply_rx
+            .try_recv()
+            .expect("attach resolved by the detach")
+            .expect_err("a refused attach is an error");
+        assert_eq!(err.kind(), ErrorKind::Detached);
+        assert!(err.remote().is_none());
+        assert!(err.to_string().contains("terminus refused"));
+    }
+
+    /// The accepted case is unchanged: a receiver answered with a source
+    /// resolves as attached.
+    #[tokio::test]
+    async fn accepted_receiver_attach_resolves_ok() {
+        let (mut session, _resp, _evt, mut transport, _far) = server_session(&peer_begin());
+        let (link_tx, _link_rx) = mpsc::channel(16);
+        let (reply_tx, mut reply_rx) = tokio::sync::oneshot::channel();
+        session.attach_link(
+            Attach {
+                name: "ok".into(),
+                role: Role::Receiver,
+                source: Some(crate::types::messaging::Source::new("/queues/a")),
+                ..Default::default()
+            },
+            CreditMode::Manual,
+            link_tx,
+            reply_tx,
+            &mut transport,
+        );
+        session.on_peer_attach(
+            Attach {
+                name: "ok".into(),
+                handle: 1,
+                role: Role::Sender,
+                source: Some(crate::types::messaging::Source::new("/queues/a")),
+                ..Default::default()
+            },
+            &mut transport,
+        );
+        let attached = reply_rx
+            .try_recv()
+            .expect("resolved")
+            .expect("an accepted attach is Ok");
+        assert_eq!(attached.handle, Handle(0));
     }
 
     #[tokio::test]

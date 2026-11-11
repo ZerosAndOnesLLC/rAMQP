@@ -1,7 +1,8 @@
 //! RabbitMQ 4.x parity (issue #45): `/queues/<name>` finds any declared
 //! queue, `delivery-count` on redelivery, unroutable = `released`, per-queue
 //! policies and the `{queue}` dead-letter template, and runtime users and
-//! permissions.
+//! permissions. Plus the #47 follow-ups: a consumer's `rejected` is
+//! dead-lettered, and a refused attach fails the attach.
 
 use std::time::Duration;
 
@@ -194,11 +195,12 @@ async fn a_second_kind_under_one_name_is_refused() {
         .send(Message::text("t"))
         .await
         .unwrap();
-    // Refusals surface on first use.
-    let q = s.create_producer("/quorum/twin").await.unwrap();
+    // The attach itself is refused.
+    let refused = s.create_producer("/quorum/twin").await.err();
+    let refused = refused.expect("second kind refused");
     assert!(
-        q.send(Message::text("q")).await.is_err(),
-        "second kind refused"
+        refused.to_string().contains("amqp:not-allowed"),
+        "{refused}"
     );
     // The existing queue is untouched and still reached at /queues/.
     let p = s.create_producer("/queues/twin").await.unwrap();
@@ -486,12 +488,26 @@ async fn runtime_users_and_permissions() {
     let rs = reader.begin_session().await.unwrap();
     let mut c = rs.create_consumer("/queues/jobs").await.unwrap();
     assert_eq!(text(&recv(&mut c).await.expect("granted")), "for-reader");
-    // Refusals surface on first use.
-    let p = rs.create_producer("/queues/jobs").await.unwrap();
-    assert!(p.send(Message::text("no")).await.is_err(), "no send grant");
-    let mut other = rs.create_consumer("/queues/other").await.unwrap();
-    let denied = tokio::time::timeout(Duration::from_secs(5), other.recv()).await;
-    assert!(matches!(denied, Ok(Err(_))), "no grant there: {denied:?}");
+    // A refusal fails the attach itself, with the broker's reason (#47).
+    let refused = rs.create_producer("/queues/jobs").await.err();
+    let refused = refused.expect("no send grant");
+    assert!(
+        refused.to_string().contains("amqp:unauthorized-access"),
+        "{refused}"
+    );
+    let refused = rs.create_consumer("/queues/other").await.err();
+    let refused = refused.expect("no grant there");
+    assert!(
+        refused.to_string().contains("amqp:unauthorized-access"),
+        "{refused}"
+    );
+    // The session survives the refusals: the granted link still works.
+    rs.create_consumer("/queues/jobs")
+        .await
+        .unwrap()
+        .detach()
+        .await
+        .unwrap();
     // SCRAM works for a runtime user too.
     let scram = ConnectionBuilder::new(format!("amqp://{}", r.addr))
         .sasl(ramqp::sasl::SaslProfile::Scram {
@@ -653,11 +669,10 @@ async fn concurrent_declarations_keep_one_kind_per_name() {
                     .await
                     .unwrap();
                 let s = conn.begin_session().await.unwrap();
-                let p = s
-                    .create_producer(&format!("/{kind}/race{i}"))
-                    .await
-                    .unwrap();
-                let _ = p.send(Message::text("x")).await;
+                // The loser of a race is refused at attach; either is fine.
+                if let Ok(p) = s.create_producer(&format!("/{kind}/race{i}")).await {
+                    let _ = p.send(Message::text("x")).await;
+                }
                 conn.close().await.ok();
             }));
         }
@@ -757,10 +772,11 @@ async fn strict_queue_grants_keep_queues_grants_to_transient() {
         .await
         .unwrap();
     let s = conn.begin_session().await.unwrap();
-    let p = s.create_producer("/queues/payments").await.unwrap();
+    let refused = s.create_producer("/queues/payments").await.err();
+    let refused = refused.expect("quorum needs its own grant");
     assert!(
-        p.send(Message::text("x")).await.is_err(),
-        "quorum needs its own grant"
+        refused.to_string().contains("amqp:unauthorized-access"),
+        "{refused}"
     );
     let p = s.create_producer("/queues/scratch").await.unwrap();
     assert!(
@@ -836,5 +852,190 @@ async fn runtime_user_deletions_and_limits() {
             "connection closed: {closed:?}"
         );
     }
+    r.shutdown.shutdown();
+}
+
+// ---------------------------------------------------------------- #47
+
+/// A consumer's `rejected` dead-letters through the queue's policy, and so
+/// does `modified{undeliverable-here}` (RabbitMQ 4.x); with no dead-letter
+/// target the message is dropped. On every queue kind.
+#[tokio::test]
+async fn rejected_messages_are_dead_lettered_on_every_queue_kind() {
+    use ramqp::types::definitions::{AmqpError, Error};
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = BrokerConfig::default();
+    config.data_dir = Some(dir.path().to_path_buf());
+    let r = start(config, None).await;
+    let conn = ConnectionBuilder::new(format!("amqp://{}", r.addr))
+        .connect()
+        .await
+        .unwrap();
+    let s = conn.begin_session().await.unwrap();
+    let kinds: &[&str] = if cfg!(feature = "store-redb") {
+        &["transient", "durable", "quorum"]
+    } else {
+        &["transient", "quorum"]
+    };
+    for &kind in kinds {
+        let (q, dlq, bare) = (
+            format!("{kind}-jobs"),
+            format!("{kind}-jobs.dlq"),
+            format!("{kind}-bare"),
+        );
+        let declare = |name: &str, body: String| {
+            let path = format!("/queues/%2F/{name}");
+            let mgmt = r.mgmt;
+            async move { http(&mgmt, "PUT", &path, &body).await }
+        };
+        assert_eq!(
+            declare(&dlq, format!(r#"{{"kind":"{kind}"}}"#)).await.0,
+            201
+        );
+        let (st, body) = declare(
+            &q,
+            format!(r#"{{"kind":"{kind}","dead_letter":"/queues/{dlq}"}}"#),
+        )
+        .await;
+        assert_eq!(st, 201, "{kind}: {body}");
+        assert_eq!(
+            declare(&bare, format!(r#"{{"kind":"{kind}"}}"#)).await.0,
+            201
+        );
+
+        let p = s.create_producer(&format!("/queues/{q}")).await.unwrap();
+        p.send(Message::text("rejected")).await.unwrap();
+        p.send(Message::text("undeliverable")).await.unwrap();
+        let mut c = s.create_consumer(&format!("/queues/{q}")).await.unwrap();
+        let d = recv(&mut c).await.expect("first delivery");
+        assert_eq!(text(&d), "rejected", "{kind}");
+        c.reject(
+            &d,
+            Some(Error::new(
+                AmqpError::InternalError,
+                Some("out of retries".into()),
+            )),
+        )
+        .await
+        .unwrap();
+        let d = recv(&mut c).await.expect("second delivery");
+        assert_eq!(text(&d), "undeliverable", "{kind}");
+        c.modify(
+            &d,
+            Modified {
+                delivery_failed: Some(true),
+                undeliverable_here: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut dl = s.create_consumer(&format!("/queues/{dlq}")).await.unwrap();
+        let mut got = Vec::new();
+        for _ in 0..2 {
+            let d = recv(&mut dl)
+                .await
+                .unwrap_or_else(|| panic!("{kind}: dead letter arrives"));
+            got.push(text(&d));
+            dl.accept(&d).await.unwrap();
+        }
+        got.sort();
+        assert_eq!(got, ["rejected", "undeliverable"], "{kind}");
+        // Neither went back to the source queue.
+        let again = tokio::time::timeout(Duration::from_millis(300), c.recv()).await;
+        assert!(again.is_err(), "{kind}: nothing redelivered: {again:?}");
+        c.detach().await.unwrap();
+        dl.detach().await.unwrap();
+
+        // No dead-letter target: a reject drops the message.
+        s.create_producer(&format!("/queues/{bare}"))
+            .await
+            .unwrap()
+            .send(Message::text("gone"))
+            .await
+            .unwrap();
+        let mut c = s.create_consumer(&format!("/queues/{bare}")).await.unwrap();
+        let d = recv(&mut c).await.expect("delivery");
+        c.reject(&d, None).await.unwrap();
+        let again = tokio::time::timeout(Duration::from_millis(300), c.recv()).await;
+        assert!(
+            again.is_err(),
+            "{kind}: dropped, not redelivered: {again:?}"
+        );
+        c.detach().await.unwrap();
+    }
+    conn.close().await.unwrap();
+    r.shutdown.shutdown();
+}
+
+/// A rejected message on a durable queue reaches its dead-letter queue
+/// across a restart of the broker (the source copy is removed only once the
+/// dead letter is stored).
+#[cfg(feature = "store-redb")]
+#[tokio::test]
+async fn durable_rejected_dead_letter_survives_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = BrokerConfig::default();
+    config.data_dir = Some(dir.path().to_path_buf());
+    let r = start(config.clone(), None).await;
+    assert_eq!(
+        http(
+            &r.mgmt,
+            "PUT",
+            "/queues/%2F/jobs.dlq",
+            r#"{"kind":"durable"}"#
+        )
+        .await
+        .0,
+        201
+    );
+    assert_eq!(
+        http(
+            &r.mgmt,
+            "PUT",
+            "/queues/%2F/jobs",
+            r#"{"kind":"durable","dead_letter":"/queues/jobs.dlq"}"#
+        )
+        .await
+        .0,
+        201
+    );
+    let conn = ConnectionBuilder::new(format!("amqp://{}", r.addr))
+        .connect()
+        .await
+        .unwrap();
+    let s = conn.begin_session().await.unwrap();
+    s.create_producer("/queues/jobs")
+        .await
+        .unwrap()
+        .send(Message::text("job-1"))
+        .await
+        .unwrap();
+    let mut c = s.create_consumer("/queues/jobs").await.unwrap();
+    let d = recv(&mut c).await.expect("delivery");
+    c.reject(&d, None).await.unwrap();
+    // Let the dead letter land before stopping.
+    let mut dl = s.create_consumer("/queues/jobs.dlq").await.unwrap();
+    let d = recv(&mut dl).await.expect("dead-lettered");
+    assert_eq!(text(&d), "job-1");
+    dl.release(&d).await.unwrap();
+    conn.close().await.unwrap();
+    r.shutdown.shutdown();
+    drop(r);
+
+    let r = start(config, None).await;
+    let conn = ConnectionBuilder::new(format!("amqp://{}", r.addr))
+        .connect()
+        .await
+        .unwrap();
+    let s = conn.begin_session().await.unwrap();
+    let mut dl = s.create_consumer("/queues/jobs.dlq").await.unwrap();
+    assert_eq!(text(&recv(&mut dl).await.expect("still there")), "job-1");
+    let mut c = s.create_consumer("/queues/jobs").await.unwrap();
+    let again = tokio::time::timeout(Duration::from_millis(300), c.recv()).await;
+    assert!(again.is_err(), "the source copy is gone: {again:?}");
+    conn.close().await.unwrap();
     r.shutdown.shutdown();
 }

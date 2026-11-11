@@ -399,7 +399,16 @@ fn handle_msg(
             }
             inflight.remove(&msg_id);
             match outcome {
-                SettleOutcome::Ack | SettleOutcome::Drop => {
+                SettleOutcome::Reject if policy.dead_letters() => {
+                    // Rejected with a dead-letter target: hand the body to
+                    // the router, then remove (never re-readied: the copy is
+                    // already on its way to the DLQ).
+                    failures.remove(&msg_id);
+                    dead_letter_stored(name, policy, store, msg_id, "rejected");
+                    push_remove(commits, raft, msg_id);
+                }
+                // Accepted, or rejected with nowhere to dead-letter: remove.
+                SettleOutcome::Ack | SettleOutcome::Reject => {
                     failures.remove(&msg_id);
                     let raft = raft.clone();
                     commits.push(Box::pin(async move {

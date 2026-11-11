@@ -184,13 +184,11 @@ async fn a_name_holds_one_queue_kind() {
     // A transient queue's name cannot also become a quorum queue.
     let t = session.create_producer("/queues/other").await.expect("t");
     t.send(Message::text("x")).await.expect("transient");
-    let q = session
-        .create_producer("/quorum/other")
-        .await
-        .expect("attach");
+    let refused = session.create_producer("/quorum/other").await.err();
+    let refused = refused.expect("a second kind under one name is refused");
     assert!(
-        q.send(Message::text("y")).await.is_err(),
-        "a second kind under one name is refused"
+        refused.to_string().contains("amqp:not-allowed"),
+        "{refused}"
     );
 
     conn.close().await.expect("close");

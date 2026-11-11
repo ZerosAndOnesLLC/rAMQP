@@ -171,13 +171,19 @@ async fn durable_messages_survive_a_broker_restart() {
     let session = conn.begin_session().await.expect("session");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     let (mut consumer, first) = loop {
-        let mut c = session
-            .create_consumer("/durable/restart")
-            .await
-            .expect("attach");
-        match tokio::time::timeout(std::time::Duration::from_secs(2), c.recv()).await {
-            Ok(Ok(d)) => break (c, d),
-            _ => {
+        // Until recovery finishes the attach is refused (not sticky).
+        let attempt = match session.create_consumer("/durable/restart").await {
+            Ok(mut c) => {
+                match tokio::time::timeout(std::time::Duration::from_secs(2), c.recv()).await {
+                    Ok(Ok(d)) => Some((c, d)),
+                    _ => None,
+                }
+            }
+            Err(_) => None,
+        };
+        match attempt {
+            Some(found) => break found,
+            None => {
                 assert!(
                     std::time::Instant::now() < deadline,
                     "store never became attachable after restart"
@@ -225,21 +231,19 @@ async fn durable_queue_is_reached_at_queues_and_holds_its_name() {
     assert_eq!(text_of(&dc.recv().await.expect("d recv")), "durable");
     assert_eq!(text_of(&dc.recv().await.expect("d recv")), "via-queues");
     // ... which a quorum queue of the same name cannot join.
-    let q = session
-        .create_producer("/quorum/same")
-        .await
-        .expect("attach");
+    let refused = session.create_producer("/quorum/same").await.err();
+    let refused = refused.expect("second kind refused");
     assert!(
-        q.send(Message::text("x")).await.is_err(),
-        "second kind refused"
+        refused.to_string().contains("amqp:not-allowed"),
+        "{refused}"
     );
 
     conn.close().await.expect("close");
     shutdown.shutdown();
 }
 
-/// Without a data dir, a durable attach is refused (the link detaches with
-/// `not-found`, surfacing at `recv`) but the session survives.
+/// Without a data dir, a durable attach is refused (the attach fails with
+/// `not-found`) but the session survives.
 #[tokio::test]
 async fn durable_without_data_dir_is_refused() {
     let (addr, shutdown) = start(BrokerConfig::default()).await;
@@ -248,17 +252,9 @@ async fn durable_without_data_dir_is_refused() {
         .await
         .expect("connect");
     let session = conn.begin_session().await.expect("session");
-    let mut consumer = session
-        .create_consumer("/durable/nope")
-        .await
-        .expect("attach itself completes");
-    let refused = tokio::time::timeout(std::time::Duration::from_secs(5), consumer.recv())
-        .await
-        .expect("refusal arrives promptly");
-    assert!(
-        refused.is_err(),
-        "attach must be refused without a data dir, got {refused:?}"
-    );
+    let refused = session.create_consumer("/durable/nope").await.err();
+    let refused = refused.expect("attach must be refused without a data dir");
+    assert!(refused.to_string().contains("amqp:not-found"), "{refused}");
     // The session survives the refusal.
     let p = session
         .create_producer("/queues/ok")
@@ -318,13 +314,19 @@ async fn quorum_messages_survive_a_broker_restart() {
     let session = conn.begin_session().await.expect("session");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
     let (mut consumer, first) = loop {
-        let mut c = session
-            .create_consumer("/quorum/qrestart")
-            .await
-            .expect("attach");
-        match tokio::time::timeout(std::time::Duration::from_secs(2), c.recv()).await {
-            Ok(Ok(d)) => break (c, d),
-            _ => {
+        // Until recovery finishes the attach is refused (not sticky).
+        let attempt = match session.create_consumer("/quorum/qrestart").await {
+            Ok(mut c) => {
+                match tokio::time::timeout(std::time::Duration::from_secs(2), c.recv()).await {
+                    Ok(Ok(d)) => Some((c, d)),
+                    _ => None,
+                }
+            }
+            Err(_) => None,
+        };
+        match attempt {
+            Some(found) => break found,
+            None => {
                 assert!(
                     std::time::Instant::now() < deadline,
                     "quorum queue never recovered after restart"

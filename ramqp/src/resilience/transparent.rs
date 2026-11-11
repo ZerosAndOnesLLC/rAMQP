@@ -716,12 +716,40 @@ impl Supervisor {
                 v
             };
             for vhandle in vhandles {
-                if self.open_link(vchan, vhandle).await.is_err() {
-                    return false;
+                match self.open_link(vchan, vhandle).await {
+                    Ok(_) => {}
+                    // The peer refused this one link (e.g. its grant was
+                    // revoked while we were away). The connection is fine:
+                    // end that link for its handle and replay the rest.
+                    Err(e) if e.kind() == ErrorKind::Detached => {
+                        self.end_refused_link(vchan, vhandle, &e);
+                    }
+                    Err(_) => return false,
                 }
             }
         }
         true
+    }
+
+    /// Forget a logical link the peer refused on re-attach, and tell its handle
+    /// it is detached (with the peer's reason) so its next operation fails.
+    fn end_refused_link(&mut self, vchan: u16, vhandle: u32, error: &LinkError) {
+        let Some(link) = self
+            .sessions
+            .get_mut(&vchan)
+            .and_then(|s| s.links.remove(&vhandle))
+        else {
+            return;
+        };
+        let event = crate::proto::LinkEvent::Detached {
+            handle: Handle(vhandle),
+            error: error.remote().map(|r| r.as_amqp().clone()),
+        };
+        // Off the supervisor task: a handle not draining its events must not
+        // stall the rest of the replay.
+        tokio::spawn(async move {
+            let _ = link.handle_events.send(event).await;
+        });
     }
 
     fn give_up(&mut self, reason: &str) {

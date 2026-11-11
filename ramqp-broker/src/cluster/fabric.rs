@@ -216,6 +216,9 @@ pub enum SettleWire {
     Ack,
     Requeue,
     RequeueFailed,
+    /// [`SettleOutcome::Reject`](crate::queue::SettleOutcome::Reject). The
+    /// variant keeps its pre-0.12 name so mixed-version clusters agree on the
+    /// wire encoding.
     Drop,
 }
 
@@ -226,7 +229,7 @@ impl From<crate::queue::SettleOutcome> for SettleWire {
             S::Ack => SettleWire::Ack,
             S::Requeue => SettleWire::Requeue,
             S::RequeueFailed => SettleWire::RequeueFailed,
-            S::Drop => SettleWire::Drop,
+            S::Reject => SettleWire::Drop,
         }
     }
 }
@@ -238,7 +241,7 @@ impl From<SettleWire> for crate::queue::SettleOutcome {
             SettleWire::Ack => S::Ack,
             SettleWire::Requeue => S::Requeue,
             SettleWire::RequeueFailed => S::RequeueFailed,
-            SettleWire::Drop => S::Drop,
+            SettleWire::Drop => S::Reject,
         }
     }
 }

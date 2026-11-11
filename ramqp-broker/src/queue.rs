@@ -52,8 +52,10 @@ pub(crate) enum SettleOutcome {
     Requeue,
     /// `modified{delivery-failed}` — return to the queue and count the failure.
     RequeueFailed,
-    /// `rejected` — drop (dead-lettering arrives in Phase 7).
-    Drop,
+    /// `rejected`, or `modified{undeliverable-here}` — dead-letter with
+    /// reason `rejected` when the queue's policy has a dead-letter target,
+    /// otherwise drop (RabbitMQ 4.x semantics).
+    Reject,
 }
 
 /// Commands into a queue actor.
@@ -369,8 +371,12 @@ async fn run(name: String, mut rx: mpsc::Receiver<QueueMsg>, policy: EffectivePo
                 }
                 if let Some((mut stored, _)) = unacked.remove(&msg_id) {
                     match outcome {
-                        SettleOutcome::Ack | SettleOutcome::Drop => {
+                        SettleOutcome::Ack => {
                             bytes = bytes.saturating_sub(stored.body.len());
+                        }
+                        SettleOutcome::Reject => {
+                            bytes = bytes.saturating_sub(stored.body.len());
+                            policy.dead_letter(&name, "rejected", stored.body);
                         }
                         SettleOutcome::Requeue => ready.push_front(stored),
                         SettleOutcome::RequeueFailed => {
