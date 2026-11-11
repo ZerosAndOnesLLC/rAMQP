@@ -28,6 +28,11 @@ default = []
 # SASL SCRAM primitives (hash math + string preparation), shared by the
 # client's ScramClient and the broker's ScramServer.
 scram = ["dep:hmac", "dep:sha1", "dep:sha2", "dep:pbkdf2", "dep:base64", "dep:stringprep"]
+# The same SCRAM primitives on AWS-LC's FIPS 140-3 validated module
+# (aws-lc-rs `fips`) instead of the RustCrypto crates — enable this INSTEAD
+# of `scram` for a FIPS build (it wins when both are on). Building it needs
+# CMake and Go (aws-lc-fips-sys).
+scram-fips = ["dep:aws-lc-rs", "dep:base64", "dep:stringprep"]
 # Transaction wire types (clean-room, spec part 4).
 transaction = []
 
@@ -52,6 +57,12 @@ features = ["hmac"]
 [dependencies.base64]
 version = "0.23"
 optional = true
+
+[dependencies.aws-lc-rs]
+version = "1.19"
+optional = true
+default-features = false
+features = ["fips", "alloc"]
 
 [dependencies.stringprep]
 version = "0.1"

@@ -598,8 +598,9 @@ Ordered by how much they threaten the plan. Status as of Phases 0–9 complete
 - **Spill-segment shipping** — a paged quorum queue's snapshot keeps bodies
   external (node-local), so follower catch-up *via snapshot* is unsupported;
   log-replay catch-up works.
-- **Fabric authentication** — inter-node RPCs are currently unauthenticated (bind
-  the fabric to a trusted network); a fabric-level auth/mTLS story is owed before a
-  hostile-network deployment.
-- **Management surface** — read-only today (`/metrics`, `/queues`); queue
-  delete + a richer admin protocol are the next slice.
+- ✅ **Fabric authentication** — optional mutual TLS on the fabric
+  (`ClusterMemberConfig::tls`, issue #37); without it the fabric must still sit
+  on a trusted network.
+- ✅ **Management surface** — admin API (declare/delete queues, exchanges,
+  bindings; per-queue stats) landed with issue #37. Still open: deleting
+  **quorum** queues (Raft group + log teardown on every replica).

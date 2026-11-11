@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Server TLS** (issue #37 §4; features `tls` — rustls/ring — or `fips`): an
+  `amqps` listener (`BrokerConfig::tls_listen` + `TlsServerConfig`), the
+  management endpoint over TLS (`management_tls`), optional client-certificate
+  verification (mTLS), and certificate **hot reload** from disk (a failed
+  reload keeps the old certificate). Optional **mutual TLS on the cluster
+  fabric** (`ClusterMemberConfig::tls`). `[tls]` config section and
+  `--tls-*` flags.
+- **FIPS build** (`fips`): rustls on AWS-LC's FIPS 140-3 provider and SCRAM
+  hashing on the same module via the new `ramqp-core` feature **`scram-fips`**
+  (SHA/HMAC/PBKDF2 and nonce randomness on AWS-LC; no RustCrypto, no ring).
+  `ramqp_broker::fips_enabled()`; the daemon refuses to start a `fips` build
+  whose module is inactive. A FIPS CI job runs both crates' suites. RFC 7677
+  SCRAM-SHA-256 known-answer test added (runs on both backends).
 - **Admin API** on the management listener (issue #37 §3): `PUT`/`DELETE`
   for queues, exchanges, and bindings (idempotent: `201` created, `204`
   already so, `409` different arguments), `GET /queues/<vhost>/<name>` for
@@ -55,6 +68,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Broker::declare_queue` and `BoundBroker::broker`.
 
 ### Changed
+- `ramqp-broker`'s SCRAM backend is now a feature: **`rustcrypto`** (on by
+  default) or `fips`. Builds using `--no-default-features` must add
+  `rustcrypto` (or `fips`); a build with neither fails with a clear error.
+  Publishing needs `ramqp-core` released first (the `scram-fips` feature).
 - The metadata group's state gains exchange definitions; snapshots written
   by 0.9.x still restore. **Upgrade every cluster node before declaring
   exchanges** — an older node cannot apply the new metadata command.

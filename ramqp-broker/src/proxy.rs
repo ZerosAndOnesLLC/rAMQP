@@ -806,6 +806,7 @@ mod tests {
             policies: Vec::new(),
             dlx: None,
             persist: None,
+            tls: None,
         })
         .await
         .expect("bootstrap");

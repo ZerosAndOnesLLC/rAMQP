@@ -69,6 +69,8 @@ pub struct NodeSettings {
     /// On-disk Raft hard-state persistence (`store-redb` + `data_dir`):
     /// groups recover their log/vote/snapshot across restarts.
     pub persist: Option<Arc<dyn super::store::RaftPersistFactory>>,
+    /// Fabric mutual TLS (see [`crate::config::ClusterMemberConfig::tls`]).
+    pub tls: Option<crate::config::TlsServerConfig>,
 }
 
 /// One local member of a per-queue Raft group.
@@ -157,7 +159,13 @@ impl ClusterNode {
                  for durable clustering"
             );
         }
-        let peers = Arc::new(fabric::Peers::default());
+        let fabric_tls = match &settings.tls {
+            Some(tls) => Some(Arc::new(
+                fabric::FabricTls::new(tls).map_err(std::io::Error::other)?,
+            )),
+            None => None,
+        };
+        let peers = Arc::new(fabric::Peers::with_tls(fabric_tls.clone()));
         let raft_config = Arc::new(
             meta_raft_config()
                 .validate()
@@ -193,7 +201,9 @@ impl ClusterNode {
         // into every group (a high-term Vote alone is a cluster-wide
         // liveness DoS). Until fabric auth/TLS lands it MUST be confined to
         // an isolated, trusted network — say so loudly on any other bind.
-        if !fabric_addr.ip().is_loopback() {
+        if fabric_tls.is_some() {
+            tracing::info!(addr = %fabric_addr, "cluster fabric uses mutual TLS");
+        } else if !fabric_addr.ip().is_loopback() {
             tracing::warn!(
                 addr = %fabric_addr,
                 "cluster fabric is listening on a non-loopback address with NO authentication \
@@ -217,7 +227,12 @@ impl ClusterNode {
             stopping: std::sync::atomic::AtomicBool::new(false),
         });
 
-        tokio::spawn(serve_fabric(listener, node.clone(), shutdown_rx));
+        tokio::spawn(serve_fabric(
+            listener,
+            fabric_tls,
+            node.clone(),
+            shutdown_rx,
+        ));
 
         // The lowest seed id proposes the initial membership, retrying until
         // a quorum of seeds is reachable. Initializing an already-initialized
@@ -981,6 +996,7 @@ where
 /// Accept fabric connections until shutdown.
 async fn serve_fabric(
     listener: TcpListener,
+    tls: Option<Arc<fabric::FabricTls>>,
     node: Arc<ClusterNode>,
     mut shutdown: watch::Receiver<bool>,
 ) {
@@ -990,7 +1006,7 @@ async fn serve_fabric(
                 match accepted {
                     Ok((stream, _peer)) => {
                         let _ = stream.set_nodelay(true);
-                        tokio::spawn(handle_conn(stream, node.clone()));
+                        tokio::spawn(accept_conn(stream, tls.clone(), node.clone()));
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "fabric accept error; continuing");
@@ -1001,6 +1017,42 @@ async fn serve_fabric(
             _ = shutdown.changed() => return,
         }
     }
+}
+
+/// Complete an inbound fabric connection: the TLS handshake (requiring a
+/// cluster-CA client certificate) when configured, then serve it.
+#[cfg(any(feature = "tls", feature = "fips"))]
+async fn accept_conn(
+    stream: tokio::net::TcpStream,
+    tls: Option<Arc<fabric::FabricTls>>,
+    node: Arc<ClusterNode>,
+) {
+    match tls {
+        Some(tls) => {
+            match tokio::time::timeout(Duration::from_secs(10), tls.acceptor.accept(stream)).await {
+                Ok(Ok(stream)) => {
+                    let (r, w) = tokio::io::split(stream);
+                    handle_conn(r, w, node).await;
+                }
+                Ok(Err(e)) => tracing::warn!(error = %e, "fabric TLS handshake refused"),
+                Err(_) => tracing::warn!("fabric TLS handshake timed out"),
+            }
+        }
+        None => {
+            let (r, w) = stream.into_split();
+            handle_conn(r, w, node).await;
+        }
+    }
+}
+
+#[cfg(not(any(feature = "tls", feature = "fips")))]
+async fn accept_conn(
+    stream: tokio::net::TcpStream,
+    _tls: Option<Arc<fabric::FabricTls>>,
+    node: Arc<ClusterNode>,
+) {
+    let (r, w) = stream.into_split();
+    handle_conn(r, w, node).await;
 }
 
 /// A queue-bound command from this connection, delivered in order by the
@@ -1036,8 +1088,11 @@ struct LeaderSubs {
 }
 
 /// Serve one inbound fabric connection.
-async fn handle_conn(stream: tokio::net::TcpStream, node: Arc<ClusterNode>) {
-    let (mut reader, writer_half) = stream.into_split();
+async fn handle_conn<R, W>(mut reader: R, writer_half: W, node: Arc<ClusterNode>)
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     let writer = spawn_writer(writer_half);
     let subs: Arc<std::sync::Mutex<LeaderSubs>> =
         Arc::new(std::sync::Mutex::new(LeaderSubs::default()));
@@ -1512,6 +1567,7 @@ mod tests {
                 policies: Vec::new(),
                 dlx: None,
                 persist: None,
+                tls: None,
             })
             .await
             .expect("bootstrap");

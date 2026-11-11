@@ -26,7 +26,6 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{Mutex, mpsc, oneshot};
 
 use super::NodeId;
@@ -261,8 +260,8 @@ fn encode_frame(frame: &OutFrame, out: &mut BytesMut) -> std::io::Result<()> {
 
 /// Read one frame from `reader`, buffering in `buf`. The body is sliced out
 /// of the buffer as refcounted `Bytes` — no copy.
-pub async fn read_frame(
-    reader: &mut OwnedReadHalf,
+pub async fn read_frame<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut R,
     buf: &mut BytesMut,
 ) -> std::io::Result<(FabricHeader, Bytes)> {
     loop {
@@ -293,7 +292,10 @@ pub async fn read_frame(
 /// Spawn the batched writer task for one connection half. Frames sent on the
 /// returned channel are coalesced under one flush per wakeup. The task exits
 /// when every sender is dropped or the socket errors.
-pub fn spawn_writer(mut writer: OwnedWriteHalf) -> mpsc::UnboundedSender<OutFrame> {
+pub fn spawn_writer<W>(mut writer: W) -> mpsc::UnboundedSender<OutFrame>
+where
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     let (tx, mut rx) = mpsc::unbounded_channel::<OutFrame>();
     tokio::spawn(async move {
         let mut out = BytesMut::with_capacity(64 * 1024);
@@ -557,13 +559,87 @@ pub enum OpenSubError {
 pub struct PeerClient {
     addr: String,
     conn: Mutex<Option<Arc<ConnState>>>,
+    tls: Option<Arc<FabricTls>>,
+}
+
+/// The fabric's mutual-TLS material: dial with the connector (presenting
+/// this node's certificate, verifying the peer's against the cluster CA),
+/// accept with the acceptor (requiring a client certificate from the same
+/// CA). Either side without it speaks plain TCP.
+pub struct FabricTls {
+    #[cfg(any(feature = "tls", feature = "fips"))]
+    pub connector: tokio_rustls::TlsConnector,
+    #[cfg(any(feature = "tls", feature = "fips"))]
+    pub acceptor: tokio_rustls::TlsAcceptor,
+}
+
+impl std::fmt::Debug for FabricTls {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FabricTls")
+    }
+}
+
+impl FabricTls {
+    /// Build both halves from the node's TLS config.
+    #[cfg(any(feature = "tls", feature = "fips"))]
+    pub fn new(tls: &crate::config::TlsServerConfig) -> Result<Self, String> {
+        if tls.client_ca_file.is_none() {
+            return Err(
+                "fabric TLS needs `client_ca_file` (the cluster CA) for mutual auth".into(),
+            );
+        }
+        Ok(FabricTls {
+            connector: crate::tls::fabric_connector(tls)?,
+            acceptor: crate::tls::acceptor(tls)?,
+        })
+    }
+
+    #[cfg(not(any(feature = "tls", feature = "fips")))]
+    pub fn new(_tls: &crate::config::TlsServerConfig) -> Result<Self, String> {
+        Err("fabric TLS needs the `tls` or `fips` feature".into())
+    }
+}
+
+/// The reader half of a fabric connection (plain TCP or TLS).
+type BoxRead = Box<dyn tokio::io::AsyncRead + Unpin + Send>;
+
+/// Split a dialed stream: TLS-wrapped when configured.
+#[cfg(any(feature = "tls", feature = "fips"))]
+async fn dial_halves(
+    stream: TcpStream,
+    addr: &str,
+    tls: Option<&FabricTls>,
+) -> std::io::Result<(BoxRead, mpsc::UnboundedSender<OutFrame>)> {
+    match tls {
+        Some(tls) => {
+            let name = crate::tls::server_name(addr).map_err(std::io::Error::other)?;
+            let stream = tls.connector.connect(name, stream).await?;
+            let (r, w) = tokio::io::split(stream);
+            Ok((Box::new(r), spawn_writer(w)))
+        }
+        None => {
+            let (r, w) = stream.into_split();
+            Ok((Box::new(r), spawn_writer(w)))
+        }
+    }
+}
+
+#[cfg(not(any(feature = "tls", feature = "fips")))]
+async fn dial_halves(
+    stream: TcpStream,
+    _addr: &str,
+    _tls: Option<&FabricTls>,
+) -> std::io::Result<(BoxRead, mpsc::UnboundedSender<OutFrame>)> {
+    let (r, w) = stream.into_split();
+    Ok((Box::new(r), spawn_writer(w)))
 }
 
 impl PeerClient {
-    pub fn new(addr: String) -> Self {
+    pub fn new(addr: String, tls: Option<Arc<FabricTls>>) -> Self {
         PeerClient {
             addr,
             conn: Mutex::new(None),
+            tls,
         }
     }
 
@@ -586,14 +662,16 @@ impl PeerClient {
         {
             return Ok(conn.clone());
         }
-        let stream = tokio::time::timeout(Self::DIAL_TIMEOUT, TcpStream::connect(&self.addr))
+        let dial = async {
+            let stream = TcpStream::connect(&self.addr).await?;
+            let _ = stream.set_nodelay(true);
+            dial_halves(stream, &self.addr, self.tls.as_deref()).await
+        };
+        let (mut reader, writer) = tokio::time::timeout(Self::DIAL_TIMEOUT, dial)
             .await
             .map_err(|_| {
                 std::io::Error::new(std::io::ErrorKind::TimedOut, "fabric dial timed out")
             })??;
-        let _ = stream.set_nodelay(true);
-        let (mut reader, writer) = stream.into_split();
-        let writer = spawn_writer(writer);
         let conn = Arc::new(ConnState {
             writer,
             pending: std::sync::Mutex::new(HashMap::new()),
@@ -628,9 +706,19 @@ impl PeerClient {
 #[derive(Debug, Default)]
 pub struct Peers {
     clients: std::sync::Mutex<HashMap<NodeId, Arc<PeerClient>>>,
+    /// Fabric mutual TLS for every dial, when configured.
+    tls: Option<Arc<FabricTls>>,
 }
 
 impl Peers {
+    /// Peers dialing with fabric TLS.
+    pub fn with_tls(tls: Option<Arc<FabricTls>>) -> Self {
+        Peers {
+            clients: std::sync::Mutex::new(HashMap::new()),
+            tls,
+        }
+    }
+
     /// The client for `id`, creating it with `addr` on first use. If the
     /// peer's address changed (member replaced), the client is rebuilt.
     pub fn client(&self, id: NodeId, addr: &str) -> Arc<PeerClient> {
@@ -638,7 +726,7 @@ impl Peers {
         match map.get(&id) {
             Some(existing) if existing.addr() == addr => existing.clone(),
             _ => {
-                let client = Arc::new(PeerClient::new(addr.to_owned()));
+                let client = Arc::new(PeerClient::new(addr.to_owned(), self.tls.clone()));
                 map.insert(id, client.clone());
                 client
             }
@@ -763,7 +851,7 @@ mod tests {
             }
         });
 
-        let client = PeerClient::new(addr);
+        let client = PeerClient::new(addr, None);
         let conn = client.conn().await.expect("connect");
         let calls: Vec<_> = (0..8u8)
             .map(|i| {
@@ -797,7 +885,7 @@ mod tests {
             drop(stream);
         });
 
-        let client = PeerClient::new(addr);
+        let client = PeerClient::new(addr, None);
         let conn = client.conn().await.expect("connect");
         let (events_tx, mut events_rx) = mpsc::unbounded_channel();
         // Register a sub directly (the real open_sub would await a reply that

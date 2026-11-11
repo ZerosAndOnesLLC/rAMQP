@@ -89,11 +89,57 @@ pub struct BrokerConfig {
     /// `false`, so Prometheus and autoscaler scrapes need no secret; turn it
     /// on when the endpoint is reachable beyond a trusted network.
     pub management_auth_reads: bool,
+    /// Serve the management endpoint over TLS with the [`BrokerConfig::tls`]
+    /// certificate (needs the `tls` or `fips` feature).
+    pub management_tls: bool,
+    /// An additional AMQP listener that speaks TLS (`amqps`, e.g.
+    /// `0.0.0.0:5671`) with the [`BrokerConfig::tls`] certificate; the main
+    /// listener stays plain (bind it to loopback for TLS-only). Needs the
+    /// `tls` or `fips` feature.
+    pub tls_listen: Option<String>,
+    /// Server certificate, key, and optional client-CA (mTLS) for the TLS
+    /// listeners.
+    pub tls: Option<TlsServerConfig>,
     /// Queue policies: `(name prefix, policy)` pairs, first match wins (an
     /// empty prefix matches every queue). Matched against the normalized
     /// queue name (no `/queues/` etc. prefix) at declaration. The management
     /// API (Phase 9) will supersede this interim surface.
     pub policies: Vec<(String, QueuePolicy)>,
+}
+
+/// Server-side TLS material, read from PEM files and **re-read when they
+/// change** (cert-manager rotates them in place): a new certificate applies
+/// to new handshakes without a restart. A failed reload keeps serving the
+/// previous certificate and logs the error.
+///
+/// Marked `#[non_exhaustive]`: construct via [`TlsServerConfig::new`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct TlsServerConfig {
+    /// PEM certificate chain (leaf first).
+    pub cert_file: std::path::PathBuf,
+    /// PEM private key (PKCS#8, PKCS#1, or SEC1).
+    pub key_file: std::path::PathBuf,
+    /// PEM CA bundle: when set, clients MUST present a certificate chaining
+    /// to it (mutual TLS). Required for the cluster fabric.
+    pub client_ca_file: Option<std::path::PathBuf>,
+    /// How often the files are checked for changes (default 10 s).
+    pub reload_interval: std::time::Duration,
+}
+
+impl TlsServerConfig {
+    /// TLS from a certificate chain and key file.
+    pub fn new(
+        cert_file: impl Into<std::path::PathBuf>,
+        key_file: impl Into<std::path::PathBuf>,
+    ) -> Self {
+        TlsServerConfig {
+            cert_file: cert_file.into(),
+            key_file: key_file.into(),
+            client_ca_file: None,
+            reload_interval: std::time::Duration::from_secs(10),
+        }
+    }
 }
 
 /// A secret string whose `Debug` output is redacted (config structs are
@@ -206,6 +252,13 @@ pub struct ClusterMemberConfig {
     /// Replica count for newly declared quorum queues (capped at the current
     /// cluster size at declaration).
     pub replicas: u8,
+    /// Mutual TLS on the fabric (needs the `tls` or `fips` feature): every
+    /// node presents `cert_file` and requires peers to present a
+    /// certificate chaining to `client_ca_file` (mandatory here), both when
+    /// accepting and when dialing. Each node's certificate must carry the
+    /// host of its seed address (DNS or IP SAN) — peers verify it. All
+    /// nodes must agree: a TLS node and a plain node cannot talk.
+    pub tls: Option<TlsServerConfig>,
 }
 
 impl ClusterMemberConfig {
@@ -216,6 +269,7 @@ impl ClusterMemberConfig {
             listen: listen.into(),
             seeds,
             replicas: 3,
+            tls: None,
         }
     }
 }
@@ -238,6 +292,9 @@ impl Default for BrokerConfig {
             management_listen: None,
             management_token: None,
             management_auth_reads: false,
+            management_tls: false,
+            tls_listen: None,
+            tls: None,
             policies: Vec::new(),
         }
     }

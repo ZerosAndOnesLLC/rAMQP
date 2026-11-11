@@ -19,7 +19,9 @@ exclude = ["tests"]
 all-features = true
 
 [dependencies]
-ramqp-core = { path = "../ramqp-core", version = "0.2.6", features = ["transaction", "scram"] }
+# SCRAM's crypto backend is chosen by this crate's `rustcrypto` (default) or
+# `fips` feature.
+ramqp-core = { path = "../ramqp-core", version = "0.2.6", features = ["transaction"] }
 bytes = { version = "1", features = ["serde"] }
 futures-util = "0.3"
 tokio = { version = "1", features = ["sync", "io-util", "net", "rt", "rt-multi-thread", "macros", "time", "signal"] }
@@ -35,11 +37,16 @@ redb = { version = "4", optional = true }
 # malloc fragments under high connection churn (issue #23); jemalloc keeps RSS
 # and throughput flat.
 tikv-jemallocator = { version = "0.7", optional = true }
+# Server TLS (features `tls` — ring — or `fips` — AWS-LC FIPS 140-3).
+rustls = { version = "0.23", optional = true, default-features = false, features = ["std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", optional = true, default-features = false, features = ["tls12", "logging"] }
 
 [dev-dependencies]
 # The published client, used as the interop peer for loopback tests.
-ramqp = { path = "../ramqp", features = ["transaction", "scram"] }
+ramqp = { path = "../ramqp", features = ["transaction", "scram", "rustls"] }
 tempfile = "3.27.0"
+# Test-time certificate authority for the TLS tests.
+rcgen = "0.14"
 tokio = { version = "1", features = ["full", "test-util"] }
 
 [features]
@@ -49,7 +56,18 @@ tokio = { version = "1", features = ["full", "test-util"] }
 # (measured: RSS +12% vs +64%, throughput -11% vs -76% over a 20-min churn
 # soak). Disable with `--no-default-features` on targets jemalloc doesn't
 # support.
-default = ["jemalloc"]
+default = ["jemalloc", "rustcrypto"]
 jemalloc = ["dep:tikv-jemallocator"]
+# SCRAM hashing on the RustCrypto crates (the default backend). A build needs
+# this or `fips`.
+rustcrypto = ["ramqp-core/scram"]
+# Server TLS (AMQP + management listeners, cluster fabric mTLS) on rustls
+# with the ring provider.
+tls = ["dep:rustls", "dep:tokio-rustls", "rustls/ring", "tokio-rustls/ring"]
+# FIPS build: TLS on rustls's AWS-LC FIPS 140-3 provider AND SCRAM hashing on
+# AWS-LC FIPS — no other crypto backend. Build with
+# `--no-default-features --features fips[,jemalloc,store-redb]`; needs
+# CMake and Go. (With `tls`/`rustcrypto` also on, FIPS still wins.)
+fips = ["dep:rustls", "dep:tokio-rustls", "rustls/fips", "tokio-rustls/fips", "ramqp-core/scram-fips"]
 # Durable-local queues (`/durable/<name>`) backed by the redb embedded store.
 store-redb = ["dep:redb"]

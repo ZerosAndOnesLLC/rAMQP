@@ -148,6 +148,32 @@ queue = "/quorum/orders.created"
 key = "order.#"
 ```
 
+### TLS and FIPS
+
+Build with `--features tls` (rustls on ring) or, for FIPS 140-3,
+`--no-default-features --features fips,jemalloc,store-redb` (rustls **and**
+SCRAM hashing on AWS-LC's FIPS module; needs CMake and Go to build). The
+daemon logs `FIPS build: …` at startup and refuses to run if the module is
+not active (`ramqp_broker::fips_enabled()`).
+
+```toml
+[tls]
+listen = "0.0.0.0:5671"            # amqps; the plain listener stays (bind it to loopback for TLS-only)
+cert_file = "/etc/ramqp/tls/tls.crt"
+key_file = "/etc/ramqp/tls/tls.key"
+client_ca_file = "/etc/ramqp/tls/ca.crt"   # optional: require client certificates
+management = true                  # serve the management endpoint over TLS
+
+[cluster]
+# ...
+tls = true                         # mutual TLS on the fabric ([tls] cert, client_ca_file = cluster CA)
+```
+
+Certificate files are re-read when they change (cert-manager rotation): new
+handshakes get the new certificate, and a broken file keeps the previous one.
+Fabric certificates must carry the host of each node's seed address (DNS or IP
+SAN). Flags: `--tls-listen`, `--tls-cert`, `--tls-key`, `--tls-client-ca`.
+
 ### Management API
 
 With `management_listen` set, one small HTTP/1.1 endpoint serves metrics,

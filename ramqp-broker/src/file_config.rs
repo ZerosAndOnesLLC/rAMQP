@@ -19,6 +19,14 @@
 //! node_id = 1
 //! listen = "0.0.0.0:7472"
 //! seeds = ["1=broker-0.broker:7472", "2=broker-1.broker:7472", "3=broker-2.broker:7472"]
+//! tls = true                      # mutual TLS on the fabric ([tls] cert + CA)
+//!
+//! [tls]                           # needs a `tls` or `fips` build
+//! listen = "0.0.0.0:5671"         # amqps listener (the plain one stays)
+//! cert_file = "/etc/ramqp/tls/tls.crt"   # reloaded when it changes
+//! key_file = "/etc/ramqp/tls/tls.key"
+//! client_ca_file = "/etc/ramqp/tls/ca.crt"   # optional: require client certs
+//! management = true               # management endpoint over TLS too
 //!
 //! [[users]]
 //! name = "orders"
@@ -97,6 +105,8 @@ pub struct FileConfig {
     pub allow_plain: Option<bool>,
     /// Cluster membership.
     pub cluster: Option<ClusterSection>,
+    /// Server TLS (needs a `tls` or `fips` build).
+    pub tls: Option<TlsSection>,
     /// Broker resource limits.
     pub limits: Option<LimitsSection>,
     /// Users.
@@ -135,6 +145,30 @@ pub struct ClusterSection {
     pub seeds: Vec<String>,
     /// Replica count for new quorum queues (default 3).
     pub replicas: Option<u8>,
+    /// Mutual TLS on the fabric with the `[tls]` certificate and its
+    /// `client_ca_file` as the cluster CA.
+    #[serde(default)]
+    pub tls: bool,
+}
+
+/// `[tls]`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct TlsSection {
+    /// The `amqps` listener (e.g. `0.0.0.0:5671`).
+    pub listen: Option<String>,
+    /// PEM certificate chain.
+    pub cert_file: PathBuf,
+    /// PEM private key.
+    pub key_file: PathBuf,
+    /// PEM CA bundle: clients must present a certificate from it (mTLS).
+    pub client_ca_file: Option<PathBuf>,
+    /// Seconds between certificate-file change checks (default 10).
+    pub reload_interval_secs: Option<u64>,
+    /// Serve the management endpoint over TLS too.
+    #[serde(default)]
+    pub management: bool,
 }
 
 /// `[limits]` — overrides for the matching [`BrokerConfig`] fields.
@@ -421,6 +455,19 @@ impl FileConfig {
                 config.max_message_size = Some(v);
             }
         }
+        if let Some(t) = &self.tls {
+            let mut tls = crate::config::TlsServerConfig::new(
+                self.resolve(&t.cert_file),
+                self.resolve(&t.key_file),
+            );
+            tls.client_ca_file = t.client_ca_file.as_ref().map(|p| self.resolve(p));
+            if let Some(secs) = t.reload_interval_secs {
+                tls.reload_interval = std::time::Duration::from_secs(secs.max(1));
+            }
+            config.tls = Some(tls);
+            config.tls_listen = t.listen.clone();
+            config.management_tls = t.management;
+        }
         if let Some(c) = &self.cluster {
             let seeds: Vec<(u64, String)> = c.seeds.iter().filter_map(|s| parse_seed(s)).collect();
             if !seeds.iter().any(|(id, _)| *id == c.node_id) {
@@ -432,6 +479,19 @@ impl FileConfig {
             let mut member = ClusterMemberConfig::new(c.node_id, c.listen.clone(), seeds);
             if let Some(r) = c.replicas {
                 member.replicas = r;
+            }
+            if c.tls {
+                let tls = config
+                    .tls
+                    .clone()
+                    .ok_or("cluster.tls needs a [tls] section")?;
+                if tls.client_ca_file.is_none() {
+                    return Err(
+                        "cluster.tls needs [tls].client_ca_file (the cluster CA) for mutual auth"
+                            .to_owned(),
+                    );
+                }
+                member.tls = Some(tls);
             }
             config.cluster = Some(member);
         }
@@ -595,6 +655,14 @@ mod tests {
             listen = "0.0.0.0:7472"
             seeds = ["1=a:7472", "2=b:7472"]
             replicas = 2
+            tls = true
+            [tls]
+            listen = "0.0.0.0:5671"
+            cert_file = "tls.crt"
+            key_file = "tls.key"
+            client_ca_file = "/abs/ca.crt"
+            reload_interval_secs = 3
+            management = true
             [[users]]
             name = "orders"
             verifier_file = "orders.scram"
@@ -635,6 +703,16 @@ mod tests {
         assert_eq!(bc.management_listen.as_deref(), Some("127.0.0.1:15692"));
         let cluster = bc.cluster.as_ref().unwrap();
         assert_eq!((cluster.node_id, cluster.replicas), (2, 2));
+        let tls = bc.tls.as_ref().unwrap();
+        assert_eq!(tls.cert_file, dir.path().join("tls.crt"));
+        assert_eq!(
+            tls.client_ca_file.as_deref(),
+            Some(Path::new("/abs/ca.crt"))
+        );
+        assert_eq!(tls.reload_interval, std::time::Duration::from_secs(3));
+        assert_eq!(cluster.tls.as_ref(), Some(tls));
+        assert_eq!(bc.tls_listen.as_deref(), Some("0.0.0.0:5671"));
+        assert!(bc.management_tls);
         assert_eq!(bc.policies.len(), 1);
         assert_eq!(bc.policies[0].0, "tenant/work.");
         assert_eq!(bc.policies[0].1.overflow, OverflowBehavior::DropHead);

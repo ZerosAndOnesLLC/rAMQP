@@ -51,6 +51,10 @@ struct Args {
     data_dir: Option<std::path::PathBuf>,
     management_listen: Option<String>,
     management_token_file: Option<std::path::PathBuf>,
+    tls_listen: Option<String>,
+    tls_cert: Option<std::path::PathBuf>,
+    tls_key: Option<std::path::PathBuf>,
+    tls_client_ca: Option<std::path::PathBuf>,
     allow_anonymous: bool,
 }
 
@@ -60,13 +64,16 @@ fn usage() -> ! {
          \x20                    [--node-id <n> --cluster-listen <addr:port> --seed <id>=<addr> ...]\n\
          \x20                    [--data-dir <path>] [--management-listen <addr:port>]\n\
          \x20                    [--management-token-file <path>]\n\
+         \x20                    [--tls-listen <addr:port> --tls-cert <pem> --tls-key <pem>\n\
+         \x20                     [--tls-client-ca <pem>]]   (a `tls` or `fips` build)\n\
          \x20                    [--allow-anonymous]\n\
          \x20      ramqp-brokerd hash-password [--mechanism SCRAM-SHA-256|SCRAM-SHA-512|SCRAM-SHA-1]\n\
          \x20                    [--iterations <n>]   (password on stdin)\n\
          env: RAMQP_CONFIG, RAMQP_LISTEN, RAMQP_NODE_ID, RAMQP_CLUSTER_LISTEN,\n\
          \x20    RAMQP_SEEDS=1=a:7472,2=b:7472, RAMQP_DATA_DIR (durable queues need a build with\n\
          \x20    --features store-redb), RAMQP_MANAGEMENT_LISTEN,\n\
-         \x20    RAMQP_MANAGEMENT_TOKEN_FILE, RAMQP_ALLOW_ANONYMOUS=1"
+         \x20    RAMQP_MANAGEMENT_TOKEN_FILE, RAMQP_ALLOW_ANONYMOUS=1, RAMQP_TLS_LISTEN,\n\
+         \x20    RAMQP_TLS_CERT, RAMQP_TLS_KEY, RAMQP_TLS_CLIENT_CA"
     );
     std::process::exit(2);
 }
@@ -97,6 +104,10 @@ fn parse_args(argv: impl Iterator<Item = String>) -> Args {
         management_token_file: std::env::var("RAMQP_MANAGEMENT_TOKEN_FILE")
             .ok()
             .map(Into::into),
+        tls_listen: std::env::var("RAMQP_TLS_LISTEN").ok(),
+        tls_cert: std::env::var("RAMQP_TLS_CERT").ok().map(Into::into),
+        tls_key: std::env::var("RAMQP_TLS_KEY").ok().map(Into::into),
+        tls_client_ca: std::env::var("RAMQP_TLS_CLIENT_CA").ok().map(Into::into),
         allow_anonymous: env_flag("RAMQP_ALLOW_ANONYMOUS"),
     };
     let mut argv = argv;
@@ -115,6 +126,10 @@ fn parse_args(argv: impl Iterator<Item = String>) -> Args {
             "--management-token-file" => args.management_token_file = Some(value().into()),
             "--seed" => flag_seeds.push(parse_seed(&value()).unwrap_or_else(|| usage())),
             "--allow-anonymous" => args.allow_anonymous = true,
+            "--tls-listen" => args.tls_listen = Some(value()),
+            "--tls-cert" => args.tls_cert = Some(value().into()),
+            "--tls-key" => args.tls_key = Some(value().into()),
+            "--tls-client-ca" => args.tls_client_ca = Some(value().into()),
             "--help" | "-h" => usage(),
             other => {
                 eprintln!("unknown argument: {other}");
@@ -186,6 +201,12 @@ async fn main() -> std::io::Result<()> {
         )
         .init();
 
+    if cfg!(feature = "fips") {
+        if !ramqp_broker::fips_enabled() {
+            fail("this is a `fips` build but the AWS-LC FIPS module is not active");
+        }
+        tracing::info!("FIPS build: TLS and SCRAM run on the AWS-LC FIPS 140-3 module");
+    }
     let args = parse_args(argv);
     let file = match &args.config {
         Some(path) => FileConfig::load(path).unwrap_or_else(|e| fail(e)),
@@ -203,10 +224,13 @@ async fn main() -> std::io::Result<()> {
                     "--node-id {node_id} must appear in the --seed list"
                 ));
             }
-            let replicas = config.cluster.as_ref().map(|c| c.replicas);
+            // Flags override membership; replicas and fabric TLS still come
+            // from the file's [cluster] section.
+            let previous = config.cluster.take();
             let mut member = ClusterMemberConfig::new(*node_id, listen.clone(), args.seeds.clone());
-            if let Some(r) = replicas {
-                member.replicas = r;
+            if let Some(prev) = previous {
+                member.replicas = prev.replicas;
+                member.tls = prev.tls;
             }
             config.cluster = Some(member);
         }
@@ -223,6 +247,21 @@ async fn main() -> std::io::Result<()> {
     if let Some(f) = &args.management_token_file {
         config.management_token =
             Some(ramqp_broker::file_config::read_token(f).unwrap_or_else(|e| fail(e)));
+    }
+    match (&args.tls_cert, &args.tls_key) {
+        (Some(cert), Some(key)) => {
+            let mut tls = ramqp_broker::TlsServerConfig::new(cert.clone(), key.clone());
+            tls.client_ca_file = args
+                .tls_client_ca
+                .clone()
+                .or_else(|| config.tls.as_ref().and_then(|t| t.client_ca_file.clone()));
+            config.tls = Some(tls);
+        }
+        (None, None) => {}
+        _ => fail("--tls-cert and --tls-key go together"),
+    }
+    if let Some(l) = &args.tls_listen {
+        config.tls_listen = Some(l.clone());
     }
     if config.data_dir.is_some() && !cfg!(feature = "store-redb") {
         fail("a data dir is configured but this build lacks the `store-redb` feature");
@@ -251,8 +290,12 @@ async fn main() -> std::io::Result<()> {
 
     // Open by accident is not an option: a public bind with no users needs
     // an explicit opt-in.
-    let addr = bound.local_addr();
-    if user_count == 0 && !addr.ip().is_loopback() {
+    let public = std::iter::once(bound.local_addr())
+        .chain(bound.tls_local_addr())
+        .find(|a| !a.ip().is_loopback());
+    if let Some(addr) = public
+        && user_count == 0
+    {
         if !allow_anonymous {
             fail(format!(
                 "refusing to listen on non-loopback {addr} with no users configured; \

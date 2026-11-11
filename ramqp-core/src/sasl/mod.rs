@@ -6,6 +6,6 @@
 //! `ramqp-broker`, and both build on the SCRAM math here (behind the `scram`
 //! feature).
 
-#[cfg(feature = "scram")]
+#[cfg(any(feature = "scram", feature = "scram-fips"))]
 pub mod scram;
 pub mod server;

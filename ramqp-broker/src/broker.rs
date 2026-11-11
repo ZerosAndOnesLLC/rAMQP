@@ -65,6 +65,25 @@ impl Broker {
     /// also starts the node's cluster half: the fabric listener, the
     /// metadata-group member, and (on the lowest seed) cluster formation.
     pub async fn bind(self, addr: &str) -> std::io::Result<BoundBroker> {
+        let wants_tls = self.config.tls_listen.is_some()
+            || self.config.management_tls
+            || self
+                .config
+                .cluster
+                .as_ref()
+                .is_some_and(|c| c.tls.is_some());
+        if wants_tls && !cfg!(any(feature = "tls", feature = "fips")) {
+            return Err(std::io::Error::other(
+                "TLS is configured but this build has neither the `tls` nor the `fips` feature",
+            ));
+        }
+        if (self.config.tls_listen.is_some() || self.config.management_tls)
+            && self.config.tls.is_none()
+        {
+            return Err(std::io::Error::other(
+                "tls_listen / management_tls need BrokerConfig::tls (certificate and key)",
+            ));
+        }
         if let Some(cluster) = &self.config.cluster
             && self.registry.cluster().is_none()
         {
@@ -91,6 +110,7 @@ impl Broker {
                 policies: self.config.policies.clone(),
                 dlx: Some(self.dlx.clone()),
                 persist,
+                tls: cluster.tls.clone(),
             })
             .await?;
             self.registry.set_cluster(node.clone());
@@ -127,9 +147,14 @@ impl Broker {
                      Basic credentials (read-only if there are none)"
                 );
             }
+            let acceptor = if self.config.management_tls {
+                tls_mgmt_acceptor(self.config.tls.as_ref().expect("checked above"))?
+            } else {
+                mgmt::plain_acceptor()
+            };
             mgmt::spawn_mgmt(
                 mgmt_listener,
-                mgmt::plain_acceptor(),
+                acceptor,
                 Arc::downgrade(&self.registry),
                 self.counters.clone(),
                 Arc::new(mgmt::MgmtAuth {
@@ -141,6 +166,13 @@ impl Broker {
         }
         let listener = TcpListener::bind(addr).await?;
         let local_addr = listener.local_addr()?;
+        let tls = match &self.config.tls_listen {
+            Some(tls_addr) => Some(
+                TlsListener::bind(tls_addr, self.config.tls.as_ref().expect("checked above"))
+                    .await?,
+            ),
+            None => None,
+        };
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         // A `0` cap disables the limit (unbounded); otherwise a permit is held
         // for each connection's lifetime, bounding concurrent connections.
@@ -151,6 +183,7 @@ impl Broker {
         Ok(BoundBroker {
             broker: self,
             listener,
+            tls,
             local_addr,
             shutdown_tx,
             shutdown_rx,
@@ -287,12 +320,77 @@ impl Broker {
 pub struct BoundBroker {
     broker: Broker,
     listener: TcpListener,
+    /// The `amqps` listener, when `tls_listen` is configured.
+    tls: Option<TlsListener>,
     local_addr: SocketAddr,
     shutdown_tx: watch::Sender<bool>,
     shutdown_rx: watch::Receiver<bool>,
     /// Bounds concurrent connections (a permit per live connection). `None`
     /// when the cap is disabled (`max_connections == 0`).
     conn_limit: Option<Arc<Semaphore>>,
+}
+
+/// The AMQP TLS listener and its handshake acceptor.
+struct TlsListener {
+    listener: TcpListener,
+    #[cfg(any(feature = "tls", feature = "fips"))]
+    acceptor: tokio_rustls::TlsAcceptor,
+}
+
+impl std::fmt::Debug for TlsListener {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TlsListener")
+            .field("addr", &self.listener.local_addr().ok())
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(any(feature = "tls", feature = "fips"))]
+impl TlsListener {
+    async fn bind(addr: &str, tls: &crate::config::TlsServerConfig) -> std::io::Result<Self> {
+        let acceptor = crate::tls::acceptor(tls).map_err(std::io::Error::other)?;
+        let listener = TcpListener::bind(addr).await?;
+        tracing::info!(addr = %listener.local_addr()?, "AMQP TLS listener bound");
+        Ok(TlsListener { listener, acceptor })
+    }
+}
+
+#[cfg(not(any(feature = "tls", feature = "fips")))]
+impl TlsListener {
+    async fn bind(_addr: &str, _tls: &crate::config::TlsServerConfig) -> std::io::Result<Self> {
+        Err(std::io::Error::other("built without TLS"))
+    }
+}
+
+/// The management endpoint's TLS acceptor.
+#[cfg(any(feature = "tls", feature = "fips"))]
+fn tls_mgmt_acceptor(tls: &crate::config::TlsServerConfig) -> std::io::Result<mgmt::Acceptor> {
+    let acceptor = crate::tls::acceptor(tls).map_err(std::io::Error::other)?;
+    Ok(Arc::new(move |stream: TcpStream| {
+        let acceptor = acceptor.clone();
+        Box::pin(async move {
+            match acceptor.accept(stream).await {
+                Ok(s) => Some(Box::new(s) as Box<dyn mgmt::MgmtStream>),
+                Err(e) => {
+                    tracing::debug!(error = %e, "management TLS handshake failed");
+                    None
+                }
+            }
+        })
+    }))
+}
+
+#[cfg(not(any(feature = "tls", feature = "fips")))]
+fn tls_mgmt_acceptor(_tls: &crate::config::TlsServerConfig) -> std::io::Result<mgmt::Acceptor> {
+    Err(std::io::Error::other("built without TLS"))
+}
+
+/// Accept on the TLS listener, or never (no TLS listener).
+async fn accept_tls(tls: Option<&TlsListener>) -> std::io::Result<(TcpStream, SocketAddr)> {
+    match tls {
+        Some(t) => t.listener.accept().await,
+        None => std::future::pending().await,
+    }
 }
 
 /// Signals a running broker to shut down.
@@ -322,6 +420,11 @@ impl BoundBroker {
         self.local_addr
     }
 
+    /// The bound TLS listen address, when `tls_listen` is configured.
+    pub fn tls_local_addr(&self) -> Option<SocketAddr> {
+        self.tls.as_ref().and_then(|t| t.listener.local_addr().ok())
+    }
+
     /// A handle that can stop the broker from another task.
     pub fn shutdown_handle(&self) -> ShutdownHandle {
         ShutdownHandle(self.shutdown_tx.clone())
@@ -336,26 +439,12 @@ impl BoundBroker {
                 accepted = self.listener.accept() => {
                     match accepted {
                         Ok((stream, peer)) => {
-                            // Acquire a connection permit first; at the cap we
-                            // drop the socket immediately rather than spawn
-                            // unbounded per-connection state (DoS guard).
-                            let permit = match &self.conn_limit {
-                                Some(sem) => match sem.clone().try_acquire_owned() {
-                                    Ok(p) => Some(p),
-                                    Err(_) => {
-                                        tracing::warn!(
-                                            %peer,
-                                            limit = self.broker.config.max_connections,
-                                            "connection limit reached; refusing"
-                                        );
-                                        drop(stream);
-                                        continue;
-                                    }
-                                },
-                                None => None,
+                            let Some(permit) = self.admit(peer) else {
+                                drop(stream);
+                                continue;
                             };
                             let _ = stream.set_nodelay(true);
-                            self.spawn_connection(stream, peer, permit);
+                            self.spawn_connection(async move { Some(stream) }, peer, permit);
                         }
                         // A per-accept error (fd exhaustion, a connection reset
                         // before accept, etc.) is transient — log it and keep
@@ -363,6 +452,22 @@ impl BoundBroker {
                         // pause avoids a busy-spin if the condition persists.
                         Err(e) => {
                             tracing::warn!(error = %e, "accept error; continuing");
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        }
+                    }
+                }
+                accepted = accept_tls(self.tls.as_ref()) => {
+                    match accepted {
+                        Ok((stream, peer)) => {
+                            let Some(permit) = self.admit(peer) else {
+                                drop(stream);
+                                continue;
+                            };
+                            let _ = stream.set_nodelay(true);
+                            self.spawn_tls_connection(stream, peer, permit);
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "TLS accept error; continuing");
                             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                         }
                     }
@@ -382,12 +487,87 @@ impl BoundBroker {
         }
     }
 
-    fn spawn_connection(
+    /// A connection permit, or `None` at the cap (the caller drops the
+    /// socket rather than spawn unbounded per-connection state — DoS
+    /// guard). `Some(None)` when the cap is disabled.
+    #[allow(clippy::option_option)]
+    fn admit(&self, peer: SocketAddr) -> Option<Option<tokio::sync::OwnedSemaphorePermit>> {
+        match &self.conn_limit {
+            Some(sem) => match sem.clone().try_acquire_owned() {
+                Ok(p) => Some(Some(p)),
+                Err(_) => {
+                    tracing::warn!(
+                        %peer,
+                        limit = self.broker.config.max_connections,
+                        "connection limit reached; refusing"
+                    );
+                    None
+                }
+            },
+            None => Some(None),
+        }
+    }
+
+    /// Serve an `amqps` connection: the TLS handshake runs in the
+    /// connection's own task (bounded by the inbound-handshake timeout), so
+    /// a slow handshake never stalls the accept loop.
+    #[cfg(any(feature = "tls", feature = "fips"))]
+    fn spawn_tls_connection(
         &self,
         stream: TcpStream,
         peer: SocketAddr,
         permit: Option<tokio::sync::OwnedSemaphorePermit>,
     ) {
+        let acceptor = self
+            .tls
+            .as_ref()
+            .expect("TLS accept implies a TLS listener")
+            .acceptor
+            .clone();
+        let timeout = self
+            .broker
+            .config
+            .connection
+            .connect_timeout
+            .unwrap_or(std::time::Duration::from_secs(30));
+        self.spawn_connection(
+            async move {
+                match tokio::time::timeout(timeout, acceptor.accept(stream)).await {
+                    Ok(Ok(tls)) => Some(tls),
+                    Ok(Err(e)) => {
+                        tracing::debug!(%peer, error = %e, "TLS handshake failed");
+                        None
+                    }
+                    Err(_) => {
+                        tracing::debug!(%peer, "TLS handshake timed out");
+                        None
+                    }
+                }
+            },
+            peer,
+            permit,
+        );
+    }
+
+    #[cfg(not(any(feature = "tls", feature = "fips")))]
+    fn spawn_tls_connection(
+        &self,
+        _stream: TcpStream,
+        _peer: SocketAddr,
+        _permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    ) {
+        unreachable!("no TLS listener without the tls feature")
+    }
+
+    fn spawn_connection<S, F>(
+        &self,
+        stream: F,
+        peer: SocketAddr,
+        permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    ) where
+        S: IoStream + 'static,
+        F: Future<Output = Option<S>> + Send + 'static,
+    {
         let config = self.broker.config.clone();
         let auth = self.broker.auth.clone();
         let registry = self.broker.registry.clone();
@@ -400,9 +580,11 @@ impl BoundBroker {
             .connections_total
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         tokio::spawn(async move {
-            match connection::serve(stream, config, auth, registry, shutdown).await {
-                Ok(()) => tracing::debug!(%peer, "connection closed"),
-                Err(e) => tracing::debug!(%peer, error = %e, "connection failed"),
+            if let Some(stream) = stream.await {
+                match connection::serve(stream, config, auth, registry, shutdown).await {
+                    Ok(()) => tracing::debug!(%peer, "connection closed"),
+                    Err(e) => tracing::debug!(%peer, error = %e, "connection failed"),
+                }
             }
             counters
                 .connections
