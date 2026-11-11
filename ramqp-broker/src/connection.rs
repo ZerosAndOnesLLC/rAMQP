@@ -697,12 +697,18 @@ impl<S: IoStream> BrokerConnection<S> {
     async fn run(&mut self) -> Result<(), ConnectError> {
         // A shutdown receiver that is inert (pending forever) when absent.
         let mut shutdown = self.shutdown.take();
-        // An authenticated runtime user is disconnected when it is deleted.
-        let mut revoked = self
+        // An authenticated user is disconnected when it is deleted (checked
+        // now too: it may have been deleted during the handshake).
+        let users = self
             .identity
             .as_ref()
-            .and_then(|_| self.registry.runtime_users())
-            .map(|u| u.revocations());
+            .and_then(|_| self.registry.runtime_users().cloned());
+        let mut revoked = users.as_ref().map(|u| u.revocations());
+        if let (Some(u), Some(me)) = (&users, self.identity.as_deref())
+            && !u.has_user(me)
+        {
+            return Err(ConnectError::msg(ErrorKind::Sasl, "the user was deleted"));
+        }
         loop {
             let revocation = async {
                 match revoked.as_mut() {
@@ -726,8 +732,11 @@ impl<S: IoStream> BrokerConnection<S> {
                 biased;
 
                 () = revocation => {
-                    let gone = match (revoked.as_mut(), self.identity.as_deref()) {
-                        (Some(rx), Some(me)) => rx.borrow_and_update().contains(me),
+                    if let Some(rx) = revoked.as_mut() {
+                        rx.borrow_and_update();
+                    }
+                    let gone = match (&users, self.identity.as_deref()) {
+                        (Some(u), Some(me)) => !u.has_user(me),
                         _ => false,
                     };
                     if gone {
@@ -1546,6 +1555,29 @@ impl<S: IoStream> BrokerConnection<S> {
             );
             return;
         }
+        // Strict grants: reaching a durable/quorum queue through its
+        // `/queues/` alias also needs a grant on its explicit address.
+        if self.config.strict_queue_grants
+            && let Some(a) = address.as_deref()
+            && let Some(explicit) = self.registry.explicit_address_of(&self.vhost, a).await
+            && !self
+                .auth
+                .authorize(self.identity.as_deref(), &self.vhost, &explicit, operation)
+        {
+            tracing::debug!(identity = ?self.identity, address = %a, %explicit, ?operation, "attach denied (strict queue grants)");
+            let session = self.sessions.get_mut(&local).expect("bound channel");
+            session.refuse_peer_attach(
+                &attach,
+                AmqpError::new(
+                    AmqpCondition::UnauthorizedAccess,
+                    Some(format!(
+                        "not authorized to {operation:?} on {explicit} (reached through {a})"
+                    )),
+                ),
+                &mut self.transport,
+            );
+            return;
+        }
         if let Some(a) = address.as_deref()
             && a.starts_with("/exchanges/")
         {
@@ -1859,7 +1891,9 @@ impl<S: IoStream> BrokerConnection<S> {
     /// confirm — Raft commit, fsync), and rejected if any refused it. Like
     /// RabbitMQ, a rejection does not undo the copies other queues already
     /// took: a retry may duplicate there. A message routed nowhere (and
-    /// without an alternate) is accepted and dropped. If a destination cannot
+    /// without an alternate) is settled `released`, as RabbitMQ 4.x does (in
+    /// a transaction: a transactional state with outcome `released`). If a
+    /// destination cannot
     /// be resolved the message goes nowhere and is rejected; if the exchange
     /// was deleted the link is detached (`amqp:resource-deleted`).
     async fn publish_via_exchange(&mut self, channel: u16, d: ramqp_core::proto::IncomingDelivery) {
@@ -1904,6 +1938,27 @@ impl<S: IoStream> BrokerConnection<S> {
         };
 
         if let Some(ts) = d.state.as_ref().and_then(txn_state) {
+            // Routed nowhere: nothing to stage — say so (`released`), as
+            // outside a transaction.
+            if targets.is_empty() {
+                if let Some(session) = self.sessions.get_mut(&channel) {
+                    session.send_disposition(
+                        handle,
+                        d.delivery_id,
+                        None,
+                        transactional_state(
+                            ts.txn_id,
+                            Some(ramqp_core::types::messaging::Outcome::Released(
+                                Released::default(),
+                            )),
+                        ),
+                        true,
+                        &mut self.transport,
+                    );
+                }
+                self.replenish_producer_credit(channel, handle);
+                return;
+            }
             // All destinations stage, or none do.
             let staged = self.txns.stage_publishes(
                 &ts.txn_id,

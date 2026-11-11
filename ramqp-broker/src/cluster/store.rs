@@ -565,6 +565,11 @@ impl MetaStore {
         self.with_state(|s| s.catalog.clone())
     }
 
+    /// Whether the catalog has `name` (no copy of the catalog).
+    pub fn contains(&self, name: &str) -> bool {
+        self.with_state(|s| s.catalog.contains_key(name))
+    }
+
     /// A quorum queue's catalog entry and current incarnation, read together
     /// (one consistent applied state).
     pub fn queue(&self, name: &str) -> Option<(QueueSpec, u64)> {

@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 RabbitMQ 4.x parity (issue #45).
 
+**Upgrade note (access control):** `/queues/<name>` now reaches durable and
+quorum queues, and authorization matches the address as written — so an
+existing grant on `/queues/*` (or `/queues/<name>`) now also covers the
+durable and quorum queues under those names. Review `[[permissions]]` before
+upgrading, or set `strict_queue_grants = true` to keep `/queues/` grants to
+transient queues.
+
 ### Changed
 - **`/queues/<name>` reaches the queue declared under `<name>`, whatever
   its kind.** It used to always mean a transient queue, so a client
@@ -19,15 +26,25 @@ RabbitMQ 4.x parity (issue #45).
   and `PUT /queues/...` still declare exactly the kind they name.
 - **A queue name holds one kind.** Attaching `/quorum/<name>` or
   `/durable/<name>` when the name already holds another kind is refused
-  (`amqp:not-allowed`), as the admin API already did (`409`); queues of two
-  kinds left by an older version make `/queues/<name>` refuse to guess.
+  (`amqp:not-allowed`), as the admin API already did (`409`); declarations
+  of one name are serialized. A declared quorum or durable queue takes
+  precedence over an auto-declared transient one; a quorum and a durable
+  queue sharing a name (left by an older version) make `/queues/<name>`
+  refuse to guess. On-disk queues not yet attached since a restart are
+  found too (an in-memory index loaded at startup — no store read per
+  attach).
+- **Unroutable transactional publishes** report a transactional state with
+  outcome `released`.
+- **Dead letters are never dropped for want of the exact kind**: a target
+  whose name holds another kind of queue reaches that queue.
 - **Unroutable exchange publishes settle `released`** (was `accepted`), as
   RabbitMQ 4.x does. With an `alternate` queue they are still `accepted`.
 
 ### Fixed
 - **`header.delivery-count` on redelivery** (AMQP 1.0 §3.2.1, §3.4.5): a
   redelivery after `modified{delivery-failed}` carries the number of failed
-  attempts, on transient, durable and quorum queues. Consumers budgeting
+  attempts (added to any count the publisher set; `first-acquirer` is
+  cleared), on transient, durable and quorum queues. Consumers budgeting
   retries on it saw every redelivery as the first attempt. A plain
   `released` does not count.
 
@@ -35,20 +52,26 @@ RabbitMQ 4.x parity (issue #45).
 - **Per-queue policies**: `PUT /queues/...` and `[[queues]]` accept the
   policy fields (`dead_letter`, `max_delivery_attempts`, `message_ttl_ms`,
   `max_length`, `max_length_bytes`, `overflow`), overriding prefix policies
-  for that queue; a re-declare with a different policy is `409`.
+  for that queue (its `dead_letter` relative to the queue's vhost); a
+  re-declare with a different policy is `409`. `GET /queues/<vhost>/<name>`
+  shows the queue's own policy from either source.
 - **`{queue}` in a policy's `dead_letter`** expands to each queue's name
   (`/quorum/{queue}.dlq`); the companions are not dead-lettered again.
 - **Runtime users and permissions** (`GET`/`PUT`/`DELETE /users/<name>`,
   `GET`/`PUT`/`DELETE /permissions/<vhost>/<user>`), admin-only and never
   public. Passwords become SCRAM verifiers on arrival and are never stored;
-  deleting a user closes its connections; configuration users stay
-  read-only. `Broker::with_runtime_users` enables them when embedding; the
+  deleting a user closes its connections (re-checked whenever any user is
+  removed, and once after the handshake); configuration users stay
+  read-only, and runtime grants apply to runtime users only. `Broker::with_runtime_users` enables them when embedding; the
   daemon uses it whenever `[[users]]` are configured.
 - Runtime definitions (users, permissions, per-queue policies) persist in
   the store standalone and replicate through a new metadata command when
   clustered, gated on every node supporting it. Metadata snapshots keep the
-  0.11.0 encoding until one is written. Standalone, queues are declared only
-  once the persisted definitions are loaded.
+  0.11.0 encoding until one is written, and a declaration or delete without
+  a policy writes nothing (so it works mid-rolling-upgrade). Standalone,
+  queues are declared only once the persisted definitions are loaded.
+- `strict_queue_grants` (config file and `BrokerConfig`): see the upgrade
+  note above.
 
 ## [ramqp-broker 0.11.0] - 2026-11-11
 

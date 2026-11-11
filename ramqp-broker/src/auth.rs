@@ -589,6 +589,25 @@ impl StaticUsers {
         users
     }
 
+    /// Add many verifiers at once (one mechanism recomputation, not one per
+    /// insert). Same rules as [`Self::with_verifier`].
+    pub fn with_verifiers(
+        mut self,
+        verifiers: impl IntoIterator<Item = (String, ScramMechanism, ScramVerifier)>,
+    ) -> Self {
+        for (username, mechanism, verifier) in verifiers {
+            assert!(
+                username != ANONYMOUS_USER,
+                "{ANONYMOUS_USER:?} is reserved for anonymous connections"
+            );
+            let entry = self.users.entry(username).or_default();
+            entry.retain(|(m, _)| *m != mechanism);
+            entry.push((mechanism, verifier));
+        }
+        self.recompute_mechs();
+        self
+    }
+
     /// Mark `username` as a management-API administrator.
     pub fn with_admin(mut self, username: impl Into<String>) -> Self {
         self.admins.insert(username.into());

@@ -23,9 +23,15 @@ pub struct RuntimeUsers {
     mechs: RwLock<&'static [&'static str]>,
     /// Runtime users present in the last applied definitions.
     known: Mutex<HashSet<String>>,
-    /// Runtime users removed by the last change: their open connections
-    /// close (`amqp:unauthorized-access`).
-    revoked: tokio::sync::watch::Sender<Arc<HashSet<String>>>,
+    /// The user and permission entries last applied (rebuild only when
+    /// they change — a queue-policy write leaves users alone).
+    applied: Mutex<Vec<(String, Vec<u8>)>>,
+    /// Parsed verifiers by their stored text (parsing is not free).
+    parsed: Mutex<HashMap<String, (ScramMechanism, ScramVerifier)>>,
+    /// Bumped whenever a runtime user is removed: every connection then
+    /// re-checks that its user still exists (a generation, not a list of
+    /// names, so coalesced notifications lose nothing).
+    revoked: tokio::sync::watch::Sender<u64>,
 }
 
 impl RuntimeUsers {
@@ -37,7 +43,9 @@ impl RuntimeUsers {
             base,
             mechs: RwLock::new(mechs),
             known: Mutex::new(HashSet::new()),
-            revoked: tokio::sync::watch::channel(Arc::new(HashSet::new())).0,
+            applied: Mutex::new(Vec::new()),
+            parsed: Mutex::new(HashMap::new()),
+            revoked: tokio::sync::watch::channel(0).0,
         }
     }
 
@@ -56,8 +64,9 @@ impl RuntimeUsers {
         self.current().has_user(name)
     }
 
-    /// Notified with the users removed by each change.
-    pub fn revocations(&self) -> tokio::sync::watch::Receiver<Arc<HashSet<String>>> {
+    /// Changes whenever a runtime user is removed; re-check
+    /// [`Self::has_user`] then.
+    pub fn revocations(&self) -> tokio::sync::watch::Receiver<u64> {
         self.revoked.subscribe()
     }
 
@@ -69,35 +78,68 @@ impl RuntimeUsers {
     /// configuration already declares are ignored (the API refuses them;
     /// this guards definitions written before a config change).
     pub fn apply(&self, defs: &Defs) {
-        let mut users = self.base.clone();
-        let mut present = HashSet::new();
-        for (name, def) in defs.users() {
-            if self.base.has_user(name) {
-                tracing::warn!(
-                    user = name,
-                    "runtime user shadowed by a configured user; ignored"
-                );
-                continue;
+        let relevant = defs.user_and_permission_entries();
+        {
+            let mut applied = self.applied.lock().expect("applied lock");
+            if *applied == relevant {
+                return;
             }
-            let mut any = false;
-            for text in &def.verifiers {
-                match crate::auth::parse_scram_verifier(text) {
-                    Ok((mechanism, verifier)) => {
-                        users = users.with_verifier(name.to_owned(), mechanism, verifier);
+            *applied = relevant;
+        }
+        let mut present = HashSet::new();
+        let mut verifiers = Vec::new();
+        let mut admins = Vec::new();
+        {
+            let mut parsed = self.parsed.lock().expect("parsed lock");
+            for (name, def) in defs.users() {
+                if self.base.has_user(name) {
+                    tracing::warn!(
+                        user = name,
+                        "runtime user shadowed by a configured user; ignored"
+                    );
+                    continue;
+                }
+                let mut any = false;
+                for text in &def.verifiers {
+                    let parsed_one = match parsed.get(text) {
+                        Some(p) => Some(p.clone()),
+                        None => match crate::auth::parse_scram_verifier(text) {
+                            Ok(p) => {
+                                parsed.insert(text.clone(), p.clone());
+                                Some(p)
+                            }
+                            Err(e) => {
+                                tracing::warn!(user = name, error = %e, "unreadable stored verifier");
+                                None
+                            }
+                        },
+                    };
+                    if let Some((mechanism, verifier)) = parsed_one {
+                        verifiers.push((name.to_owned(), mechanism, verifier));
                         any = true;
                     }
-                    Err(e) => tracing::warn!(user = name, error = %e, "unreadable stored verifier"),
+                }
+                if any {
+                    if def.admin {
+                        admins.push(name.to_owned());
+                    }
+                    present.insert(name.to_owned());
                 }
             }
-            if !any {
+            // Forget parses of verifiers no longer stored.
+            let live: HashSet<String> = defs.users().flat_map(|(_, d)| d.verifiers).collect();
+            parsed.retain(|text, _| live.contains(text));
+        }
+        let mut users = self.base.clone().with_verifiers(verifiers);
+        for a in admins {
+            users = users.with_admin(a);
+        }
+        // Runtime grants apply to runtime users only: configuration users'
+        // access is the file's.
+        for (vhost, user, grants) in defs.permissions() {
+            if !present.contains(user) {
                 continue;
             }
-            if def.admin {
-                users = users.with_admin(name.to_owned());
-            }
-            present.insert(name.to_owned());
-        }
-        for (vhost, user, grants) in defs.permissions() {
             for g in grants {
                 users = users.with_permission(Permission::new(
                     user.to_owned(),
@@ -118,7 +160,7 @@ impl RuntimeUsers {
         };
         if !removed.is_empty() {
             tracing::info!(users = ?removed, "runtime users removed; closing their connections");
-            let _ = self.revoked.send(Arc::new(removed));
+            self.revoked.send_modify(|g| *g += 1);
         }
     }
 }
@@ -198,7 +240,7 @@ mod tests {
             .with_password("ops", "ops-pw")
             .with_admin("ops");
         let users = RuntimeUsers::new(base);
-        let mut revoked = users.revocations();
+        let revoked = users.revocations();
         let grants = vec![Grant {
             address: "/queues/jobs".into(),
             send: false,
@@ -235,7 +277,7 @@ mod tests {
         users.apply(&defs_with(vec![]));
         assert!(!users.verify(plain("reader", "reader-pw")));
         assert!(revoked.has_changed().unwrap());
-        assert!(revoked.borrow_and_update().contains("reader"));
+        assert!(!users.has_user("reader"));
         assert!(users.verify(plain("ops", "ops-pw")));
     }
 

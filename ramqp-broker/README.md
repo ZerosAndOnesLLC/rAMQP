@@ -25,10 +25,16 @@ protocol engine as the [`ramqp`](https://crates.io/crates/ramqp) client.
   its kind**, and auto-declares a transient queue only when there is none.
   `/quorum/<name>` and `/durable/<name>` name a kind explicitly (declaring
   it on first use). A name holds one kind: declaring a second kind under it
-  is refused (`amqp:not-allowed` at attach, `409` in the admin API), and
-  should two kinds exist from an older version, `/queues/<name>` refuses to
-  guess between them. Authorization matches the address
-  as written, so grant the form clients use.
+  is refused (`amqp:not-allowed` at attach, `409` in the admin API). A
+  declared quorum or durable queue takes precedence over an auto-declared
+  transient one (in a cluster, transient queues are node-local); should a
+  quorum and a durable queue share a name from an older version,
+  `/queues/<name>` refuses to guess. Authorization matches the address
+  as written, so grant the form clients use — and note that a grant on
+  `/queues/*` therefore reaches durable and quorum queues too (RabbitMQ 4.x
+  semantics). Set `strict_queue_grants = true` to keep `/queues/` grants to
+  transient queues: reaching a durable or quorum queue through `/queues/`
+  then also needs a grant on its `/durable/` or `/quorum/` address.
 - **Transient queues** — auto-declared at `/queues/<name>`:
   one lock-free actor task per queue, competing consumers with round-robin
   dispatch, credit-based flow control, accept/release/modified/reject
@@ -112,6 +118,7 @@ data_dir = "/var/lib/ramqp"           # needs --features store-redb
 management_listen = "0.0.0.0:15692"
 management_token_file = "/etc/ramqp/mgmt-token"   # bearer token for admin writes
 allow_plain = true                    # PLAIN is checked against the SCRAM verifier
+strict_queue_grants = false           # true: /queues/* grants cover transient queues only
 
 [limits]
 max_connections = 16384
@@ -237,7 +244,7 @@ inspection, and an idempotent admin API (the default vhost is `%2F`):
 | `GET /users` | users (`source`: `config` or `api`); never public |
 | `PUT /users/<name>` `{"password":"…"}` or `{"verifier":"SCRAM-SHA-256$…"}`, optional `"admin":true` | create or replace a runtime user (`201` / `204`). A password becomes SCRAM-SHA-256 and -512 verifiers on arrival and is never stored. Configuration users are read-only (`409`) |
 | `DELETE /users/<name>` | delete a runtime user and its permissions; its open connections close (`amqp:unauthorized-access`) |
-| `GET` / `PUT` / `DELETE /permissions/<vhost>/<user>` `[{"address":"/queues/jobs","operations":["receive"]}]` | a user's grants in a vhost, the same address-glob × operation form as `[[permissions]]` |
+| `GET` / `PUT` / `DELETE /permissions/<vhost>/<user>` `[{"address":"/queues/jobs","operations":["receive"]}]` | a runtime user's grants in a vhost, the same address-glob × operation form as `[[permissions]]` (configuration users get theirs from the file: `409`) |
 
 Writes always need credentials: `Authorization: Bearer <token>` from
 `management_token_file` (`--management-token-file`), or HTTP Basic for a
@@ -252,12 +259,15 @@ built-in user store (`[[users]]` in the config file, or
 `Broker::with_runtime_users` when embedding).
 
 A queue's own policy (on `[[queues]]`, or in `PUT /queues/...`) overrides
-the prefix policies for that queue. In a prefix policy, `{queue}` in
+the prefix policies for that queue; its `dead_letter` is relative to the
+queue's vhost. A dead letter whose target name already holds another kind of
+queue (a consumer attached the dead-letter queue at `/queues/<name>` first,
+say) goes to that queue rather than being dropped. In a prefix policy, `{queue}` in
 `dead_letter` expands to each queue's name, giving every queue its own
 dead-letter companion; the companions themselves are not dead-lettered by
 that policy. Redeliveries after `modified{delivery-failed}` carry the
-failure count in `header.delivery-count` (AMQP 1.0 §3.2.1), so consumers can
-budget retries.
+failure count in `header.delivery-count` (AMQP 1.0 §3.2.1; added to any count
+the publisher set), so consumers can budget retries.
 
 Secrets stay out of the file: point `verifier_file` / `password_file` at a
 mounted Kubernetes Secret. Generate a verifier with

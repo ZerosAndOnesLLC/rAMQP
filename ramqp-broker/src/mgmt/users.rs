@@ -126,7 +126,17 @@ pub(super) async fn put(registry: &Arc<QueueRegistry>, req: &Request, name: &str
         }
     };
     let key = user_key(name);
-    let existed = registry.defs().map.contains_key(&key);
+    let defs = registry.defs();
+    let existed = defs.map.contains_key(&key);
+    // A new user starts with no grants: drop any left over from an earlier
+    // user of this name (a delete racing a permissions write can leave one).
+    if !existed {
+        for perm in perm_keys_of(&defs, name) {
+            if let Err(e) = registry.def_write(&perm, None).await {
+                return Response::error(503, format!("could not clear stale permissions: {e}"));
+            }
+        }
+    }
     let value = match encode(&UserDef { verifiers, admin }) {
         Ok(v) => v,
         Err(r) => return r,
@@ -161,10 +171,14 @@ pub(super) async fn delete(registry: &Arc<QueueRegistry>, name: &str) -> Respons
             return Response::error(503, format!("could not remove the user's permissions: {e}"));
         }
     }
-    match registry.def_write(&key, None).await {
-        Ok(_) => Response::empty(204),
-        Err(e) => Response::error(503, format!("could not remove the user: {e}")),
+    if let Err(e) = registry.def_write(&key, None).await {
+        return Response::error(503, format!("could not remove the user: {e}"));
     }
+    // Grants written while the delete ran (orphans otherwise).
+    for perm in perm_keys_of(&registry.defs(), name) {
+        let _ = registry.def_write(&perm, None).await;
+    }
+    Response::empty(204)
 }
 
 pub(super) fn get_permissions(registry: &QueueRegistry, vhost: &str, user: &str) -> Response {
@@ -210,8 +224,16 @@ pub(super) async fn put_permissions(
     if !QueueRegistry::valid_vhost(vhost) || !valid_name(user) {
         return Response::error(400, "invalid vhost or user name");
     }
-    if !runtime.has_user(user) {
-        return Response::error(404, format!("no user {user:?}"));
+    if runtime.is_config_user(user) {
+        return Response::error(
+            409,
+            format!(
+                "user {user:?} is defined in the configuration file (grant in [[permissions]])"
+            ),
+        );
+    }
+    if !registry.defs().map.contains_key(&user_key(user)) {
+        return Response::error(404, format!("no runtime user {user:?}"));
     }
     // An array of grants (or one grant object).
     let body: Json = match serde_json::from_slice(&req.body) {

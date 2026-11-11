@@ -38,6 +38,16 @@ impl Defs {
             .and_then(|v| crate::serde_bin::from_slice(v).ok())
     }
 
+    /// The raw user and permission entries (what the authenticator is
+    /// built from), for change detection.
+    pub(crate) fn user_and_permission_entries(&self) -> Vec<(String, Vec<u8>)> {
+        self.map
+            .iter()
+            .filter(|(k, _)| k.starts_with(USER) || k.starts_with(PERM))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+
     /// Every runtime user (name → definition).
     pub(crate) fn users(&self) -> impl Iterator<Item = (&str, UserDef)> + '_ {
         self.prefixed(USER)
@@ -160,6 +170,27 @@ impl PolicySpec {
             },
             dead_letter: self.dead_letter.clone(),
             max_delivery_attempts: self.max_delivery_attempts,
+        }
+    }
+
+    /// From the policy type (a configuration `[[queues]]` policy, for
+    /// display).
+    pub fn from_policy(p: &QueuePolicy) -> Self {
+        PolicySpec {
+            message_ttl_ms: p
+                .message_ttl
+                .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
+            max_length: p.max_length.map(|v| v as u64),
+            max_length_bytes: p.max_length_bytes.map(|v| v as u64),
+            overflow: Some(
+                match p.overflow {
+                    OverflowBehavior::DropHead => "drop-head",
+                    _ => "reject-publish",
+                }
+                .to_owned(),
+            ),
+            dead_letter: p.dead_letter.clone(),
+            max_delivery_attempts: p.max_delivery_attempts,
         }
     }
 

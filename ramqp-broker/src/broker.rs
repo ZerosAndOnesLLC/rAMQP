@@ -324,22 +324,15 @@ impl Broker {
         // never means "whatever exists", unlike a client attach).
         let (kind, name) = QueueRegistry::parse_address(address)
             .ok_or_else(|| format!("{address:?} is not a queue address"))?;
-        if let Some(existing) = self
-            .registry
-            .declared_kinds(&QueueRegistry::qualify(vhost, name).ok_or("invalid name")?)
-            .await
-            .into_iter()
-            .find(|k| *k != kind)
-        {
-            return Err(format!(
+        match self.registry.declare_in(vhost, kind, name).await {
+            Ok(_) => Ok(()),
+            Err(crate::registry::ResolveError::OtherKind(existing)) => Err(format!(
                 "{address:?}: a {existing:?} queue already uses that name in vhost {vhost:?}"
-            ));
+            )),
+            Err(e) => Err(format!(
+                "could not declare {address:?} in vhost {vhost:?}: {e:?}"
+            )),
         }
-        self.registry
-            .declare_in(vhost, kind, name)
-            .await
-            .map(|_| ())
-            .ok_or_else(|| format!("could not declare {address:?} in vhost {vhost:?}"))
     }
 
     /// Declare an exchange in `vhost`. Idempotent: redeclaring with the

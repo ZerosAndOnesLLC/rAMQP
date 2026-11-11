@@ -8,32 +8,34 @@ use bytes::{Bytes, BytesMut};
 use ramqp_core::codec::{Decode, Descriptor, Encode, descriptors, peek_descriptor};
 use ramqp_core::types::messaging::Header;
 
-/// `body` (an encoded bare message) with its header's `delivery-count` set
-/// to `failures`. Only the header section is rewritten — every other
-/// section is passed through byte for byte — and a message without a header
-/// gets one (default fields). `failures == 0` returns `body` unchanged, so
-/// a first delivery costs nothing. An unparseable header is left alone.
+/// `body` (an encoded bare message, as stored — never rewritten) with its
+/// header's `delivery-count` raised by `failures` (keeping the count the
+/// publisher sent) and `first-acquirer` cleared. Only the header section is
+/// rewritten — every other section passes through byte for byte — and a
+/// message without a header gets one. `failures == 0` returns `body`
+/// unchanged, so a first delivery costs nothing. Bytes that do not start
+/// with a described section, or an unparseable header, are left alone.
 pub(crate) fn with_delivery_count(body: &Bytes, failures: u32) -> Bytes {
     if failures == 0 {
         return body.clone();
     }
-    let has_header = matches!(
-        peek_descriptor(body),
-        Ok(Descriptor::Code(descriptors::HEADER))
-    );
-    let (mut header, rest) = if has_header {
-        let mut cursor = body.clone();
-        match Header::decode(&mut cursor) {
-            Ok(h) => (h, cursor),
-            Err(_) => return body.clone(),
+    let (mut header, rest) = match peek_descriptor(body) {
+        Ok(Descriptor::Code(descriptors::HEADER)) => {
+            let mut cursor = body.clone();
+            match Header::decode(&mut cursor) {
+                Ok(h) => (h, cursor),
+                Err(_) => return body.clone(),
+            }
         }
-    } else {
-        (Header::default(), body.clone())
+        // Another section first: the message has no header yet.
+        Ok(_) => (Header::default(), body.clone()),
+        // Not a described section at all: not a message we can annotate.
+        Err(_) => return body.clone(),
     };
-    if header.delivery_count == failures {
-        return body.clone();
-    }
-    header.delivery_count = failures;
+    // The count the publisher sent (the stored copy keeps it) plus the
+    // failures here; a redelivered message was acquired before.
+    header.delivery_count = header.delivery_count.saturating_add(failures);
+    header.first_acquirer = false;
     let mut out = BytesMut::with_capacity(body.len() + 16);
     header.encode(&mut out);
     out.extend_from_slice(&rest);
@@ -51,6 +53,25 @@ mod tests {
         let mut b = BytesMut::new();
         m.encode(&mut b);
         b.freeze()
+    }
+
+    #[test]
+    fn keeps_the_publishers_count_and_clears_first_acquirer() {
+        let mut m = Message::text("b");
+        m.header = Some(Header {
+            delivery_count: 3,
+            first_acquirer: true,
+            ..Header::default()
+        });
+        let raw = encode(&m);
+        let h = Message::decode(&mut with_delivery_count(&raw, 2))
+            .unwrap()
+            .header
+            .unwrap();
+        assert_eq!((h.delivery_count, h.first_acquirer), (5, false));
+        // Not a message: left alone.
+        let junk = Bytes::from_static(b"\x45not-amqp");
+        assert_eq!(with_delivery_count(&junk, 1), junk);
     }
 
     #[test]
@@ -93,7 +114,7 @@ mod tests {
             (h.durable, h.priority, h.ttl, h.delivery_count),
             (true, 7, Some(5_000), 3)
         );
-        // Idempotent: rewriting to the same count is a no-op.
-        assert_eq!(with_delivery_count(&out, 3), out);
+        // The stored (original) message is what gets rewritten each time.
+        assert_eq!(with_delivery_count(&raw, 3), out);
     }
 }

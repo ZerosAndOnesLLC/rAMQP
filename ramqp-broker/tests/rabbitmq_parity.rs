@@ -534,3 +534,307 @@ async fn runtime_users_need_the_user_store() {
     );
     r.shutdown.shutdown();
 }
+
+// ------------------------------------------------- review follow-ups (#46)
+
+/// `/users` and `/permissions` are never public — whatever form of the
+/// path routes to them (doubled slashes, percent-encoding).
+#[tokio::test]
+async fn user_endpoints_need_credentials_in_every_path_form() {
+    let r = start(
+        BrokerConfig::default(),
+        Some(StaticUsers::new().with_password("ops", "ops-pw")),
+    )
+    .await;
+    for path in [
+        "/users",
+        "//users",
+        "/%75sers",
+        "/users/",
+        "//permissions/%2F/ops",
+        "/%70ermissions/%2F/ops",
+    ] {
+        let (s, body) = http_auth(&r.mgmt, "GET", path, "", None).await;
+        assert_eq!(s, 401, "{path}: {body}");
+    }
+    r.shutdown.shutdown();
+}
+
+/// Standalone quorum queue on disk, not attached since a restart:
+/// `/queues/<name>` reaches it (never a new transient queue shadowing it).
+#[cfg(feature = "store-redb")]
+#[tokio::test]
+async fn queues_address_finds_an_on_disk_quorum_queue_after_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = BrokerConfig::default();
+    config.data_dir = Some(dir.path().to_path_buf());
+    let r = start(config.clone(), None).await;
+    let (s, body) = http(&r.mgmt, "PUT", "/queues/%2F/orders", r#"{"kind":"quorum"}"#).await;
+    assert_eq!(s, 201, "{body}");
+    let conn = ConnectionBuilder::new(format!("amqp://{}", r.addr))
+        .connect()
+        .await
+        .unwrap();
+    let s = conn.begin_session().await.unwrap();
+    s.create_producer("/queues/orders")
+        .await
+        .unwrap()
+        .send(Message::text("kept"))
+        .await
+        .unwrap();
+    conn.close().await.unwrap();
+    r.shutdown.shutdown();
+    drop(r);
+
+    let r = start(config, None).await;
+    let conn = ConnectionBuilder::new(format!("amqp://{}", r.addr))
+        .connect()
+        .await
+        .unwrap();
+    let s = conn.begin_session().await.unwrap();
+    let mut c = s.create_consumer("/queues/orders").await.unwrap();
+    assert_eq!(
+        text(&recv(&mut c).await.expect("persisted message")),
+        "kept"
+    );
+    let (_, body) = http(&r.mgmt, "GET", "/queues", "").await;
+    assert!(
+        !body.contains("\"kind\":\"transient\""),
+        "no shadow: {body}"
+    );
+    conn.close().await.unwrap();
+    r.shutdown.shutdown();
+}
+
+/// A dead letter reaches the dead-letter queue even when the name was first
+/// declared (by a consumer at `/queues/<name>`) as another kind than the
+/// policy's target names.
+#[tokio::test]
+async fn dead_letters_reach_a_dlq_declared_as_another_kind() {
+    let r = start(BrokerConfig::default(), None).await;
+    let decl = r#"{"kind":"quorum","dead_letter":"/quorum/jobs.dlq","max_delivery_attempts":1}"#;
+    assert_eq!(http(&r.mgmt, "PUT", "/queues/%2F/jobs", decl).await.0, 201);
+    let conn = ConnectionBuilder::new(format!("amqp://{}", r.addr))
+        .connect()
+        .await
+        .unwrap();
+    let s = conn.begin_session().await.unwrap();
+    // The DLQ consumer is there first, at the RabbitMQ address: transient.
+    let mut dlq = s.create_consumer("/queues/jobs.dlq").await.unwrap();
+    s.create_producer("/queues/jobs")
+        .await
+        .unwrap()
+        .send(Message::text("doomed"))
+        .await
+        .unwrap();
+    let mut c = s.create_consumer("/queues/jobs").await.unwrap();
+    let d = recv(&mut c).await.expect("delivery");
+    c.modify(&d, delivery_failed()).await.unwrap();
+    assert_eq!(
+        text(&recv(&mut dlq).await.expect("dead letter arrives")),
+        "doomed"
+    );
+    conn.close().await.unwrap();
+    r.shutdown.shutdown();
+}
+
+/// Concurrent first attaches of two kinds under one name never leave the
+/// name with both kinds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_declarations_keep_one_kind_per_name() {
+    let r = start(BrokerConfig::default(), None).await;
+    let addr = r.addr;
+    let mut tasks = Vec::new();
+    for i in 0..30 {
+        for kind in ["queues", "quorum"] {
+            tasks.push(tokio::spawn(async move {
+                let conn = ConnectionBuilder::new(format!("amqp://{addr}"))
+                    .connect()
+                    .await
+                    .unwrap();
+                let s = conn.begin_session().await.unwrap();
+                let p = s
+                    .create_producer(&format!("/{kind}/race{i}"))
+                    .await
+                    .unwrap();
+                let _ = p.send(Message::text("x")).await;
+                conn.close().await.ok();
+            }));
+        }
+    }
+    for t in tasks {
+        t.await.unwrap();
+    }
+    let conn = ConnectionBuilder::new(format!("amqp://{addr}"))
+        .connect()
+        .await
+        .unwrap();
+    let s = conn.begin_session().await.unwrap();
+    for i in 0..30 {
+        let p = s
+            .create_producer(&format!("/queues/race{i}"))
+            .await
+            .unwrap();
+        assert!(
+            p.send(Message::text("after")).await.is_ok(),
+            "race{i} still reachable at /queues/"
+        );
+    }
+    // The decisive check: no name is held by two queues.
+    let (_, body) = http(&r.mgmt, "GET", "/queues", "").await;
+    let listed: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let mut seen = std::collections::HashMap::new();
+    for q in listed.as_array().unwrap() {
+        *seen
+            .entry(q["name"].as_str().unwrap().to_owned())
+            .or_insert(0) += 1;
+    }
+    let doubled: Vec<_> = seen.iter().filter(|(_, n)| **n > 1).collect();
+    assert!(doubled.is_empty(), "names held by two kinds: {doubled:?}");
+    assert_eq!(seen.len(), 30);
+    conn.close().await.unwrap();
+    r.shutdown.shutdown();
+}
+
+/// A transactional publish that reaches no queue says so: a transactional
+/// state whose outcome is `released`.
+#[tokio::test]
+async fn transactional_unroutable_publish_is_released() {
+    use ramqp::types::messaging::Outcome;
+    let r = start(BrokerConfig::default(), None).await;
+    r.broker
+        .declare_exchange("", "tx", ExchangeKind::Direct, None)
+        .await
+        .unwrap();
+    let conn = ConnectionBuilder::new(format!("amqp://{}", r.addr))
+        .connect()
+        .await
+        .unwrap();
+    let s = conn.begin_session().await.unwrap();
+    let ctl = s.create_transaction_controller().await.unwrap();
+    let txn = ctl.declare().await.unwrap();
+    let p = s.create_producer("/exchanges/tx/nobody").await.unwrap();
+    let state = p
+        .send_with_state(
+            Message::text("x"),
+            ramqp::txn::transactional_state(txn.clone(), None),
+        )
+        .await
+        .unwrap();
+    let ts = ramqp_core::txn::txn_state(&state).expect("transactional state");
+    assert!(matches!(ts.outcome, Some(Outcome::Released(_))), "{ts:?}");
+    ctl.commit(txn).await.unwrap();
+    conn.close().await.unwrap();
+    r.shutdown.shutdown();
+}
+
+/// `strict_queue_grants`: a `/queues/*` grant does not reach a quorum queue
+/// through its `/queues/` alias; an explicit grant does.
+#[tokio::test]
+async fn strict_queue_grants_keep_queues_grants_to_transient() {
+    use ramqp_broker::auth::Permission;
+    let mut config = BrokerConfig::default();
+    config.strict_queue_grants = true;
+    let users = StaticUsers::new()
+        .with_password("ops", "ops-pw")
+        .with_admin("ops")
+        .with_password("app", "app-pw")
+        .with_permission(Permission::new("app", "*", "/queues/*", true, true));
+    let r = start(config, Some(users)).await;
+    assert_eq!(
+        http(
+            &r.mgmt,
+            "PUT",
+            "/queues/%2F/payments",
+            r#"{"kind":"quorum"}"#
+        )
+        .await
+        .0,
+        201
+    );
+    let conn = ConnectionBuilder::new(format!("amqp://app:app-pw@{}", r.addr))
+        .connect()
+        .await
+        .unwrap();
+    let s = conn.begin_session().await.unwrap();
+    let p = s.create_producer("/queues/payments").await.unwrap();
+    assert!(
+        p.send(Message::text("x")).await.is_err(),
+        "quorum needs its own grant"
+    );
+    let p = s.create_producer("/queues/scratch").await.unwrap();
+    assert!(
+        p.send(Message::text("y")).await.is_ok(),
+        "transient is covered"
+    );
+    conn.close().await.unwrap();
+    r.shutdown.shutdown();
+}
+
+/// Deleting two runtime users back to back closes both users' connections;
+/// grants cannot be given to configuration users; a non-admin runtime user
+/// cannot administer.
+#[tokio::test]
+async fn runtime_user_deletions_and_limits() {
+    let base = StaticUsers::new()
+        .with_password("ops", "ops-pw")
+        .with_admin("ops");
+    let r = start(BrokerConfig::default(), Some(base)).await;
+    for u in ["a", "b"] {
+        let body = format!(r#"{{"password":"{u}-pw"}}"#);
+        assert_eq!(
+            http(&r.mgmt, "PUT", &format!("/users/{u}"), &body).await.0,
+            201
+        );
+        let grant = r#"[{"address":"/queues/*","operations":["send","receive"]}]"#;
+        assert_eq!(
+            http(&r.mgmt, "PUT", &format!("/permissions/%2F/{u}"), grant)
+                .await
+                .0,
+            201
+        );
+    }
+    let grant = r#"[{"address":"/queues/*","operations":["send"]}]"#;
+    assert_eq!(
+        http(&r.mgmt, "PUT", "/permissions/%2F/ops", grant).await.0,
+        409
+    );
+    use base64::Engine;
+    let basic = base64::engine::general_purpose::STANDARD.encode("a:a-pw");
+    let (s, _) = http_auth(
+        &r.mgmt,
+        "PUT",
+        "/queues/%2F/q",
+        r#"{"kind":"transient"}"#,
+        Some(&format!("Basic {basic}")),
+    )
+    .await;
+    assert_eq!(s, 401, "a non-admin runtime user cannot administer");
+
+    let mut consumers = Vec::new();
+    let mut conns = Vec::new();
+    for u in ["a", "b"] {
+        let conn = ConnectionBuilder::new(format!("amqp://{u}:{u}-pw@{}", r.addr))
+            .connect()
+            .await
+            .unwrap();
+        let s = conn.begin_session().await.unwrap();
+        consumers.push(
+            s.create_consumer(&format!("/queues/{u}-inbox"))
+                .await
+                .unwrap(),
+        );
+        conns.push(conn);
+    }
+    // Back to back: neither deletion may be missed.
+    assert_eq!(http(&r.mgmt, "DELETE", "/users/a", "").await.0, 204);
+    assert_eq!(http(&r.mgmt, "DELETE", "/users/b", "").await.0, 204);
+    for c in &mut consumers {
+        let closed = tokio::time::timeout(Duration::from_secs(5), c.recv()).await;
+        assert!(
+            matches!(closed, Ok(Err(_))),
+            "connection closed: {closed:?}"
+        );
+    }
+    r.shutdown.shutdown();
+}

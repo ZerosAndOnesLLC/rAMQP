@@ -992,10 +992,20 @@ impl ClusterNode {
             return Err(format!("unexpected definitions response: {response:?}"));
         };
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        while self.meta_store.defs_epoch() < epoch && tokio::time::Instant::now() < deadline {
+        while self.meta_store.defs_epoch() < epoch {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "committed, but not applied on this node within 5s (epoch {epoch}); retry"
+                ));
+            }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         Ok(changed)
+    }
+
+    /// The applied runtime-definitions epoch.
+    pub(crate) fn defs_epoch(&self) -> u64 {
+        self.meta_store.defs_epoch()
     }
 
     /// The applied runtime definitions and their epoch.
@@ -1015,7 +1025,7 @@ impl ClusterNode {
 
     /// Whether the replicated catalog has this queue.
     pub(crate) fn has_queue(&self, name: &str) -> bool {
-        self.meta_store.catalog().contains_key(name)
+        self.meta_store.contains(name)
     }
 
     /// This node's applied exchange definitions and their epoch.

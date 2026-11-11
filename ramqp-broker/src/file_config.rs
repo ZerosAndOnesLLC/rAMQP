@@ -105,6 +105,9 @@ pub struct FileConfig {
     pub allow_anonymous: Option<bool>,
     /// Offer PLAIN (checked against the stored SCRAM verifier). Default on.
     pub allow_plain: Option<bool>,
+    /// `/queues/...` grants cover only transient queues (see
+    /// `BrokerConfig::strict_queue_grants`). Default off.
+    pub strict_queue_grants: Option<bool>,
     /// Cluster membership.
     pub cluster: Option<ClusterSection>,
     /// Server TLS (needs a `tls` or `fips` build).
@@ -482,6 +485,9 @@ impl FileConfig {
         }
         if let Some(f) = &self.management_token_file {
             config.management_token = Some(read_token(&self.resolve(f))?);
+        }
+        if let Some(s) = self.strict_queue_grants {
+            config.strict_queue_grants = s;
         }
         if let Some(r) = self.management_auth_reads {
             config.management_auth_reads = r;

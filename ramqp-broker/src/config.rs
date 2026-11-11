@@ -107,6 +107,12 @@ pub struct BrokerConfig {
     /// (e.g. `/quorum/{queue}.dlq`); the queues it names are not themselves
     /// dead-lettered by that policy.
     pub policies: Vec<(String, QueuePolicy)>,
+    /// Grants on `/queues/...` cover only transient queues: a
+    /// `/queues/<name>` attach that reaches a durable or quorum queue also
+    /// needs a grant on `/durable/<name>` or `/quorum/<name>`. Off by
+    /// default (RabbitMQ 4.x semantics: a queue address grants access
+    /// whatever the queue's type).
+    pub strict_queue_grants: bool,
     /// Per-queue policies: `(namespace-qualified queue name, policy)`.
     /// Override [`Self::policies`] (and any policy set through the
     /// management API) for exactly that queue.
@@ -303,6 +309,7 @@ impl Default for BrokerConfig {
             tls: None,
             policies: Vec::new(),
             queue_policies: Vec::new(),
+            strict_queue_grants: false,
         }
     }
 }
