@@ -127,7 +127,10 @@ async fn per_address_authorization_gates_attaches() {
     // Refused at the attach itself, with the broker's reason.
     let denied = session.create_consumer("/queues/secret-audit").await.err();
     let denied = denied.expect("bob must not consume secrets");
-    assert!(denied.to_string().contains("amqp:"), "{denied}");
+    assert!(
+        denied.to_string().contains("amqp:unauthorized-access"),
+        "{denied}"
+    );
     // The session survives: other addresses still work.
     let mut ok = session.create_consumer("/queues/open").await.expect("open");
     producer_send(&session, "/queues/open", "fine").await;
@@ -189,7 +192,10 @@ async fn reattach_of_a_denied_link_name_stays_denied() {
         // Refused at the attach itself, with the broker's reason.
         let denied = session.create_consumer("/queues/secret-box").await.err();
         let denied = denied.expect("denied consumer must not receive");
-        assert!(denied.to_string().contains("amqp:"), "{denied}");
+        assert!(
+            denied.to_string().contains("amqp:unauthorized-access"),
+            "{denied}"
+        );
     }
     conn.close().await.expect("close");
     shutdown.shutdown();
@@ -228,7 +234,10 @@ async fn vhost_grants_confine_authenticated_users() {
     // Refused at the attach itself, with the broker's reason.
     let refusal = sess.create_consumer("/queues/mine").await.err();
     let refusal = refusal.expect("foreign-vhost attach must be refused");
-    assert!(refusal.to_string().contains("amqp:"), "{refusal}");
+    assert!(
+        refusal.to_string().contains("amqp:unauthorized-access"),
+        "{refusal}"
+    );
     conn.close().await.expect("close");
     shutdown.shutdown();
 }
@@ -262,7 +271,7 @@ async fn cross_tenant_addressing_is_refused() {
     // Refused at the attach itself, with the broker's reason.
     let denied = sess.create_consumer("/queues/tenant-a/secret").await.err();
     let denied = denied.expect("cross-tenant consumer must be refused");
-    assert!(denied.to_string().contains("amqp:"), "{denied}");
+    assert!(denied.to_string().contains("amqp:not-found"), "{denied}");
 
     // A vhost containing '/' is refused at the open.
     assert!(
@@ -372,7 +381,10 @@ async fn config_file_users_and_permissions() {
     // Refused at the attach itself, with the broker's reason.
     let refusal = sess.create_consumer("/queues/billing").await.err();
     let refusal = refusal.expect("ungranted address must be refused");
-    assert!(refusal.to_string().contains("amqp:"), "{refusal}");
+    assert!(
+        refusal.to_string().contains("amqp:unauthorized-access"),
+        "{refusal}"
+    );
     conn.close().await.expect("close");
 
     // PLAIN with the same password works (verified against the verifier).

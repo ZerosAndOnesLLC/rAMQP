@@ -23,7 +23,13 @@ struct Running {
 
 /// A broker with a management endpoint (bearer [`TOKEN`]); `users` turns on
 /// the runtime user store over those configured users.
-async fn start(mut config: BrokerConfig, users: Option<StaticUsers>) -> Running {
+async fn start(config: BrokerConfig, users: Option<StaticUsers>) -> Running {
+    start_on(config, users, "127.0.0.1:0").await
+}
+
+/// [`start`] on a given AMQP listen address (a restart on the same port, for
+/// a reconnecting client).
+async fn start_on(mut config: BrokerConfig, users: Option<StaticUsers>, listen: &str) -> Running {
     for _ in 0..50 {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let mgmt = l.local_addr().unwrap();
@@ -35,7 +41,7 @@ async fn start(mut config: BrokerConfig, users: Option<StaticUsers>) -> Running 
             broker = broker.with_runtime_users(u);
         }
         // A previous instance's store lock frees asynchronously.
-        let Ok(bound) = broker.clone().bind("127.0.0.1:0").await else {
+        let Ok(bound) = broker.clone().bind(listen).await else {
             tokio::time::sleep(Duration::from_millis(100)).await;
             continue;
         };
@@ -669,9 +675,13 @@ async fn concurrent_declarations_keep_one_kind_per_name() {
                     .await
                     .unwrap();
                 let s = conn.begin_session().await.unwrap();
-                // The loser of a race is refused at attach; either is fine.
-                if let Ok(p) = s.create_producer(&format!("/{kind}/race{i}")).await {
-                    let _ = p.send(Message::text("x")).await;
+                // The loser of a race is refused at attach, for the
+                // name's other kind (and only for that).
+                match s.create_producer(&format!("/{kind}/race{i}")).await {
+                    Ok(p) => {
+                        let _ = p.send(Message::text("x")).await;
+                    }
+                    Err(e) => assert!(e.to_string().contains("amqp:not-allowed"), "{e}"),
                 }
                 conn.close().await.ok();
             }));
@@ -970,12 +980,13 @@ async fn rejected_messages_are_dead_lettered_on_every_queue_kind() {
     r.shutdown.shutdown();
 }
 
-/// A rejected message on a durable queue reaches its dead-letter queue
-/// across a restart of the broker (the source copy is removed only once the
-/// dead letter is stored).
+/// A rejected message on a durable queue is dead-lettered, and after a clean
+/// restart the dead letter is still there and the source copy is gone. (The
+/// crash window between storing the dead letter and removing the source is
+/// not exercised: a crash there redelivers the source copy.)
 #[cfg(feature = "store-redb")]
 #[tokio::test]
-async fn durable_rejected_dead_letter_survives_restart() {
+async fn durable_rejected_dead_letter_persists_across_restart() {
     let dir = tempfile::tempdir().unwrap();
     let mut config = BrokerConfig::default();
     config.data_dir = Some(dir.path().to_path_buf());
@@ -1036,6 +1047,203 @@ async fn durable_rejected_dead_letter_survives_restart() {
     let mut c = s.create_consumer("/queues/jobs").await.unwrap();
     let again = tokio::time::timeout(Duration::from_millis(300), c.recv()).await;
     assert!(again.is_err(), "the source copy is gone: {again:?}");
+    conn.close().await.unwrap();
+    r.shutdown.shutdown();
+}
+
+/// A reconnecting client whose grant on one queue was revoked while it was
+/// away: after the reconnect that link ends with the broker's reason, for a
+/// consumer (`recv`) and a producer (`send`) alike, and every other link is
+/// restored.
+#[cfg(feature = "store-redb")]
+#[tokio::test]
+async fn reconnect_ends_only_the_refused_link() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = BrokerConfig::default();
+    config.data_dir = Some(dir.path().to_path_buf());
+    let r = start(config.clone(), Some(base_users())).await;
+    let listen = r.addr.to_string();
+    assert_eq!(
+        http(&r.mgmt, "PUT", "/users/app", r#"{"password":"app-pw"}"#)
+            .await
+            .0,
+        201
+    );
+    let both = r#"[{"address":"/queues/kept","operations":["send","receive"]},
+                   {"address":"/queues/lost","operations":["send","receive"]}]"#;
+    assert_eq!(
+        http(&r.mgmt, "PUT", "/permissions/%2F/app", both).await.0,
+        201
+    );
+
+    let conn = ConnectionBuilder::new(format!("amqp://app:app-pw@{listen}"))
+        .reconnecting(true)
+        .connect()
+        .await
+        .unwrap();
+    let s = conn.begin_session().await.unwrap();
+    let kept_p = s.create_producer("/queues/kept").await.unwrap();
+    let mut kept_c = s.create_consumer("/queues/kept").await.unwrap();
+    let lost_p = s.create_producer("/queues/lost").await.unwrap();
+    let mut lost_c = s.create_consumer("/queues/lost").await.unwrap();
+
+    // Revoke `lost`, then restart the broker under the client.
+    let kept = r#"[{"address":"/queues/kept","operations":["send","receive"]}]"#;
+    assert_eq!(
+        http(&r.mgmt, "PUT", "/permissions/%2F/app", kept).await.0,
+        204
+    );
+    r.shutdown.shutdown();
+    drop(r);
+    let r = start_on(config, Some(base_users()), &listen).await;
+
+    // The kept links are restored (a send waits out the reconnect).
+    let sent = tokio::time::timeout(Duration::from_secs(20), kept_p.send(Message::text("back")))
+        .await
+        .expect("send within the reconnect")
+        .expect("kept producer restored");
+    assert!(matches!(sent, DeliveryState::Accepted(_)), "{sent:?}");
+    assert_eq!(
+        text(&recv(&mut kept_c).await.expect("kept consumer restored")),
+        "back"
+    );
+
+    // The refused ones end with the broker's reason.
+    let lost = tokio::time::timeout(Duration::from_secs(5), lost_c.recv())
+        .await
+        .expect("the refusal reaches the consumer");
+    let lost = lost.expect_err("refused consumer");
+    assert!(
+        lost.to_string().contains("amqp:unauthorized-access"),
+        "{lost}"
+    );
+    let lost = lost_p
+        .send(Message::text("no"))
+        .await
+        .expect_err("refused producer");
+    assert_eq!(lost.kind(), ramqp::error::ErrorKind::Refused, "{lost}");
+    assert!(
+        lost.to_string().contains("amqp:unauthorized-access"),
+        "{lost}"
+    );
+    conn.close().await.ok();
+    r.shutdown.shutdown();
+}
+
+/// A reconnecting client whose link is refused for a reason that clears (an
+/// exchange not declared yet on the restarted broker) keeps retrying the
+/// re-attach, and the link works once it's there.
+#[tokio::test]
+async fn reconnect_retries_a_link_refused_for_a_reason_that_clears() {
+    let declare = r#"{"type":"topic"}"#;
+    let r = start(BrokerConfig::default(), None).await;
+    let listen = r.addr.to_string();
+    assert_eq!(
+        http(&r.mgmt, "PUT", "/exchanges/%2F/ev", declare).await.0,
+        201
+    );
+    let conn = ConnectionBuilder::new(format!("amqp://{listen}"))
+        .reconnecting(true)
+        .connect()
+        .await
+        .unwrap();
+    let s = conn.begin_session().await.unwrap();
+    let p = s.create_producer("/exchanges/ev/k").await.unwrap();
+    r.shutdown.shutdown();
+    drop(r);
+
+    // The restarted broker has no `ev` yet: the re-attach is refused
+    // (`not-found`) until it's declared a moment later.
+    let r = start_on(BrokerConfig::default(), None, &listen).await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(
+        http(&r.mgmt, "PUT", "/exchanges/%2F/ev", declare).await.0,
+        201
+    );
+    let sent = tokio::time::timeout(Duration::from_secs(20), p.send(Message::text("x")))
+        .await
+        .expect("send within the retry budget")
+        .expect("the link was restored");
+    // No binding: unroutable, which an exchange settles `released`.
+    assert!(matches!(sent, DeliveryState::Released(_)), "{sent:?}");
+    conn.close().await.ok();
+    r.shutdown.shutdown();
+}
+
+/// Inside a transaction, a `rejected` (and a bare `modified{undeliverable-here}`)
+/// is staged: a rollback requeues the message, a commit dead-letters it.
+#[tokio::test]
+async fn transactional_reject_dead_letters_on_commit_only() {
+    use ramqp::types::messaging::{Outcome, Rejected};
+
+    let r = start(BrokerConfig::default(), None).await;
+    for (name, body) in [
+        ("tx.dlq", r#"{"kind":"transient"}"#),
+        (
+            "tx",
+            r#"{"kind":"transient","dead_letter":"/queues/tx.dlq"}"#,
+        ),
+    ] {
+        let (st, b) = http(&r.mgmt, "PUT", &format!("/queues/%2F/{name}"), body).await;
+        assert_eq!(st, 201, "{name}: {b}");
+    }
+    let conn = ConnectionBuilder::new(format!("amqp://{}", r.addr))
+        .connect()
+        .await
+        .unwrap();
+    let s = conn.begin_session().await.unwrap();
+    let ctl = s.create_transaction_controller().await.unwrap();
+    let p = s.create_producer("/queues/tx").await.unwrap();
+    p.send(Message::text("rejected")).await.unwrap();
+    p.send(Message::text("undeliverable")).await.unwrap();
+    let mut c = s.create_consumer("/queues/tx").await.unwrap();
+    let mut dl = s.create_consumer("/queues/tx.dlq").await.unwrap();
+    // Only `undeliverable-here`: no `delivery-failed`.
+    let undeliverable = || {
+        Outcome::Modified(Modified {
+            undeliverable_here: Some(true),
+            ..Default::default()
+        })
+    };
+    let settle = |text: &str| {
+        if text == "rejected" {
+            Outcome::Rejected(Rejected::default())
+        } else {
+            undeliverable()
+        }
+    };
+
+    // Rolled back: both come back to the queue, nothing is dead-lettered.
+    let id = ctl.declare().await.unwrap();
+    for _ in 0..2 {
+        let d = recv(&mut c).await.expect("delivery");
+        c.settle_in_txn(&d, id.clone(), settle(&text(&d)))
+            .await
+            .unwrap();
+    }
+    ctl.rollback(id).await.unwrap();
+    let none = tokio::time::timeout(Duration::from_millis(300), dl.recv()).await;
+    assert!(none.is_err(), "nothing dead-lettered on rollback: {none:?}");
+
+    // Committed: both are dead-lettered.
+    let id = ctl.declare().await.unwrap();
+    for _ in 0..2 {
+        let d = recv(&mut c).await.expect("redelivery after rollback");
+        c.settle_in_txn(&d, id.clone(), settle(&text(&d)))
+            .await
+            .unwrap();
+    }
+    ctl.commit(id).await.unwrap();
+    let mut got = Vec::new();
+    for _ in 0..2 {
+        let d = recv(&mut dl).await.expect("dead-lettered on commit");
+        got.push(text(&d));
+        dl.accept(&d).await.unwrap();
+    }
+    got.sort();
+    assert_eq!(got, ["rejected", "undeliverable"]);
+    let again = tokio::time::timeout(Duration::from_millis(300), c.recv()).await;
+    assert!(again.is_err(), "not redelivered: {again:?}");
     conn.close().await.unwrap();
     r.shutdown.shutdown();
 }

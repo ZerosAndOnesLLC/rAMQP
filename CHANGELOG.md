@@ -16,6 +16,19 @@ durable and quorum queues under those names. Review `[[permissions]]` before
 upgrading, or set `strict_queue_grants = true` to keep `/queues/` grants to
 transient queues.
 
+**Upgrade note (`modified{undeliverable-here}`, #47):** a consumer settling
+`modified` with `undeliverable-here: true` used to requeue the message; it
+is now dead-lettered like `rejected`, or **deleted when the queue has no
+dead-letter target** (RabbitMQ 4.x semantics). Clients that send it on
+giving up on a message (Qpid JMS, for one, may do so when its redelivery
+policy is exhausted) now lose those messages unless the queue has a
+`dead_letter`. Configure one before upgrading if you relied on the requeue.
+
+**Upgrade note (client, #47):** `create_consumer`/`create_producer` now
+fail when the peer refuses the link, where they returned `Ok` before; and
+they fail with `ErrorKind::Timeout` if the attach isn't answered within
+`connect_timeout`.
+
 ### Changed
 - **`/queues/<name>` reaches the queue declared under `<name>`, whatever
   its kind.** It used to always mean a transient queue, so a client
@@ -49,22 +62,43 @@ transient queues.
   `released` does not count.
 - **A consumer's `rejected` is dead-lettered** (#47). It used to drop the
   message even when the queue's policy (its own or a prefix policy) had a
-  `dead_letter` target. It now dead-letters with reason `rejected`, and
-  drops only when there is no target, as RabbitMQ 4.x does. The same goes
-  for `modified{undeliverable-here}`, which RabbitMQ 4.x treats like
-  `rejected` (it used to requeue). On transient, durable and quorum queues;
-  a durable queue removes its copy only after the dead letter is stored,
-  so a crash re-dead-letters it rather than losing it.
+  `dead_letter` target. It now goes to that target, and is dropped only
+  when there is none, as RabbitMQ 4.x does. The same goes for
+  `modified{undeliverable-here}`, which RabbitMQ 4.x treats like `rejected`
+  (it used to requeue; see the upgrade note). On transient, durable and
+  quorum queues, transactional settlements included (applied on commit).
+  (The dead letter isn't annotated with a reason; `rejected` appears only
+  in the broker's log.)
+- **Quorum queues remove a dead-lettered message only after its copy is
+  stored** — for `rejected`, `delivery-limit`, `maxlen` and `expired`
+  alike, as durable queues already did. A crash in between leaves the
+  message in the source queue to be delivered again (and possibly
+  dead-lettered twice), never lost from both. A body that can't be read is
+  left in the log rather than removed undelivered, and a removal that fails
+  to commit is proposed again instead of leaving the message invisible.
+  As before, a dead-letter queue that refuses the copy (full) still counts
+  as resolved.
 - **Client: a refused attach fails the attach** (#47, `ramqp-core` /
   `ramqp`). When the peer refuses a link (AMQP 1.0 §2.6.3: an `attach`
   with a null source/target, then a `detach` with the reason),
   `create_consumer`/`create_producer` returned `Ok` with a link that didn't
   exist, and the refusal showed only on the first `recv`/`send`. They now
-  return a `LinkError` (kind `Detached`) carrying the peer's error, e.g.
-  `amqp:unauthorized-access`; without one, a generic "terminus refused".
-  With transparent reconnect, a link refused on re-attach is ended for its
-  handle (with that error) while the rest of the topology is restored,
-  instead of stalling the reconnect.
+  return a `LinkError` carrying the peer's error, classified by condition:
+  `ErrorKind::Refused` (new, not retryable) for `unauthorized-access`,
+  `not-allowed` and the like; `LinkRedirect` for `amqp:link:redirect`;
+  `Detached` (retryable) for anything that may clear, such as `not-found`,
+  or a refusal with no error. A null terminus counts as a refusal only when
+  our attach named one. An attach the peer answers with `end` or `close`
+  instead fails with that reason, not "driver dropped".
+- **Client: attaches are bounded by `connect_timeout`** (#47). A peer that
+  never answers an attach fails it with `ErrorKind::Timeout`; if it answers
+  later, the orphaned link is detached.
+- **Client: transparent reconnect and refused links** (#47). A link the
+  peer refuses on re-attach for a reason that may clear (a queue still
+  recovering after a broker restart) is retried with the reconnect backoff
+  for up to 30 s. A link refused for good (or past that) ends for its
+  handle while the rest of the topology is restored: a consumer's `recv`
+  and a producer's `send` both return the peer's reason.
 
 ### Added
 - **Per-queue policies**: `PUT /queues/...` and `[[queues]]` accept the

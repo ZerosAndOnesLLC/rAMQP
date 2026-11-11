@@ -175,9 +175,21 @@ impl Session {
             })
             .await
             .map_err(|_| LinkError::msg(ErrorKind::NotConnected, "connection closed"))?;
-        let attached = reply_rx
-            .await
-            .map_err(|_| LinkError::msg(ErrorKind::Cancelled, "driver dropped"))??;
+        // Bounded by `connect_timeout`: a peer that never answers the attach
+        // (or refuses it with a null terminus and never detaches) must not
+        // hang the caller. Dropping the reply marks the link abandoned, so
+        // the session closes it if the peer answers later.
+        let reply = async {
+            reply_rx
+                .await
+                .map_err(|_| LinkError::msg(ErrorKind::Cancelled, "driver dropped"))?
+        };
+        let attached = match self.config.connection.connect_timeout {
+            Some(limit) => tokio::time::timeout(limit, reply)
+                .await
+                .map_err(|_| LinkError::msg(ErrorKind::Timeout, "attach not answered in time"))??,
+            None => reply.await?,
+        };
         Ok(attached.handle)
     }
 

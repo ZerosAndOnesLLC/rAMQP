@@ -266,9 +266,9 @@ say) goes to that queue rather than being dropped. In a prefix policy, `{queue}`
 `dead_letter` expands to each queue's name, giving every queue its own
 dead-letter companion; the companions themselves are not dead-lettered by
 that policy. A consumer's `rejected` (or `modified{undeliverable-here}`)
-dead-letters through the queue's policy with reason `rejected`, and drops
-the message only when there is no `dead_letter` target (RabbitMQ 4.x
-semantics). Redeliveries after `modified{delivery-failed}` carry the
+dead-letters through the queue's policy, and drops the message only when
+there is no `dead_letter` target (RabbitMQ 4.x semantics). Durable and
+quorum queues remove the source copy only once the dead letter is stored. Redeliveries after `modified{delivery-failed}` carry the
 failure count in `header.delivery-count` (AMQP 1.0 §3.2.1; added to any count
 the publisher set), so consumers can budget retries.
 

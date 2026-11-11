@@ -87,6 +87,12 @@ pub struct Session {
     /// sides have detached, so these are neither reused nor unmapped until
     /// the peer's answering detach (which we then do not answer again).
     half_closed: std::collections::HashSet<u32>,
+    /// Links we attached naming the terminus the peer must resolve (`source`
+    /// for our receiver, `target` for our sender), awaiting the peer's
+    /// attach. Only for these does a null terminus in the answer mean a
+    /// refusal (§2.6.3): a caller attaching with that terminus null gets it
+    /// echoed back null by a peer that accepts.
+    expects_terminus: std::collections::HashSet<u32>,
     /// Index of (link name, our local role) -> local handle, so a peer `attach`
     /// response binds in O(1) instead of scanning every link. Keyed by role as
     /// well as name because AMQP 1.0 §2.6.1 identifies a link by container-id +
@@ -138,6 +144,7 @@ impl Session {
             remote_handles: RemoteHandleMap::default(),
             links: HashMap::new(),
             half_closed: std::collections::HashSet::new(),
+            expects_terminus: std::collections::HashSet::new(),
             link_handles: HashMap::new(),
             events,
             pending_begin: Some(pending_begin),
@@ -208,6 +215,7 @@ impl Session {
             remote_handles: RemoteHandleMap::default(),
             links: HashMap::new(),
             half_closed: std::collections::HashSet::new(),
+            expects_terminus: std::collections::HashSet::new(),
             link_handles: HashMap::new(),
             events,
             pending_begin: None,
@@ -235,6 +243,12 @@ impl Session {
     /// as a [`SessionEvent`] when the peer initiated it.
     pub fn on_peer_end(&mut self, error: Option<AmqpError>) {
         self.phase = SessionPhase::Ended;
+        // Attaches still awaiting an answer fail with the session's reason
+        // (a peer may refuse by ending the session instead of detaching).
+        self.fail_pending_attaches(|| match &error {
+            Some(e) => LinkError::from_remote(ErrorKind::PeerClosed, RemoteError::new(e.clone())),
+            None => LinkError::msg(ErrorKind::PeerClosed, "session ended by peer"),
+        });
         let result = match &error {
             Some(e) => Err(SessionError::from_remote(
                 ErrorKind::PeerClosed,
@@ -246,6 +260,17 @@ impl Session {
             let _ = reply.send(result);
         } else {
             let _ = self.events.send(SessionEvent::Ended { error });
+        }
+    }
+
+    /// Fail every attach still awaiting the peer's answer with `error()` —
+    /// when the session or connection goes away under it, so callers see why
+    /// instead of a dropped reply.
+    pub fn fail_pending_attaches(&mut self, error: impl Fn() -> LinkError) {
+        for link in self.links.values_mut() {
+            if let Some(reply) = link.take_pending_attach() {
+                let _ = reply.send(Err(error()));
+            }
         }
     }
 
@@ -279,6 +304,13 @@ impl Session {
             }
         };
         attach.handle = handle;
+        let names_terminus = match attach.role {
+            Role::Receiver => attach.source.is_some(),
+            Role::Sender => attach.target.is_some(),
+        };
+        if names_terminus {
+            self.expects_terminus.insert(handle);
+        }
         let name = attach.name.clone();
         // Our local role for a self-initiated attach is `attach.role`.
         self.link_handles
@@ -336,6 +368,7 @@ impl Session {
             return;
         }
         self.remote_handles.bind(attach.handle, local);
+        let expected_terminus = self.expects_terminus.remove(&local);
 
         let windows = self.windows;
         let local_channel = self.local_channel;
@@ -348,12 +381,32 @@ impl Session {
             // opened, `target` for a sender — and follows with a `detach`
             // carrying the reason. Leave the attach pending:
             // `on_peer_detach` fails it with that error, so the caller never
-            // gets a handle to a link that doesn't exist.
-            let refused = match link {
-                Link::Receiver(_) => attach.source.is_none(),
-                Link::Sender(_) => attach.target.is_none(),
-            };
+            // gets a handle to a link that doesn't exist. (Only when our
+            // attach named that terminus: a null one is echoed back null.)
+            let refused = expected_terminus
+                && match link {
+                    Link::Receiver(_) => attach.source.is_none(),
+                    Link::Sender(_) => attach.target.is_none(),
+                };
             if refused {
+                return;
+            }
+            // The caller stopped waiting (its attach timed out): nobody owns
+            // this link, so close it rather than leave it attached.
+            if attach_abandoned(link) {
+                transport.queue_amqp(
+                    local_channel,
+                    &Performative::Detach(Detach {
+                        handle: local,
+                        closed: true,
+                        error: None,
+                    }),
+                    None,
+                );
+                // Like our own detach: the handle stays reserved until the
+                // peer's answering detach.
+                self.forget_link_keep_handle(local);
+                self.half_closed.insert(local);
                 return;
             }
             link.mark_attached();
@@ -853,6 +906,7 @@ impl Session {
 
     /// Drop a link's state but keep its handle allocated (half-closed).
     fn forget_link_keep_handle(&mut self, local: u32) {
+        self.expects_terminus.remove(&local);
         if let Some(link) = self.links.remove(&local) {
             let key = match &link {
                 Link::Sender(s) => (s.name.clone(), Role::Sender),
@@ -1204,16 +1258,44 @@ impl Session {
     }
 }
 
-/// Build a link-level `flow` from the link credit + session windows.
-/// The error a refused attach fails with: the peer's `detach` error when it
-/// sent one (e.g. `amqp:unauthorized-access`), else a generic refusal.
-fn refused_attach_error(error: Option<AmqpError>) -> LinkError {
-    match error {
-        Some(e) => LinkError::from_remote(ErrorKind::Detached, RemoteError::new(e)),
-        None => LinkError::msg(ErrorKind::Detached, "terminus refused by peer"),
-    }
+/// Whether the caller awaiting this link's attach has given up (its reply
+/// receiver is gone, e.g. after an attach timeout).
+fn attach_abandoned(link: &Link) -> bool {
+    let pending = match link {
+        Link::Sender(l) => l.pending_attach.as_ref(),
+        Link::Receiver(l) => l.pending_attach.as_ref(),
+    };
+    pending.is_some_and(|reply| reply.is_closed())
 }
 
+/// The error a refused attach fails with, classified by the peer's `detach`
+/// condition:
+/// - a condition retrying won't change (`unauthorized-access`,
+///   `not-allowed`, …) → [`ErrorKind::Refused`] (not retryable);
+/// - `amqp:link:redirect` → [`ErrorKind::LinkRedirect`];
+/// - anything else (`not-found`, `resource-locked`, …, or no error at all,
+///   e.g. a queue still recovering) → [`ErrorKind::Detached`] (retryable).
+fn refused_attach_error(error: Option<AmqpError>) -> LinkError {
+    use crate::types::definitions::{AmqpError as Amqp, ErrorCondition, LinkError as Link};
+    let Some(e) = error else {
+        return LinkError::msg(ErrorKind::Detached, "terminus refused by peer");
+    };
+    let kind = match &e.condition {
+        ErrorCondition::Amqp(
+            Amqp::UnauthorizedAccess
+            | Amqp::NotAllowed
+            | Amqp::NotImplemented
+            | Amqp::InvalidField
+            | Amqp::DecodeError
+            | Amqp::PreconditionFailed,
+        ) => ErrorKind::Refused,
+        ErrorCondition::Link(Link::Redirect) => ErrorKind::LinkRedirect,
+        _ => ErrorKind::Detached,
+    };
+    LinkError::from_remote(kind, RemoteError::new(e))
+}
+
+/// Build a link-level `flow` from the link credit + session windows.
 fn link_flow(handle: u32, credit: &LinkCredit, windows: &SessionWindows) -> Flow {
     let mut flow = windows.build_flow();
     flow.handle = Some(handle);
@@ -1603,7 +1685,8 @@ mod tests {
             .try_recv()
             .expect("attach resolved by the detach")
             .expect_err("a refused attach is an error");
-        assert_eq!(err.kind(), ErrorKind::Detached);
+        assert_eq!(err.kind(), ErrorKind::Refused);
+        assert!(!err.is_retryable(), "a permission refusal isn't retryable");
         assert_eq!(
             err.remote()
                 .expect("peer error carried")
@@ -1669,6 +1752,185 @@ mod tests {
         assert_eq!(err.kind(), ErrorKind::Detached);
         assert!(err.remote().is_none());
         assert!(err.to_string().contains("terminus refused"));
+    }
+
+    /// Attach a receiver named `name` and return its pending reply.
+    fn pending_receiver<S: IoStream>(
+        session: &mut Session,
+        name: &str,
+        source: Option<&str>,
+        transport: &mut FramedTransport<S>,
+    ) -> tokio::sync::oneshot::Receiver<Result<LinkAttached, LinkError>> {
+        let (link_tx, _link_rx) = mpsc::channel(16);
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        session.attach_link(
+            Attach {
+                name: name.into(),
+                role: Role::Receiver,
+                source: source.map(crate::types::messaging::Source::new),
+                ..Default::default()
+            },
+            CreditMode::Manual,
+            link_tx,
+            reply_tx,
+            transport,
+        );
+        reply_rx
+    }
+
+    /// Answer `name` with a null terminus (peer handle `peer`), detach with
+    /// `error`, and return the attach's error.
+    fn refuse<S: IoStream>(
+        session: &mut Session,
+        name: &str,
+        peer: u32,
+        error: Option<AmqpError>,
+        mut reply: tokio::sync::oneshot::Receiver<Result<LinkAttached, LinkError>>,
+        transport: &mut FramedTransport<S>,
+    ) -> LinkError {
+        session.on_peer_attach(
+            Attach {
+                name: name.into(),
+                handle: peer,
+                role: Role::Sender,
+                ..Default::default()
+            },
+            transport,
+        );
+        session.on_peer_detach(
+            Detach {
+                handle: peer,
+                closed: true,
+                error,
+            },
+            transport,
+        );
+        reply.try_recv().expect("resolved").expect_err("refused")
+    }
+
+    /// A refusal is classified by its condition: one that may clear stays
+    /// retryable (`Detached`), a permanent one is `Refused`, a redirect is a
+    /// `LinkRedirect`.
+    #[tokio::test]
+    async fn refused_attach_kind_follows_the_condition() {
+        use crate::types::definitions::{AmqpError as Amqp, ErrorCondition, LinkError as LinkCond};
+        let (mut session, _resp, _evt, mut transport, _far) = server_session(&peer_begin());
+        let cases = [
+            (ErrorCondition::Amqp(Amqp::NotFound), ErrorKind::Detached),
+            (
+                ErrorCondition::Amqp(Amqp::ResourceLocked),
+                ErrorKind::Detached,
+            ),
+            (ErrorCondition::Amqp(Amqp::NotAllowed), ErrorKind::Refused),
+            (
+                ErrorCondition::Link(LinkCond::Redirect),
+                ErrorKind::LinkRedirect,
+            ),
+        ];
+        for (i, (condition, kind)) in cases.into_iter().enumerate() {
+            let name = format!("c{i}");
+            let reply = pending_receiver(&mut session, &name, Some("/q"), &mut transport);
+            let err = refuse(
+                &mut session,
+                &name,
+                10 + i as u32,
+                Some(AmqpError {
+                    condition,
+                    description: None,
+                    info: None,
+                }),
+                reply,
+                &mut transport,
+            );
+            assert_eq!(err.kind(), kind, "{name}");
+            assert!(err.remote().is_some(), "{name}");
+        }
+    }
+
+    /// A caller that attaches with the terminus null gets it echoed back null
+    /// by an accepting peer: that's not a refusal.
+    #[tokio::test]
+    async fn null_terminus_we_sent_is_not_a_refusal() {
+        let (mut session, _resp, _evt, mut transport, _far) = server_session(&peer_begin());
+        let mut reply = pending_receiver(&mut session, "bare", None, &mut transport);
+        session.on_peer_attach(
+            Attach {
+                name: "bare".into(),
+                handle: 2,
+                role: Role::Sender,
+                ..Default::default()
+            },
+            &mut transport,
+        );
+        reply
+            .try_recv()
+            .expect("resolved at once")
+            .expect("accepted, not refused");
+    }
+
+    /// The caller gave up waiting (attach timeout): when the peer's answer
+    /// arrives, the orphaned link is detached, and its handle is freed once
+    /// the peer answers that detach.
+    #[tokio::test]
+    async fn abandoned_attach_is_detached_when_answered() {
+        let (mut session, _resp, _evt, mut transport, mut far) = server_session(&peer_begin());
+        let reply = pending_receiver(&mut session, "late", Some("/q"), &mut transport);
+        transport.flush().await.unwrap();
+        let _ = far.read_frame().await.unwrap(); // our attach
+        drop(reply);
+        session.on_peer_attach(
+            Attach {
+                name: "late".into(),
+                handle: 5,
+                role: Role::Sender,
+                source: Some(crate::types::messaging::Source::new("/q")),
+                ..Default::default()
+            },
+            &mut transport,
+        );
+        transport.flush().await.unwrap();
+        match far.read_frame().await.unwrap().body {
+            FrameBody::Amqp(Performative::Detach(d), _) => {
+                assert_eq!(d.handle, 0);
+                assert!(d.closed);
+            }
+            other => panic!("expected our detach, got {other:?}"),
+        }
+        assert!(!session.knows_link("late", Role::Sender), "link forgotten");
+        assert!(
+            session.half_closed.contains(&0),
+            "handle held until answered"
+        );
+        session.on_peer_detach(
+            Detach {
+                handle: 5,
+                closed: true,
+                error: None,
+            },
+            &mut transport,
+        );
+        assert!(!session.half_closed.contains(&0), "handle released");
+    }
+
+    /// A peer that ends the session instead of answering an attach fails the
+    /// attach with the session's reason.
+    #[tokio::test]
+    async fn session_end_fails_pending_attaches() {
+        let (mut session, _resp, _evt, mut transport, _far) = server_session(&peer_begin());
+        let mut reply = pending_receiver(&mut session, "e", Some("/q"), &mut transport);
+        session.on_peer_end(Some(AmqpError::new(
+            crate::types::definitions::AmqpError::UnauthorizedAccess,
+            None,
+        )));
+        let err = reply
+            .try_recv()
+            .expect("resolved")
+            .expect_err("failed by the end");
+        assert_eq!(err.kind(), ErrorKind::PeerClosed);
+        assert_eq!(
+            err.remote().unwrap().condition().as_str(),
+            "amqp:unauthorized-access"
+        );
     }
 
     /// The accepted case is unchanged: a receiver answered with a source

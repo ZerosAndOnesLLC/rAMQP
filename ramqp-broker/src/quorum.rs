@@ -55,19 +55,31 @@ enum Committed {
     Remove {
         msg_id: u64,
         result: Result<(), String>,
-        /// Re-ready the message if the remove fails to commit. True for a
-        /// consumer ack (the message is still replicated → redeliver,
-        /// at-least-once); FALSE for a dead-letter removal (the body already
-        /// went to the DLX — re-readying would deliver it AND dead-letter
-        /// it, LOW-1). Matches the durable actor, which never reinserts
-        /// after dead-lettering.
-        readd_on_failure: bool,
+        /// What to do if the remove fails to commit.
+        on_failure: OnRemoveFailure,
     },
     /// A failure-count proposal finished (best-effort).
     CountFailure { result: Result<(), String> },
 }
 
 type CommitFuture = Pin<Box<dyn Future<Output = Committed> + Send>>;
+
+/// How a removal that failed to commit is recovered.
+#[derive(Debug, Clone, Copy)]
+enum OnRemoveFailure {
+    /// A consumer ack: re-ready the message (it is still replicated →
+    /// redeliver, at-least-once).
+    Readd,
+    /// A dead-letter removal: the copy is already stored in the DLQ, so
+    /// re-readying would deliver it AND dead-letter it (LOW-1). Propose the
+    /// removal again, this many more times; past that the message stays in
+    /// replicated state and a failover redelivers it.
+    Retry(u8),
+}
+
+/// Re-proposals of a failed dead-letter removal before leaving it to a
+/// failover.
+const DEAD_LETTER_REMOVE_RETRIES: u8 = 3;
 
 /// Spawn a quorum queue actor over an already-running queue group.
 ///
@@ -240,16 +252,29 @@ async fn run(
                             }
                         }
                     }
-                    Committed::Remove { msg_id, result, readd_on_failure } => {
+                    Committed::Remove { msg_id, result, on_failure } => {
                         if let Err(e) = result {
                             tracing::warn!(queue = %name, error = %e, "remove not committed");
-                            // Only re-ready an ACK removal: a dead-letter
-                            // removal's body is already at the DLX, so
-                            // re-readying would double it (LOW-1). It stays in
-                            // replicated state and redelivers on the next
-                            // failover instead.
-                            if readd_on_failure {
-                                ready.insert(msg_id);
+                            match on_failure {
+                                OnRemoveFailure::Readd => {
+                                    ready.insert(msg_id);
+                                }
+                                // Never re-ready a dead-letter removal (its
+                                // copy is in the DLQ): propose it again, so
+                                // the message isn't left replicated but
+                                // invisible while this node keeps leading.
+                                OnRemoveFailure::Retry(left) if left > 0 => {
+                                    push_remove(
+                                        &mut commits,
+                                        &raft,
+                                        msg_id,
+                                        OnRemoveFailure::Retry(left - 1),
+                                        None,
+                                    );
+                                }
+                                OnRemoveFailure::Retry(_) => {
+                                    tracing::warn!(queue = %name, msg_id, "dead-letter removal not committed; a failover redelivers it");
+                                }
                             }
                         }
                     }
@@ -306,8 +331,9 @@ fn handle_msg(
                 let dropped = policy.drop_head.then(|| ready.pop_first()).flatten();
                 match dropped {
                     Some(old_id) => {
-                        dead_letter_stored(name, policy, store, old_id, "maxlen");
-                        push_remove(commits, raft, old_id);
+                        dead_letter_then_remove(
+                            name, policy, store, raft, commits, old_id, "maxlen",
+                        );
                     }
                     // A reserved publish is never refused: its slot was
                     // admitted at Reserve time.
@@ -400,32 +426,15 @@ fn handle_msg(
             inflight.remove(&msg_id);
             match outcome {
                 SettleOutcome::Reject if policy.dead_letters() => {
-                    // Rejected with a dead-letter target: hand the body to
-                    // the router, then remove (never re-readied: the copy is
-                    // already on its way to the DLQ).
+                    // Rejected with a dead-letter target: the source copy is
+                    // removed only once the dead letter is stored.
                     failures.remove(&msg_id);
-                    dead_letter_stored(name, policy, store, msg_id, "rejected");
-                    push_remove(commits, raft, msg_id);
+                    dead_letter_then_remove(name, policy, store, raft, commits, msg_id, "rejected");
                 }
                 // Accepted, or rejected with nowhere to dead-letter: remove.
                 SettleOutcome::Ack | SettleOutcome::Reject => {
                     failures.remove(&msg_id);
-                    let raft = raft.clone();
-                    commits.push(Box::pin(async move {
-                        let result = raft
-                            .client_write(QueueCommand::Settle {
-                                msg_id,
-                                requeue: false,
-                            })
-                            .await
-                            .map(|_| ())
-                            .map_err(|e| e.to_string());
-                        Committed::Remove {
-                            msg_id,
-                            result,
-                            readd_on_failure: true,
-                        }
-                    }));
+                    push_remove(commits, raft, msg_id, OnRemoveFailure::Readd, None);
                 }
                 SettleOutcome::Requeue => {
                     // Released: dispatchable again, no penalty, no log write
@@ -445,8 +454,15 @@ fn handle_msg(
                     *count += 1;
                     if policy.attempts_exhausted(*count) {
                         failures.remove(&msg_id);
-                        dead_letter_stored(name, policy, store, msg_id, "delivery-limit");
-                        push_remove(commits, raft, msg_id);
+                        dead_letter_then_remove(
+                            name,
+                            policy,
+                            store,
+                            raft,
+                            commits,
+                            msg_id,
+                            "delivery-limit",
+                        );
                     } else {
                         ready.insert(msg_id);
                         let raft = raft.clone();
@@ -489,10 +505,22 @@ fn handle_msg(
     }
 }
 
-/// Propose an ack-style removal (dead-lettered / expired / dropped-head).
-fn push_remove(commits: &mut FuturesUnordered<CommitFuture>, raft: &QueueRaft, msg_id: u64) {
+/// Propose removing `msg_id` from the replicated log, first waiting for
+/// `after` (a dead letter's stored confirmation) when given.
+fn push_remove(
+    commits: &mut FuturesUnordered<CommitFuture>,
+    raft: &QueueRaft,
+    msg_id: u64,
+    on_failure: OnRemoveFailure,
+    after: Option<tokio::sync::oneshot::Receiver<()>>,
+) {
     let raft = raft.clone();
     commits.push(Box::pin(async move {
+        if let Some(stored) = after {
+            // Resolves once the copy's fate is known (stored, refused or
+            // dropped); a dead router resolves it at once.
+            let _ = stored.await;
+        }
         let result = raft
             .client_write(QueueCommand::Settle {
                 msg_id,
@@ -501,32 +529,48 @@ fn push_remove(commits: &mut FuturesUnordered<CommitFuture>, raft: &QueueRaft, m
             .await
             .map(|_| ())
             .map_err(|e| e.to_string());
-        // Dead-letter path: the body is already at the DLX; never re-ready.
         Committed::Remove {
             msg_id,
             result,
-            readd_on_failure: false,
+            on_failure,
         }
     }));
 }
 
-/// Read a message's body out of applied state and hand it to the
-/// dead-letter router.
-fn dead_letter_stored(
+/// Dead-letter a stored message, then remove the source copy only after the
+/// dead-letter router resolves the copy's fate (as `durable.rs` does): a
+/// crash in between leaves the message in the log to be delivered again,
+/// never lost from both queues. A body that can't be read is neither
+/// dead-lettered nor removed — it stays in the log, as dispatch leaves it.
+fn dead_letter_then_remove(
     name: &str,
     policy: &EffectivePolicy,
     store: &QueueStore,
+    raft: &QueueRaft,
+    commits: &mut FuturesUnordered<CommitFuture>,
     msg_id: u64,
     reason: &str,
 ) {
     let body = match store.with_state(|s| s.body_of(msg_id)) {
-        Some(crate::cluster::queue_group::BodyFetch::Ready(bytes)) => Some(bytes),
-        Some(crate::cluster::queue_group::BodyFetch::Spilled(spill, r)) => spill.read(&r).ok(),
-        None => None,
+        Some(crate::cluster::queue_group::BodyFetch::Ready(bytes)) => bytes,
+        Some(crate::cluster::queue_group::BodyFetch::Spilled(spill, r)) => match spill.read(&r) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                tracing::warn!(queue = %name, msg_id, reason, error = %e, "body unreadable; not dead-lettered, left in the log");
+                return;
+            }
+        },
+        // Already gone from the state machine: nothing to dead-letter.
+        None => return,
     };
-    if let Some(body) = body {
-        policy.dead_letter(name, reason, body);
-    }
+    let stored = policy.dead_letter_ordered(name, reason, body);
+    push_remove(
+        commits,
+        raft,
+        msg_id,
+        OnRemoveFailure::Retry(DEAD_LETTER_REMOVE_RETRIES),
+        stored,
+    );
 }
 
 /// Lazy TTL: expire ready messages from the head (dead-letter + propose
@@ -551,8 +595,7 @@ fn expire_head(
             break;
         }
         ready.remove(&head);
-        dead_letter_stored(name, policy, store, head, "expired");
-        push_remove(commits, raft, head);
+        dead_letter_then_remove(name, policy, store, raft, commits, head, "expired");
     }
 }
 

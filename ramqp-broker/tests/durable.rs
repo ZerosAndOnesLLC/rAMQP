@@ -179,7 +179,11 @@ async fn durable_messages_survive_a_broker_restart() {
                     _ => None,
                 }
             }
-            Err(_) => None,
+            // Only the recovering queue's `not-found` is expected here.
+            Err(e) => {
+                assert!(e.to_string().contains("amqp:not-found"), "{e}");
+                None
+            }
         };
         match attempt {
             Some(found) => break found,
@@ -322,7 +326,11 @@ async fn quorum_messages_survive_a_broker_restart() {
                     _ => None,
                 }
             }
-            Err(_) => None,
+            // Only the recovering queue's `not-found` is expected here.
+            Err(e) => {
+                assert!(e.to_string().contains("amqp:not-found"), "{e}");
+                None
+            }
         };
         match attempt {
             Some(found) => break found,

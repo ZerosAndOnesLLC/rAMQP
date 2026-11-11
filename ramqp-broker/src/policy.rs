@@ -277,9 +277,7 @@ impl EffectivePolicy {
     /// or dropped). A durable source orders its own Remove after it; `None`
     /// means the message simply dropped and the caller may proceed at once.
     ///
-    /// Only the durable store (`durable.rs`) needs the ordered variant, so it is
-    /// gated to `store-redb` to keep default-feature builds warning-clean.
-    #[cfg(feature = "store-redb")]
+    /// Durable and quorum queues order their removal after it.
     pub fn dead_letter_ordered(
         &self,
         queue: &str,
