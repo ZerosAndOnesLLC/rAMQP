@@ -209,8 +209,14 @@ jobs:
           ref: ${{ env.TAG }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Install python3-qpid-proton
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq python3-qpid-proton
+      # Qpid Proton from PyPI (prebuilt wheels, OpenSSL bundled) rather than
+      # apt: the runner's Ubuntu mirrors have been unreachable at times,
+      # which failed the gate before any test ran.
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+      - name: Install Qpid Proton (python-qpid-proton)
+        run: python -m pip install --quiet python-qpid-proton
       - name: Qpid Proton interop
         run: ramqp-broker/tests/interop/proton/run.sh
 
@@ -239,8 +245,14 @@ jobs:
       - uses: actions/setup-go@v7
         with:
           go-version-file: ramqp-broker/tests/interop/goamqp/go.mod
-      - name: Install python3-qpid-proton
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq python3-qpid-proton
+      # Qpid Proton from PyPI (prebuilt wheels, OpenSSL bundled) rather than
+      # apt: the runner's Ubuntu mirrors have been unreachable at times,
+      # which failed the gate before any test ran.
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+      - name: Install Qpid Proton (python-qpid-proton)
+        run: python -m pip install --quiet python-qpid-proton
       - name: Feature interop matrix
         run: ramqp-broker/tests/interop/matrix/run.sh
 

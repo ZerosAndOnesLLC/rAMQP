@@ -5,8 +5,8 @@
 #   ramqp-broker/tests/interop/proton/run.sh
 #
 # Proton needs a native library, so this runs the client one of two ways:
-#   - HOST: if `python3 -c "import proton"` works (CI installs python3-qpid-proton
-#     via apt), the broker binds loopback and proton runs on the host.
+#   - HOST: if `python3 -c "import proton"` works (CI pip-installs python-qpid-proton
+#     from PyPI), the broker binds loopback and proton runs on the host.
 #   - DOCKER fallback: otherwise (e.g. a dev box where we can't touch system
 #     packages) the broker binds 0.0.0.0 and proton runs in an ubuntu container
 #     that apt-installs python3-qpid-proton and reaches the host via host-gateway.
