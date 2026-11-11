@@ -192,12 +192,20 @@ async fn run(
                             continue;
                         };
                         match outcome {
-                            SettleOutcome::Ack | SettleOutcome::Drop => {
+                            SettleOutcome::Ack => {
                                 failures.remove(&msg_id);
                                 bytes = bytes.saturating_sub(len);
                                 let _ = store
                                     .submit(StoreOp::Remove { queue: queue_id, msg_id })
                                     .await;
+                            }
+                            SettleOutcome::Reject => {
+                                failures.remove(&msg_id);
+                                bytes = bytes.saturating_sub(len);
+                                dead_letter_then_remove(
+                                    &name, &policy, &store, queue_id, msg_id, "rejected",
+                                )
+                                .await;
                             }
                             SettleOutcome::Requeue => {
                                 ready.insert(msg_id, (enqueue_time, len));

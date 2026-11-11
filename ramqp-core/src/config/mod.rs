@@ -25,7 +25,9 @@ pub struct ConnectionConfig {
     pub idle_timeout: Option<Duration>,
     /// Maximum time for the connection handshake (transport connect + SASL + the
     /// `open` exchange). `None` disables it. Guards against a peer that accepts
-    /// the socket then stalls mid-handshake (slow-loris).
+    /// the socket then stalls mid-handshake (slow-loris). It also bounds each
+    /// link attach (`create_consumer` / `create_producer`): a peer that never
+    /// answers one fails it with [`ErrorKind::Timeout`](crate::error::ErrorKind::Timeout).
     pub connect_timeout: Option<Duration>,
     /// Bound on the driver command queue (back-pressures producers).
     pub command_buffer: usize,

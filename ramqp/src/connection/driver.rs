@@ -134,6 +134,21 @@ impl<S: IoStream> Driver<S> {
     /// terminal error, if any.
     pub async fn run(mut self) -> Result<(), ConnectError> {
         let result = self.event_loop().await;
+        // Attaches still awaiting an answer fail with the connection's
+        // reason (e.g. the peer closed it instead of refusing the link),
+        // rather than surfacing as a dropped reply.
+        for session in self.sessions.values_mut() {
+            session.fail_pending_attaches(|| match &result {
+                Ok(()) => LinkError::msg(ErrorKind::PeerClosed, "connection closed"),
+                Err(e) => {
+                    let out = LinkError::msg(e.kind(), e.to_string());
+                    match e.remote() {
+                        Some(remote) => out.with_remote(remote.clone()),
+                        None => out,
+                    }
+                }
+            });
+        }
         match &result {
             Ok(()) => self.events.publish(ConnectionEvent::Closed {
                 error: false,

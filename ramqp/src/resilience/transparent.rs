@@ -31,7 +31,7 @@ use tokio::task::JoinHandle;
 
 use crate::api::connection::Connection;
 use crate::config::{Config, CreditMode, ReconnectConfig};
-use crate::error::{ConnectError, ErrorKind, LinkError, SendError, SessionError};
+use crate::error::{ConnectError, ErrorKind, LinkError, RemoteError, SendError, SessionError};
 use crate::ids::{ChannelId, Handle};
 use crate::observe::{ConnectionEvent, EventBus, SharedMetrics};
 use crate::proto::{DriverCommand, LinkAttached, Reply, SessionEvent, SessionOpened};
@@ -46,6 +46,11 @@ use crate::types::performatives::{Attach, Begin};
 /// credit invariant); the extra slack over the credit window is small.
 const RELAY_CAPACITY: usize = 256;
 
+/// How long a reconnect keeps retrying the re-attach of a link the peer
+/// refuses for a reason that may clear (e.g. a queue still recovering after
+/// a broker restart) before ending that link.
+const LINK_REATTACH_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// A logical (handle-visible) sender/receiver link, replayed on reconnect.
 struct LogicalLink {
     /// The original attach (link name is stable; the driver re-assigns `handle`).
@@ -55,6 +60,25 @@ struct LogicalLink {
     handle_events: mpsc::Sender<crate::proto::LinkEvent>,
     /// The current connection's real handle (`None` while disconnected).
     real_handle: Option<u32>,
+    /// The task relaying the current (or last) epoch's events to the handle.
+    pump: Option<JoinHandle<()>>,
+}
+
+/// Why a logical link was ended on re-attach: kept so the handle's later
+/// operations (a producer's `send`, which never reads link events) fail with
+/// the peer's reason instead of a generic "connection lost".
+struct RefusedLink {
+    kind: ErrorKind,
+    remote: Option<RemoteError>,
+}
+
+impl RefusedLink {
+    fn send_error(&self) -> SendError {
+        match &self.remote {
+            Some(remote) => SendError::from_remote(self.kind, remote.clone()),
+            None => SendError::msg(self.kind, "link refused on reconnect"),
+        }
+    }
 }
 
 /// A logical (handle-visible) session, replayed on reconnect.
@@ -63,6 +87,9 @@ struct LogicalSession {
     handle_events: mpsc::UnboundedSender<SessionEvent>,
     real_channel: Option<u16>,
     links: HashMap<u32, LogicalLink>,
+    /// Links ended because the peer refused their re-attach, until the
+    /// handle detaches.
+    refused: HashMap<u32, RefusedLink>,
     next_vhandle: u32,
 }
 
@@ -228,6 +255,7 @@ impl Supervisor {
                         handle_events: events,
                         real_channel: None,
                         links: HashMap::new(),
+                        refused: HashMap::new(),
                         next_vhandle: 0,
                     },
                 );
@@ -268,6 +296,7 @@ impl Supervisor {
                         credit_mode,
                         handle_events: events,
                         real_handle: None,
+                        pump: None,
                     },
                 );
                 match self.open_link(vchan, vhandle).await {
@@ -320,6 +349,7 @@ impl Supervisor {
                 let real = self.real_ids(vchan, vhandle);
                 if let Some(s) = self.sessions.get_mut(&vchan) {
                     s.links.remove(&vhandle);
+                    s.refused.remove(&vhandle);
                 }
                 match (self.inner.clone(), real) {
                     (Some(inner), Some((rc, rh))) => {
@@ -467,10 +497,14 @@ impl Supervisor {
         let routed = self.inner.clone().zip(self.real_ids(vchan, vhandle));
         let Some((inner, (rc, rh))) = routed else {
             if let Some(reply) = reply {
-                let _ = reply.send(Err(SendError::msg(
-                    ErrorKind::NotConnected,
-                    "connection lost",
-                )));
+                let refused = self
+                    .sessions
+                    .get(&vchan)
+                    .and_then(|s| s.refused.get(&vhandle))
+                    .map(RefusedLink::send_error);
+                let _ = reply.send(Err(refused.unwrap_or_else(|| {
+                    SendError::msg(ErrorKind::NotConnected, "connection lost")
+                })));
             }
             return;
         };
@@ -622,23 +656,33 @@ impl Supervisor {
             })
             .await
             .map_err(|_| LinkError::msg(ErrorKind::NotConnected, "connection lost"))?;
-        let attached = rrx
-            .await
-            .map_err(|_| LinkError::msg(ErrorKind::Cancelled, "driver dropped"))??;
-        if let Some(l) = self
-            .sessions
-            .get_mut(&vchan)
-            .and_then(|s| s.links.get_mut(&vhandle))
-        {
-            l.real_handle = Some(attached.handle.value());
-        }
-        tokio::spawn(async move {
+        // Bounded like a direct attach: an unanswered attach must not stall
+        // the supervisor (every command on the connection waits on it).
+        let reply = async {
+            rrx.await
+                .map_err(|_| LinkError::msg(ErrorKind::Cancelled, "driver dropped"))?
+        };
+        let attached = match self.config.connection.connect_timeout {
+            Some(limit) => tokio::time::timeout(limit, reply)
+                .await
+                .map_err(|_| LinkError::msg(ErrorKind::Timeout, "attach not answered in time"))??,
+            None => reply.await?,
+        };
+        let pump = tokio::spawn(async move {
             while let Some(ev) = erx.recv().await {
                 if handle_events.send(ev).await.is_err() {
                     break;
                 }
             }
         });
+        if let Some(l) = self
+            .sessions
+            .get_mut(&vchan)
+            .and_then(|s| s.links.get_mut(&vhandle))
+        {
+            l.real_handle = Some(attached.handle.value());
+            l.pump = Some(pump);
+        }
         Ok(attached)
     }
 
@@ -716,12 +760,83 @@ impl Supervisor {
                 v
             };
             for vhandle in vhandles {
-                if self.open_link(vchan, vhandle).await.is_err() {
+                if !self.reattach(vchan, vhandle).await {
                     return false;
                 }
             }
         }
         true
+    }
+
+    /// Re-attach one logical link after a reconnect. Returns `false` only if
+    /// the connection died; a link the peer refuses is dealt with here:
+    /// - a refusal that may clear (`not-found`, no error — a queue still
+    ///   recovering after a broker restart) is retried with backoff, within
+    ///   the reconnect policy and [`LINK_REATTACH_BUDGET`];
+    /// - a permanent one (`unauthorized-access`, a redirect, …), or a
+    ///   temporary one past the budget, ends that link for its handle while
+    ///   the rest of the topology is restored.
+    async fn reattach(&mut self, vchan: u16, vhandle: u32) -> bool {
+        let deadline = tokio::time::Instant::now() + LINK_REATTACH_BUDGET;
+        let mut backoff = Backoff::new(self.reconnect.clone());
+        loop {
+            let e = match self.open_link(vchan, vhandle).await {
+                Ok(_) => return true,
+                Err(e) => e,
+            };
+            match e.kind() {
+                ErrorKind::Detached => {
+                    let now = tokio::time::Instant::now();
+                    match backoff.next_delay() {
+                        Some(delay) if now < deadline => {
+                            tokio::time::sleep(delay.min(deadline - now)).await;
+                        }
+                        _ => {
+                            self.end_refused_link(vchan, vhandle, &e);
+                            return true;
+                        }
+                    }
+                }
+                ErrorKind::Refused | ErrorKind::LinkRedirect => {
+                    self.end_refused_link(vchan, vhandle, &e);
+                    return true;
+                }
+                _ => return false,
+            }
+        }
+    }
+
+    /// Forget a logical link the peer refused on re-attach, and tell its handle
+    /// it is detached (with the peer's reason): a consumer's next `recv`
+    /// returns it, and a producer's next `send` fails with it (through the
+    /// session's `refused` record — a producer never reads link events).
+    fn end_refused_link(&mut self, vchan: u16, vhandle: u32, error: &LinkError) {
+        let Some(session) = self.sessions.get_mut(&vchan) else {
+            return;
+        };
+        let Some(link) = session.links.remove(&vhandle) else {
+            return;
+        };
+        session.refused.insert(
+            vhandle,
+            RefusedLink {
+                kind: error.kind(),
+                remote: error.remote().cloned(),
+            },
+        );
+        let event = crate::proto::LinkEvent::Detached {
+            handle: Handle(vhandle),
+            error: error.remote().map(|r| r.as_amqp().clone()),
+        };
+        // Off the supervisor task: a handle not draining its events must not
+        // stall the rest of the replay. The previous epoch's relay finishes
+        // first, so the detach is the last event the handle sees.
+        tokio::spawn(async move {
+            if let Some(pump) = link.pump {
+                let _ = pump.await;
+            }
+            let _ = link.handle_events.send(event).await;
+        });
     }
 
     fn give_up(&mut self, reason: &str) {

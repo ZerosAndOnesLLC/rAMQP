@@ -124,14 +124,13 @@ async fn per_address_authorization_gates_attaches() {
         .await
         .expect("send is allowed");
     producer.send(Message::text("entry")).await.expect("send");
-    let mut consumer = session
-        .create_consumer("/queues/secret-audit")
-        .await
-        .expect("attach completes");
-    let denied = tokio::time::timeout(Duration::from_secs(5), consumer.recv())
-        .await
-        .expect("refusal arrives");
-    assert!(denied.is_err(), "bob must not consume secrets: {denied:?}");
+    // Refused at the attach itself, with the broker's reason.
+    let denied = session.create_consumer("/queues/secret-audit").await.err();
+    let denied = denied.expect("bob must not consume secrets");
+    assert!(
+        denied.to_string().contains("amqp:unauthorized-access"),
+        "{denied}"
+    );
     // The session survives: other addresses still work.
     let mut ok = session.create_consumer("/queues/open").await.expect("open");
     producer_send(&session, "/queues/open", "fine").await;
@@ -190,14 +189,13 @@ async fn reattach_of_a_denied_link_name_stays_denied() {
     // Two consumer attaches to the same denied address; both must be refused
     // (the second exercises any known-link routing).
     for _ in 0..2 {
-        let mut consumer = session
-            .create_consumer("/queues/secret-box")
-            .await
-            .expect("attach completes (refusal is link-level)");
-        let denied = tokio::time::timeout(Duration::from_secs(5), consumer.recv())
-            .await
-            .expect("refusal arrives");
-        assert!(denied.is_err(), "denied consumer must not receive");
+        // Refused at the attach itself, with the broker's reason.
+        let denied = session.create_consumer("/queues/secret-box").await.err();
+        let denied = denied.expect("denied consumer must not receive");
+        assert!(
+            denied.to_string().contains("amqp:unauthorized-access"),
+            "{denied}"
+        );
     }
     conn.close().await.expect("close");
     shutdown.shutdown();
@@ -227,20 +225,19 @@ async fn vhost_grants_confine_authenticated_users() {
     producer_send(&sess, "/queues/mine", "ok").await;
     conn.close().await.expect("close");
 
-    // In any other vhost the attach is refused (surfaces on first use).
+    // In any other vhost the attach is refused.
     let conn = connect_vhost("tenant-b")
         .connect()
         .await
         .expect("authn still succeeds");
     let sess = conn.begin_session().await.expect("sess");
-    let mut denied = sess
-        .create_consumer("/queues/mine")
-        .await
-        .expect("attach completes");
-    let refusal = tokio::time::timeout(Duration::from_secs(5), denied.recv())
-        .await
-        .expect("refusal arrives");
-    assert!(refusal.is_err(), "foreign-vhost attach must be refused");
+    // Refused at the attach itself, with the broker's reason.
+    let refusal = sess.create_consumer("/queues/mine").await.err();
+    let refusal = refusal.expect("foreign-vhost attach must be refused");
+    assert!(
+        refusal.to_string().contains("amqp:unauthorized-access"),
+        "{refusal}"
+    );
     conn.close().await.expect("close");
     shutdown.shutdown();
 }
@@ -264,24 +261,17 @@ async fn cross_tenant_addressing_is_refused() {
     producer_send(&sess_a, "/queues/secret", "private").await;
 
     // A default-vhost client addressing across the separator is refused:
-    // the attach completes with a null terminus + detach, so the refusal
-    // surfaces on the first receive/send.
+    // the broker answers with a null terminus + detach, which fails the
+    // attach.
     let conn = ConnectionBuilder::new(format!("amqp://{addr}"))
         .connect()
         .await
         .expect("default vhost connect");
     let sess = conn.begin_session().await.expect("sess");
-    let mut crosser = sess
-        .create_consumer("/queues/tenant-a/secret")
-        .await
-        .expect("attach completes");
-    let denied = tokio::time::timeout(Duration::from_secs(5), crosser.recv())
-        .await
-        .expect("refusal arrives");
-    assert!(
-        denied.is_err(),
-        "cross-tenant consumer must be refused: {denied:?}"
-    );
+    // Refused at the attach itself, with the broker's reason.
+    let denied = sess.create_consumer("/queues/tenant-a/secret").await.err();
+    let denied = denied.expect("cross-tenant consumer must be refused");
+    assert!(denied.to_string().contains("amqp:not-found"), "{denied}");
 
     // A vhost containing '/' is refused at the open.
     assert!(
@@ -388,14 +378,13 @@ async fn config_file_users_and_permissions() {
     let sess = conn.begin_session().await.expect("sess");
     producer_send(&sess, "/queues/orders.created", "o1").await;
     // Outside the granted glob: refused at the link.
-    let mut denied = sess
-        .create_consumer("/queues/billing")
-        .await
-        .expect("attach completes");
-    let refusal = tokio::time::timeout(Duration::from_secs(5), denied.recv())
-        .await
-        .expect("refusal arrives");
-    assert!(refusal.is_err(), "ungranted address must be refused");
+    // Refused at the attach itself, with the broker's reason.
+    let refusal = sess.create_consumer("/queues/billing").await.err();
+    let refusal = refusal.expect("ungranted address must be refused");
+    assert!(
+        refusal.to_string().contains("amqp:unauthorized-access"),
+        "{refusal}"
+    );
     conn.close().await.expect("close");
 
     // PLAIN with the same password works (verified against the verifier).

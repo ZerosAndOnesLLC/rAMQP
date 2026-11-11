@@ -41,6 +41,10 @@ pub enum ErrorKind {
     NotConnected,
     /// The operation was cancelled (graceful shutdown / dropped handle).
     Cancelled,
+    /// The peer refused the operation for a reason retrying won't change
+    /// (e.g. a link attach answered with `amqp:unauthorized-access` or
+    /// `amqp:not-allowed`).
+    Refused,
 }
 
 impl ErrorKind {
@@ -63,7 +67,8 @@ impl ErrorKind {
             | ErrorKind::LinkRedirect
             | ErrorKind::Settlement
             | ErrorKind::Encode
-            | ErrorKind::Cancelled => false,
+            | ErrorKind::Cancelled
+            | ErrorKind::Refused => false,
         }
     }
 
@@ -82,7 +87,8 @@ impl ErrorKind {
             | ErrorKind::Capacity
             | ErrorKind::Settlement
             | ErrorKind::NotConnected
-            | ErrorKind::Cancelled => false,
+            | ErrorKind::Cancelled
+            | ErrorKind::Refused => false,
         }
     }
 
@@ -101,6 +107,7 @@ impl ErrorKind {
             ErrorKind::Encode => "encode",
             ErrorKind::NotConnected => "not-connected",
             ErrorKind::Cancelled => "cancelled",
+            ErrorKind::Refused => "refused",
         }
     }
 }
