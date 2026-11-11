@@ -518,3 +518,72 @@ async fn tls_only_mode_binds_no_plain_listener() {
     assert!(Broker::new(BrokerConfig::default()).bind("").await.is_err());
     shutdown.shutdown();
 }
+
+/// Speak the AMQP 1.0 spec's negotiated TLS (§5.2.1) by hand: send the TLS
+/// protocol header, expect it echoed, run TLS, then check that the broker
+/// answers the SASL header over the encrypted stream.
+async fn negotiated_tls(addr: std::net::SocketAddr, ca_pem: &str) {
+    use rustls::pki_types::pem::PemObject;
+    let mut tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+    tcp.write_all(b"AMQP\x02\x01\x00\x00").await.unwrap();
+    let mut echo = [0u8; 8];
+    tokio::time::timeout(Duration::from_secs(5), tcp.read_exact(&mut echo))
+        .await
+        .expect("header echoed in time")
+        .unwrap();
+    assert_eq!(&echo, b"AMQP\x02\x01\x00\x00", "TLS header echoed");
+    let mut roots = rustls::RootCertStore::empty();
+    for c in rustls::pki_types::CertificateDer::pem_slice_iter(ca_pem.as_bytes()) {
+        roots.add(c.unwrap()).unwrap();
+    }
+    let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    let mut tls = tokio_rustls::TlsConnector::from(Arc::new(config))
+        .connect("localhost".try_into().unwrap(), tcp)
+        .await
+        .expect("TLS after the header exchange");
+    tls.write_all(b"AMQP\x03\x01\x00\x00").await.unwrap();
+    let mut sasl = [0u8; 8];
+    tls.read_exact(&mut sasl).await.unwrap();
+    assert_eq!(
+        &sasl, b"AMQP\x03\x01\x00\x00",
+        "AMQP (SASL) negotiation over TLS"
+    );
+}
+
+/// Clients following the spec's default TLS method (fe2o3-amqp, others)
+/// send the TLS protocol header first: accepted on the amqps listener and,
+/// as an in-place upgrade, on the plain listener.
+#[tokio::test]
+async fn tls_protocol_header_negotiation_on_both_listeners() {
+    let pki = Pki::new("ca");
+    let (cert, key) = pki.leaf_files("server");
+    let mut config = BrokerConfig::default();
+    config.tls = Some(TlsServerConfig::new(cert, key));
+    config.tls_listen = Some("127.0.0.1:0".to_owned());
+    let bound = Broker::new(config).bind("127.0.0.1:0").await.expect("bind");
+    let (plain, tls) = (bound.local_addr(), bound.tls_local_addr().unwrap());
+    let shutdown = bound.shutdown_handle();
+    tokio::spawn(bound.run());
+    negotiated_tls(tls, &pki.ca_pem).await;
+    negotiated_tls(plain, &pki.ca_pem).await;
+    // Plain AMQP on the plain listener is untouched by the upgrade check.
+    round_trip_plain(plain).await;
+    shutdown.shutdown();
+}
+
+async fn round_trip_plain(addr: std::net::SocketAddr) {
+    let conn = ConnectionBuilder::new(format!("amqp://{addr}"))
+        .connect()
+        .await
+        .expect("plain connect");
+    let s = conn.begin_session().await.unwrap();
+    let p = s.create_producer("/queues/plain-still").await.unwrap();
+    p.send(Message::text("ok")).await.unwrap();
+    conn.close().await.unwrap();
+}

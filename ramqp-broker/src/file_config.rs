@@ -80,11 +80,9 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 use crate::auth::{
-    ANONYMOUS_USER, Permission, StaticScram, StaticUsers, derive_scram_verifier,
-    parse_scram_verifier,
+    ANONYMOUS_USER, Permission, StaticUsers, parse_scram_verifier, password_verifiers,
 };
 use crate::config::{BrokerConfig, ClusterMemberConfig, OverflowBehavior, QueuePolicy};
-use ramqp_core::sasl::scram::ScramMechanism;
 
 /// The parsed configuration file. Every field is optional; command-line
 /// flags and environment variables override what is set here.
@@ -579,12 +577,11 @@ impl FileConfig {
                 if pw.is_empty() {
                     return Err(format!("user {:?}: password file is empty", u.name));
                 }
-                let verifier =
-                    derive_scram_verifier(ScramMechanism::Sha256, pw, StaticScram::ITERATIONS)
-                        .ok_or_else(|| {
-                            format!("user {:?}: password rejected by SASLprep", u.name)
-                        })?;
-                users = users.with_verifier(u.name.clone(), ScramMechanism::Sha256, verifier);
+                for (mech, verifier) in password_verifiers(pw)
+                    .ok_or_else(|| format!("user {:?}: password rejected by SASLprep", u.name))?
+                {
+                    users = users.with_verifier(u.name.clone(), mech, verifier);
+                }
             } else if lines.is_empty() {
                 return Err(format!("user {:?}: no verifier found", u.name));
             }
@@ -655,7 +652,10 @@ pub fn parse_seed(s: &str) -> Option<(u64, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::{Authenticator, Credentials, Operation, format_scram_verifier};
+    use crate::auth::{
+        Authenticator, Credentials, Operation, derive_scram_verifier, format_scram_verifier,
+    };
+    use ramqp_core::sasl::scram::ScramMechanism;
 
     #[test]
     fn full_file_parses_and_applies() {
@@ -772,10 +772,9 @@ mod tests {
             passwd: "pw"
         }));
         assert!(auth.is_admin("ops") && !auth.is_admin("orders"));
-        assert_eq!(
-            auth.mechanisms(),
-            &["SCRAM-SHA-512", "SCRAM-SHA-256", "PLAIN"]
-        );
+        // `orders` has only a SHA-512 verifier, so SHA-512 is the one SCRAM
+        // mechanism every user can complete.
+        assert_eq!(auth.mechanisms(), &["SCRAM-SHA-512", "PLAIN"]);
         assert!(auth.authorize(Some("orders"), "", "/queues/orders.eu", Operation::Send));
         assert!(!auth.authorize(Some("orders"), "", "/queues/orders.eu", Operation::Receive));
         assert!(!auth.authorize(Some("ops"), "", "/queues/orders.eu", Operation::Send));

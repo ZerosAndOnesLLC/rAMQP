@@ -195,10 +195,20 @@ impl Broker {
             0 => None,
             n => Some(Arc::new(Semaphore::new(n))),
         };
+        #[cfg(any(feature = "tls", feature = "fips"))]
+        let upgrade = match (&tls, &self.config.tls) {
+            (Some(t), _) => Some(UpgradeAcceptor(t.acceptor.clone())),
+            (None, Some(cfg)) => Some(UpgradeAcceptor(
+                crate::tls::acceptor(cfg).map_err(std::io::Error::other)?,
+            )),
+            (None, None) => None,
+        };
         Ok(BoundBroker {
             broker: self,
             listener,
             tls,
+            #[cfg(any(feature = "tls", feature = "fips"))]
+            upgrade,
             local_addr,
             shutdown_tx,
             shutdown_rx,
@@ -338,6 +348,10 @@ pub struct BoundBroker {
     listener: Option<TcpListener>,
     /// The `amqps` listener, when `tls_listen` is configured.
     tls: Option<TlsListener>,
+    /// TLS for clients that negotiate it on the PLAIN listener (the AMQP TLS
+    /// protocol header), when a certificate is configured.
+    #[cfg(any(feature = "tls", feature = "fips"))]
+    upgrade: Option<UpgradeAcceptor>,
     local_addr: SocketAddr,
     shutdown_tx: watch::Sender<bool>,
     shutdown_rx: watch::Receiver<bool>,
@@ -414,6 +428,64 @@ async fn accept_plain(listener: Option<&TcpListener>) -> std::io::Result<(TcpStr
     }
 }
 
+/// The TLS acceptor for plain-port upgrades (`Debug` for [`BoundBroker`]).
+#[cfg(any(feature = "tls", feature = "fips"))]
+#[derive(Clone)]
+struct UpgradeAcceptor(tokio_rustls::TlsAcceptor);
+
+#[cfg(any(feature = "tls", feature = "fips"))]
+impl std::fmt::Debug for UpgradeAcceptor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("UpgradeAcceptor")
+    }
+}
+
+/// The AMQP 1.0 TLS protocol header (§5.2.1): a client that negotiates TLS
+/// the spec's default way sends it first and expects it echoed before the
+/// TLS handshake.
+#[cfg(any(feature = "tls", feature = "fips"))]
+const TLS_PROTO_HEADER: [u8; 8] = *b"AMQP\x02\x01\x00\x00";
+
+/// Peek (without consuming) whether the client opened with the TLS protocol
+/// header. Waits for the first 8 bytes; `false` on anything else (plain
+/// AMQP/SASL headers, or a raw TLS ClientHello).
+#[cfg(any(feature = "tls", feature = "fips"))]
+async fn opens_with_tls_header(stream: &TcpStream) -> std::io::Result<bool> {
+    let mut buf = [0u8; 8];
+    loop {
+        let n = stream.peek(&mut buf).await?;
+        if n == 0 {
+            return Ok(false);
+        }
+        if buf[..n] != TLS_PROTO_HEADER[..n] {
+            return Ok(false);
+        }
+        if n == buf.len() {
+            return Ok(true);
+        }
+        // A partial header so far: wait for the rest without spinning.
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+}
+
+/// Establish TLS on an accepted socket, both ways the spec allows: if the
+/// client sent the TLS protocol header, consume it and echo it, then run the
+/// handshake (fe2o3-amqp and other spec-default clients); otherwise run the
+/// handshake directly (RabbitMQ-style `amqps`: Qpid JMS/Proton, ramqp).
+#[cfg(any(feature = "tls", feature = "fips"))]
+async fn establish_tls(
+    mut stream: TcpStream,
+    acceptor: &tokio_rustls::TlsAcceptor,
+) -> std::io::Result<tokio_rustls::server::TlsStream<TcpStream>> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    if opens_with_tls_header(&stream).await? {
+        let mut header = [0u8; 8];
+        stream.read_exact(&mut header).await?;
+        stream.write_all(&TLS_PROTO_HEADER).await?;
+    }
+    acceptor.accept(stream).await
+}
+
 /// Accept on the TLS listener, or never (no TLS listener).
 async fn accept_tls(tls: Option<&TlsListener>) -> std::io::Result<(TcpStream, SocketAddr)> {
     match tls {
@@ -474,7 +546,7 @@ impl BoundBroker {
                                 continue;
                             };
                             let _ = stream.set_nodelay(true);
-                            self.spawn_connection(async move { Some(stream) }, peer, permit);
+                            self.spawn_plain_connection(stream, peer, permit);
                         }
                         // A per-accept error (fd exhaustion, a connection reset
                         // before accept, etc.) is transient — log it and keep
@@ -562,7 +634,7 @@ impl BoundBroker {
             .unwrap_or(std::time::Duration::from_secs(30));
         self.spawn_connection(
             async move {
-                match tokio::time::timeout(timeout, acceptor.accept(stream)).await {
+                match tokio::time::timeout(timeout, establish_tls(stream, &acceptor)).await {
                     Ok(Ok(tls)) => Some(tls),
                     Ok(Err(e)) => {
                         tracing::debug!(%peer, error = %e, "TLS handshake failed");
@@ -577,6 +649,60 @@ impl BoundBroker {
             peer,
             permit,
         );
+    }
+
+    /// Serve a connection from the plain listener. With a certificate
+    /// configured, a client that opens with the AMQP TLS protocol header is
+    /// upgraded to TLS in place (the spec's negotiated TLS on the plain
+    /// port); everyone else stays plain.
+    #[cfg(any(feature = "tls", feature = "fips"))]
+    fn spawn_plain_connection(
+        &self,
+        stream: TcpStream,
+        peer: SocketAddr,
+        permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    ) {
+        let Some(UpgradeAcceptor(acceptor)) = self.upgrade.clone() else {
+            self.spawn_connection(async move { Some(stream) }, peer, permit);
+            return;
+        };
+        let timeout = self
+            .broker
+            .config
+            .connection
+            .connect_timeout
+            .unwrap_or(std::time::Duration::from_secs(30));
+        self.spawn_connection(
+            async move {
+                let upgrade = tokio::time::timeout(timeout, opens_with_tls_header(&stream))
+                    .await
+                    .ok()?
+                    .ok()?;
+                if !upgrade {
+                    return Some(Box::new(stream) as Box<dyn IoStream>);
+                }
+                match tokio::time::timeout(timeout, establish_tls(stream, &acceptor)).await {
+                    Ok(Ok(tls)) => Some(Box::new(tls) as Box<dyn IoStream>),
+                    Ok(Err(e)) => {
+                        tracing::debug!(%peer, error = %e, "TLS upgrade failed");
+                        None
+                    }
+                    Err(_) => None,
+                }
+            },
+            peer,
+            permit,
+        );
+    }
+
+    #[cfg(not(any(feature = "tls", feature = "fips")))]
+    fn spawn_plain_connection(
+        &self,
+        stream: TcpStream,
+        peer: SocketAddr,
+        permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    ) {
+        self.spawn_connection(async move { Some(stream) }, peer, permit);
     }
 
     #[cfg(not(any(feature = "tls", feature = "fips")))]

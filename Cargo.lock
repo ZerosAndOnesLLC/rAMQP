@@ -720,21 +720,31 @@ version = "0.18.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b1866e0bb2dae6f9481296b2350270bc964d2d2473ca58dc9d1434af820f670c"
 dependencies = [
+ "base64",
  "bytes",
  "fe2o3-amqp-types",
  "futures-util",
  "getrandom 0.4.3",
+ "hmac",
  "parking_lot",
+ "pbkdf2",
  "pin-project-lite",
+ "rand 0.10.3",
+ "rustls",
  "serde",
  "serde_amqp",
  "serde_bytes",
+ "sha1",
+ "sha2",
  "slab",
+ "stringprep",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-rustls",
  "tokio-util",
  "url",
  "wasmtimer",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -1670,7 +1680,10 @@ dependencies = [
  "futures-util",
  "ramqp",
  "ramqp-broker",
+ "rcgen",
+ "rustls",
  "tokio",
+ "tokio-rustls",
  "tokio-tungstenite",
  "tracing-subscriber",
 ]

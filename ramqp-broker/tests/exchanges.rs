@@ -516,3 +516,82 @@ async fn dollar_queue_names_are_reserved() {
     conn.close().await.unwrap();
     shutdown.shutdown();
 }
+
+/// RabbitMQ compatibility: its clients send `vhost:/` for the default vhost
+/// — that is OUR default vhost (same queues as no vhost at all).
+#[tokio::test]
+async fn rabbitmq_default_vhost_name_maps_to_ours() {
+    let (_broker, addr, shutdown) = start(BrokerConfig::default()).await;
+    let mut config = ramqp::Config::default();
+    config.connection.hostname = Some("vhost:/".to_owned());
+    let conn = ConnectionBuilder::new(format!("amqp://{addr}"))
+        .config(config)
+        .connect()
+        .await
+        .expect("vhost:/ is accepted");
+    let s = conn.begin_session().await.unwrap();
+    let p = s.create_producer("/queues/shared").await.unwrap();
+    assert!(accepted(&p.send(Message::text("x")).await.unwrap()));
+    conn.close().await.unwrap();
+    // A plain connection (default vhost) sees the same queue.
+    let (conn, s) = session(addr).await;
+    let mut c = s.create_consumer("/queues/shared").await.unwrap();
+    expect_exactly(&mut c, &["x"]).await;
+    conn.close().await.unwrap();
+    shutdown.shutdown();
+}
+
+/// RabbitMQ compatibility: its client libraries open `/management` links at
+/// connect and send topology requests there. The broker accepts the links
+/// (so those clients connect and publish) and answers every request with a
+/// correlated `501` reply instead of letting it time out.
+#[tokio::test]
+async fn rabbitmq_management_requests_get_a_501_reply() {
+    use ramqp::codec::Value;
+    use ramqp::types::messaging::{Body, MessageId};
+    let (_broker, addr, shutdown) = start(BrokerConfig::default()).await;
+    let (conn, s) = session(addr).await;
+    let mut replies = s.create_consumer("/management").await.expect("reply link");
+    let requests = s
+        .create_producer("/management")
+        .await
+        .expect("request link");
+    let mut req = Message::text("{}");
+    req.properties = Some(Properties {
+        message_id: Some(MessageId::String("req-1".into())),
+        to: Some("/queues/orders".into()),
+        subject: Some("PUT".into()),
+        reply_to: Some("$me".into()),
+        ..Default::default()
+    });
+    requests.send(req).await.expect("request delivered");
+    let d = tokio::time::timeout(Duration::from_secs(5), replies.recv())
+        .await
+        .expect("a reply, not a timeout")
+        .expect("reply");
+    let msg = d.message().expect("decodable reply");
+    let props = msg.properties.expect("reply properties");
+    assert_eq!(
+        props.correlation_id,
+        Some(MessageId::String("req-1".into()))
+    );
+    assert_eq!(props.subject.as_deref(), Some("501"));
+    assert!(matches!(msg.body, Body::Value(Value::String(ref t)) if t.contains("admin API")));
+    // `/management` is not a queue: nothing was declared under that name.
+    assert!(
+        broker_has_no_queue_named(addr, "management").await,
+        "`/management` must not auto-declare a queue"
+    );
+    conn.close().await.unwrap();
+    shutdown.shutdown();
+}
+
+/// Nothing published to `/management` ever lands in a queue a consumer of
+/// `/queues/management` could read.
+async fn broker_has_no_queue_named(addr: std::net::SocketAddr, name: &str) -> bool {
+    let (conn, s) = session(addr).await;
+    let mut c = s.create_consumer(&format!("/queues/{name}")).await.unwrap();
+    let got = tokio::time::timeout(Duration::from_millis(300), c.recv()).await;
+    conn.close().await.unwrap();
+    got.is_err()
+}

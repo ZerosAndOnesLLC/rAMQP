@@ -140,6 +140,9 @@ async fn handshake<S: IoStream>(
         .hostname
         .as_deref()
         .and_then(|h| h.strip_prefix("vhost:"))
+        // RabbitMQ's default vhost is named `/`, and its clients send
+        // `vhost:/` when none is configured: that is our default vhost.
+        .map(|v| if v == "/" { "" } else { v })
         .unwrap_or("")
         .to_owned();
     if vhost.contains('/') || vhost.chars().any(char::is_control) {
@@ -410,6 +413,13 @@ enum Binding {
     },
     /// Peer sender → the transaction coordinator (declare/discharge).
     Coordinator,
+    /// Peer sender → RabbitMQ's `/management` node. RabbitMQ's own AMQP 1.0
+    /// client libraries open this (and [`Binding::ManagementReplies`]) at
+    /// connect; each topology request is answered with a `501` reply
+    /// pointing at the config file / admin API.
+    ManagementRequests,
+    /// Peer receiver ← the `/management` node: where `501` replies go.
+    ManagementReplies,
     /// Peer receiver → our sender → subscribed to `queue` as `sub`.
     Consumer {
         queue: QueueHandle,
@@ -440,6 +450,11 @@ struct ExchangeRoute {
     /// Keyless: destinations per routing key (bounded; cleared on change).
     by_key: HashMap<String, Arc<[QueueHandle]>>,
 }
+
+/// Why a RabbitMQ `/management` request is rejected.
+const MANAGEMENT_UNSUPPORTED: &str = "RabbitMQ's AMQP management protocol is not supported: \
+     declare queues, exchanges and bindings in the ramqp-brokerd config file or through its \
+     admin API";
 
 /// Bound on a keyless route's per-key cache (cleared when exceeded).
 const ROUTE_CACHE_MAX: usize = 1024;
@@ -1446,6 +1461,14 @@ impl<S: IoStream> BrokerConnection<S> {
             },
             Role::Receiver => attach.source.as_ref().and_then(|s| s.address.clone()),
         };
+        // RabbitMQ's `/management` node exposes nothing (every request is
+        // rejected), so it needs no grant — RabbitMQ client libraries open
+        // it at connect, whatever the user's permissions.
+        if address.as_deref() == Some("/management") {
+            self.accept_management_attach(local, remote_channel, attach)
+                .await;
+            return;
+        }
         // Authorize before resolving (an unauthorized attach must not even
         // auto-declare the queue).
         let operation = match attach.role {
@@ -1574,6 +1597,101 @@ impl<S: IoStream> BrokerConnection<S> {
         };
         self.bindings.insert((local, accepted.handle.0), binding);
         tracing::debug!(handle = accepted.handle.0, role = ?accepted.role, "link bound");
+    }
+
+    /// Answer one RabbitMQ management request with a `501` reply on the
+    /// session's `/management` reply link (correlated by the request's
+    /// message-id, status code in `subject`, explanation as the body) — so a
+    /// RabbitMQ client fails fast with a clear error instead of timing out.
+    fn answer_management_request(
+        &mut self,
+        channel: u16,
+        handle: u32,
+        d: ramqp_core::proto::IncomingDelivery,
+    ) {
+        use ramqp_core::codec::{Decode, Encode, Value};
+        use ramqp_core::types::messaging::{Body, Message, Properties};
+        let Some(session) = self.sessions.get_mut(&channel) else {
+            return;
+        };
+        if !d.settled {
+            session.send_disposition(
+                handle,
+                d.delivery_id,
+                None,
+                DeliveryState::Accepted(Accepted::default()),
+                true,
+                &mut self.transport,
+            );
+        }
+        session.grant_credit(handle, 1, &mut self.transport);
+        let request_id = Message::decode(&mut d.message.clone())
+            .ok()
+            .and_then(|m| m.properties)
+            .and_then(|p| p.message_id);
+        let reply_link = self.bindings.iter().find_map(|((ch, h), b)| {
+            (*ch == channel && matches!(b, Binding::ManagementReplies)).then_some(*h)
+        });
+        let (Some(request_id), Some(reply_link)) = (request_id, reply_link) else {
+            return;
+        };
+        let reply = Message {
+            properties: Some(Properties {
+                correlation_id: Some(request_id),
+                subject: Some("501".to_owned()),
+                ..Default::default()
+            }),
+            body: Body::Value(Value::String(MANAGEMENT_UNSUPPORTED.to_owned())),
+            ..Default::default()
+        };
+        let mut buf = bytes::BytesMut::new();
+        reply.encode(&mut buf);
+        session.send_transfer(
+            reply_link,
+            buf.freeze(),
+            true,
+            0,
+            None,
+            None,
+            &mut self.transport,
+            self.max_frame_size,
+        );
+    }
+
+    /// Accept a link on RabbitMQ's `/management` node (see
+    /// [`Binding::Management`]). Accepting — rather than refusing — keeps
+    /// RabbitMQ's client libraries able to connect, publish, and consume.
+    async fn accept_management_attach(&mut self, local: u16, remote_channel: u16, attach: Attach) {
+        let session = self.sessions.get_mut(&local).expect("bound channel");
+        let credit = match attach.role {
+            Role::Sender => 1,
+            Role::Receiver => 0,
+        };
+        match session.accept_peer_attach(
+            attach,
+            CreditMode::Manual,
+            credit,
+            self.config.max_message_size,
+            self.link_events_tx.clone(),
+            &mut self.transport,
+        ) {
+            Ok(a) => {
+                let binding = match a.role {
+                    // `a.role` is OUR role: we receive the peer's requests.
+                    Role::Receiver => Binding::ManagementRequests,
+                    Role::Sender => Binding::ManagementReplies,
+                };
+                self.bindings.insert((local, a.handle.0), binding);
+            }
+            Err(e) => {
+                self.end_session_with_error(
+                    local,
+                    remote_channel,
+                    AmqpError::new(AmqpCondition::ResourceLimitExceeded, Some(e.to_string())),
+                )
+                .await;
+            }
+        }
     }
 
     /// Accept a producer attach to an exchange (`/exchanges/<name>[/<key>]`).
@@ -1852,6 +1970,10 @@ impl<S: IoStream> BrokerConnection<S> {
                     {
                         Some(Binding::Producer { queue, epoch, .. }) => {
                             (queue.tx.clone(), queue.name.clone(), *epoch)
+                        }
+                        Some(Binding::ManagementRequests) => {
+                            self.answer_management_request(channel, handle, d);
+                            continue;
                         }
                         Some(Binding::Coordinator) => {
                             // The client pipelines transactional dispositions
