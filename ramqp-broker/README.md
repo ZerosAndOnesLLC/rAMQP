@@ -180,6 +180,30 @@ and a peer's certificate must also name one of the seed hosts (DNS or IP
 SAN), so a stray certificate from the same CA is still refused. Flags:
 `--tls-listen`, `--tls-cert`, `--tls-key`, `--tls-client-ca`.
 
+### Other clients
+
+The broker speaks plain AMQP 1.0, and its release gate runs independent
+client stacks against it with logins, exchanges and TLS: Qpid JMS (Java),
+Qpid Proton (Python/C), rhea (Node.js), Azure go-amqp (Go), fe2o3-amqp (Rust)
+and RabbitMQ's own AMQP 1.0 client (see `tests/interop/`). Points worth
+knowing when moving clients over:
+
+- **Addresses** are RabbitMQ 4.x's: `/queues/<name>`, `/exchanges/<name>/<key>`.
+  Quorum and durable queues are `/quorum/<name>` and `/durable/<name>`.
+- **SASL**: PLAIN works for every user (checked against the stored verifier);
+  a SCRAM mechanism is offered only when every user has a verifier for it, so
+  clients that pick the strongest offered never lock a user out. Users created
+  from a password get SHA-256 and SHA-512 verifiers.
+- **TLS**: both ways the spec allows — TLS from the first byte (RabbitMQ-style
+  `amqps`) and the negotiated `AMQP 2.1.0.0` header (fe2o3-amqp and other
+  spec-default clients), the latter also as an in-place upgrade on the plain
+  port when a certificate is configured.
+- **RabbitMQ clients** (`rabbitmq-amqp-*-client`): `vhost:/` is the default
+  vhost; connecting, publishing (exchange and queue addresses) and consuming
+  work. Their topology management (`DeclareQueue`, `Bind`, …) goes over a
+  RabbitMQ-specific `/management` protocol and is answered with `501` — declare
+  topology in the config file or through the admin API instead.
+
 ### Management API
 
 With `management_listen` set, one small HTTP/1.1 endpoint serves metrics,

@@ -50,3 +50,12 @@ path = "src/bin/confirm.rs"
 [[bin]]
 name = "latency"
 path = "src/bin/latency.rs"
+
+# The fe2o3 feature-interop leg (tests/fe2o3_features.rs): SCRAM + TLS on the
+# client, TLS on the broker, a throwaway CA.
+[dev-dependencies]
+fe2o3-amqp = { version = "0.18", features = ["scram", "rustls"] }
+ramqp-broker = { path = "../ramqp-broker", features = ["tls"] }
+rcgen = "0.14"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }

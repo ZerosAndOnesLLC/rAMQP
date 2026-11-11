@@ -462,6 +462,16 @@ pub fn format_scram_verifier(mechanism: ScramMechanism, verifier: &ScramVerifier
     )
 }
 
+/// The verifiers stored for a user known by password: SCRAM-SHA-256 and
+/// SCRAM-SHA-512, so whichever of the two a client prefers works. `None` if
+/// SASLprep rejects the password.
+pub fn password_verifiers(password: &str) -> Option<Vec<(ScramMechanism, ScramVerifier)>> {
+    [ScramMechanism::Sha256, ScramMechanism::Sha512]
+        .into_iter()
+        .map(|m| derive_scram_verifier(m, password, StaticScram::ITERATIONS).map(|v| (m, v)))
+        .collect()
+}
+
 /// Derive a fresh SCRAM verifier (random 16-byte salt) from a password.
 /// `None` if SASLprep rejects the password.
 pub fn derive_scram_verifier(
@@ -513,10 +523,16 @@ impl StaticUsers {
     }
 
     fn recompute_mechs(&mut self) {
+        // A SCRAM mechanism is offered only if EVERY user can complete it:
+        // clients pick the strongest mechanism offered (Qpid JMS, Proton),
+        // so offering one that some user lacks locks that user out. PLAIN
+        // (checked against any verifier) still works for everyone.
         let has = |m: ScramMechanism| {
-            self.users
-                .values()
-                .any(|vs| vs.iter().any(|(vm, _)| *vm == m))
+            !self.users.is_empty()
+                && self
+                    .users
+                    .values()
+                    .all(|vs| vs.iter().any(|(vm, _)| *vm == m))
         };
         let mut mechs = Vec::new();
         // Strongest first: clients pick the first mutually supported one.
@@ -563,10 +579,14 @@ impl StaticUsers {
     /// immediately (the password is not kept). Panics on a password
     /// SASLprep prohibits.
     pub fn with_password(self, username: impl Into<String>, password: &str) -> Self {
-        let verifier =
-            derive_scram_verifier(ScramMechanism::Sha256, password, StaticScram::ITERATIONS)
-                .expect("password must survive SASLprep");
-        self.with_verifier(username, ScramMechanism::Sha256, verifier)
+        let username = username.into();
+        let mut users = self;
+        for (mechanism, verifier) in
+            password_verifiers(password).expect("password must survive SASLprep")
+        {
+            users = users.with_verifier(username.clone(), mechanism, verifier);
+        }
+        users
     }
 
     /// Mark `username` as a management-API administrator.
@@ -785,7 +805,10 @@ mod tests {
             passwd: "s3cret"
         }));
         assert!(!users.verify(Credentials::Anonymous));
-        assert_eq!(users.mechanisms(), &["SCRAM-SHA-256", "PLAIN"]);
+        assert_eq!(
+            users.mechanisms(),
+            &["SCRAM-SHA-512", "SCRAM-SHA-256", "PLAIN"]
+        );
         let no_plain = StaticUsers::new()
             .with_password("alice", "s3cret")
             .allow_plain(false);
@@ -793,7 +816,7 @@ mod tests {
             authcid: "alice",
             passwd: "s3cret"
         }));
-        assert_eq!(no_plain.mechanisms(), &["SCRAM-SHA-256"]);
+        assert_eq!(no_plain.mechanisms(), &["SCRAM-SHA-512", "SCRAM-SHA-256"]);
         assert!(
             no_plain
                 .scram_verifier(ScramMechanism::Sha256, "alice")
@@ -801,9 +824,33 @@ mod tests {
         );
         assert!(
             no_plain
-                .scram_verifier(ScramMechanism::Sha512, "alice")
+                .scram_verifier(ScramMechanism::Sha1, "alice")
                 .is_none()
         );
+    }
+
+    /// A SCRAM mechanism is advertised only when every user can complete
+    /// it — clients pick the strongest offered, so offering SHA-512 while
+    /// one user only has a SHA-256 verifier would lock that user out.
+    #[test]
+    fn only_mechanisms_every_user_has_are_offered() {
+        let only256 = derive_scram_verifier(ScramMechanism::Sha256, "pw", 4096).unwrap();
+        let users = StaticUsers::new()
+            .with_password("both", "pw")
+            .with_verifier("only256", ScramMechanism::Sha256, only256);
+        assert_eq!(users.mechanisms(), &["SCRAM-SHA-256", "PLAIN"]);
+        let none_shared = StaticUsers::new()
+            .with_verifier(
+                "a",
+                ScramMechanism::Sha1,
+                derive_scram_verifier(ScramMechanism::Sha1, "pw", 4096).unwrap(),
+            )
+            .with_verifier(
+                "b",
+                ScramMechanism::Sha512,
+                derive_scram_verifier(ScramMechanism::Sha512, "pw", 4096).unwrap(),
+            );
+        assert_eq!(none_shared.mechanisms(), &["PLAIN"]);
     }
 
     #[test]
@@ -843,7 +890,10 @@ mod tests {
         assert!(a(Some("svc"), "", "$coordinator", Operation::Send));
         assert!(!a(None, "tenant", "$coordinator", Operation::Send));
         assert!(users.verify(Credentials::Anonymous));
-        assert_eq!(users.mechanisms(), &["SCRAM-SHA-256", "PLAIN", "ANONYMOUS"]);
+        assert_eq!(
+            users.mechanisms(),
+            &["SCRAM-SHA-512", "SCRAM-SHA-256", "PLAIN", "ANONYMOUS"]
+        );
     }
 
     #[test]

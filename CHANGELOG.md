@@ -73,6 +73,21 @@ session-window fix below). Breaking daemon/feature changes are listed under
   `SIGTERM`.
 - `Broker::declare_queue` and `BoundBroker::broker`.
 
+### Client interoperability (before release)
+- **Feature interop matrix** in the release gate: Qpid JMS, Qpid Proton,
+  rhea, Azure go-amqp and RabbitMQ's own AMQP 1.0 Go client against a broker
+  with logins, exchanges and TLS; fe2o3-amqp covers the same in-process.
+- SCRAM mechanisms are offered only when every user has a verifier for them
+  (strongest-first clients such as Qpid JMS could otherwise lock a user out);
+  password users get SCRAM-SHA-256 and SCRAM-SHA-512 verifiers.
+- TLS: the spec's negotiated `AMQP 2.1.0.0` header is accepted on the amqps
+  listener and as an upgrade on the plain listener (fe2o3-amqp's default).
+- RabbitMQ clients: `vhost:/` maps to the default vhost; `/management` links
+  are accepted and every request gets a correlated `501` reply (declare via
+  the config file or admin API) instead of a timeout.
+- `ramqp-core`: a link we detach or refuse keeps its handle until the peer's
+  answering detach (AMQP 1.0 §2.6), instead of reusing it at once.
+
 ### Fixed (review of the issue #37 work, before release)
 - Exchange publishes whose destination queue cannot be resolved are now
   **rejected** (nothing published, nothing cached) instead of accepted while

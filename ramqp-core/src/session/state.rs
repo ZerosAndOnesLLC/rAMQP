@@ -82,6 +82,11 @@ pub struct Session {
     handles: HandleAllocator,
     remote_handles: RemoteHandleMap,
     links: HashMap<u32, Link>,
+    /// Local handles of links WE detached (or refused) whose peer detach has
+    /// not arrived yet. AMQP 1.0 §2.6: a handle stays in use until both
+    /// sides have detached, so these are neither reused nor unmapped until
+    /// the peer's answering detach (which we then do not answer again).
+    half_closed: std::collections::HashSet<u32>,
     /// Index of (link name, our local role) -> local handle, so a peer `attach`
     /// response binds in O(1) instead of scanning every link. Keyed by role as
     /// well as name because AMQP 1.0 §2.6.1 identifies a link by container-id +
@@ -132,6 +137,7 @@ impl Session {
             handles: HandleAllocator::new(begin.handle_max),
             remote_handles: RemoteHandleMap::default(),
             links: HashMap::new(),
+            half_closed: std::collections::HashSet::new(),
             link_handles: HashMap::new(),
             events,
             pending_begin: Some(pending_begin),
@@ -201,6 +207,7 @@ impl Session {
             handles: HandleAllocator::new(handle_max),
             remote_handles: RemoteHandleMap::default(),
             links: HashMap::new(),
+            half_closed: std::collections::HashSet::new(),
             link_handles: HashMap::new(),
             events,
             pending_begin: None,
@@ -541,8 +548,12 @@ impl Session {
             }),
             None,
         );
+        // Keep the handle (and the peer's mapping) until the peer answers
+        // with its own detach — reusing it earlier lets the next link's
+        // attach collide with the refused one on the peer's side.
         if handle.is_some() {
-            self.handles.release(local);
+            self.remote_handles.bind(attach.handle, local);
+            self.half_closed.insert(local);
         }
     }
 
@@ -823,6 +834,12 @@ impl Session {
     /// handle. Centralized so `link_handles` can never drift out of sync with
     /// `links` across the (three) detach paths.
     fn forget_link(&mut self, local: u32) {
+        self.forget_link_keep_handle(local);
+        self.handles.release(local);
+    }
+
+    /// Drop a link's state but keep its handle allocated (half-closed).
+    fn forget_link_keep_handle(&mut self, local: u32) {
         if let Some(link) = self.links.remove(&local) {
             let key = match &link {
                 Link::Sender(s) => (s.name.clone(), Role::Sender),
@@ -830,7 +847,6 @@ impl Session {
             };
             self.link_handles.remove(&key);
         }
-        self.handles.release(local);
     }
 
     /// Detach a link with a peer-facing error and notify the user handle.
@@ -1098,10 +1114,15 @@ impl Session {
                 }),
                 None,
             );
-            if let Some(r) = remote {
-                self.remote_handles.unbind(r);
+            match remote {
+                // Attached both ways: the handle stays reserved (and the
+                // peer's mapping kept) until the peer's answering detach.
+                Some(_) => {
+                    self.forget_link_keep_handle(handle);
+                    self.half_closed.insert(handle);
+                }
+                None => self.forget_link(handle),
             }
-            self.forget_link(handle);
         }
         let _ = reply.send(Ok(()));
     }
@@ -1115,6 +1136,13 @@ impl Session {
         let Some(local) = self.remote_handles.resolve(detach.handle) else {
             return;
         };
+        // The answer to a detach we sent (or to a refusal): both sides are
+        // now detached — release the handle, and do not answer again.
+        if self.half_closed.remove(&local) {
+            self.remote_handles.unbind(detach.handle);
+            self.handles.release(local);
+            return;
+        }
         let events = self.links.get(&local).map(|l| l.events().clone());
         if let Some(events) = events {
             let _ = events.try_send(LinkEvent::Detached {
@@ -1311,6 +1339,51 @@ mod tests {
         assert_eq!(response.outgoing_window, 16);
         assert_eq!(response.handle_max, 64);
         assert_eq!(response.next_outgoing_id, 0);
+    }
+
+    /// AMQP 1.0 §2.6: a refused link's handle stays reserved until the peer
+    /// answers with its detach — then it is released, and not answered again.
+    #[tokio::test]
+    async fn refused_link_handle_is_held_until_the_peer_detaches() {
+        let (mut session, _resp, _evt, mut transport, _far) = server_session(&peer_begin());
+        let attach = Attach {
+            name: "refused".into(),
+            handle: 9,
+            role: Role::Sender,
+            ..Default::default()
+        };
+        session.refuse_peer_attach(
+            &attach,
+            AmqpError::new(crate::types::definitions::AmqpError::NotFound, None),
+            &mut transport,
+        );
+        let held = session
+            .remote_handles
+            .resolve(9)
+            .expect("peer handle still mapped");
+        assert!(session.half_closed.contains(&held));
+        // Not reusable yet: the next allocation picks another handle.
+        let next = session.handles.allocate().unwrap();
+        assert_ne!(next, held);
+        session.handles.release(next);
+        // The peer's answering detach releases it (and is not answered).
+        let queued = transport.pending_bytes();
+        session.on_peer_detach(
+            Detach {
+                handle: 9,
+                closed: true,
+                error: None,
+            },
+            &mut transport,
+        );
+        assert!(!session.half_closed.contains(&held));
+        assert_eq!(session.remote_handles.resolve(9), None);
+        assert_eq!(session.handles.allocate(), Some(held), "released for reuse");
+        assert_eq!(
+            transport.pending_bytes(),
+            queued,
+            "no second detach was queued"
+        );
     }
 
     /// A transfer for a link we no longer have (pipelined behind our

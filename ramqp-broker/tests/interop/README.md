@@ -5,6 +5,34 @@ its wire behavior isn't accidentally tailored to our own `ramqp` client. This
 is the "external toolchain" half of broker.md Phase 10; the Rust `fe2o3-amqp`
 leg lives in [`bench-compare/tests/fe2o3_interop.rs`](../../../bench-compare/tests/fe2o3_interop.rs).
 
+## Feature matrix (logins, exchanges, TLS)
+
+`matrix/run.sh` starts one fixture broker the way a RabbitMQ 4.x replacement
+runs — users (one from a password, one with only a SCRAM-SHA-256 verifier),
+a topic exchange with bindings, plain + `amqps` listeners with a throwaway
+CA — and runs every client leg against it (release gate: `interop-matrix`):
+
+| Leg | Client | Scenarios |
+|---|---|---|
+| `jms` | Apache Qpid JMS 2.x (Java) | PLAIN, SCRAM (client-chosen and forced SHA-256), bad password, exchange by address key and by subject (`JMSType`), unknown exchange, amqps |
+| `proton` | Apache Qpid Proton (Python/C) | PLAIN, bad password, exchange by address key and subject, unknown exchange, amqps |
+| `rhea` | rhea 3.x (Node.js) | same as proton |
+| `goamqp` | Azure go-amqp 1.x (Go) | same as proton |
+| `rabbitmq-go` | RabbitMQ's own AMQP 1.0 Go client | connect, publish via `ExchangeAddress` and `QueueAddress`, consume, amqps; its topology management gets a `501` |
+| fe2o3 | fe2o3-amqp (Rust, in-process: `bench-compare/tests/fe2o3_features.rs`) | PLAIN, SCRAM-SHA-256/512, bad password, anonymous refused, exchanges, amqps (spec TLS negotiation) |
+
+```sh
+ramqp-broker/tests/interop/matrix/run.sh            # all legs
+ramqp-broker/tests/interop/matrix/run.sh jms rhea   # some
+```
+
+Findings it drove (fixed in the broker): clients that pick the strongest
+SCRAM mechanism offered (Qpid JMS) need every offered mechanism to work for
+every user; spec-default TLS (fe2o3) sends the `AMQP 2.1.0.0` TLS header
+before the handshake; RabbitMQ clients send `vhost:/` and open `/management`
+links at connect. Known client issue: fe2o3-amqp 0.18 fails the next attach
+on a session right after a refused attach (reproduces against RabbitMQ too).
+
 ## Legs
 
 | Leg | Client stack | Direction | Where | Status |

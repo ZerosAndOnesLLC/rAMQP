@@ -214,6 +214,36 @@ jobs:
       - name: Qpid Proton interop
         run: ramqp-broker/tests/interop/proton/run.sh
 
+  # Feature interop matrix: independent client stacks against a broker set up
+  # the way a RabbitMQ 4.x replacement runs — user logins (PLAIN + SCRAM),
+  # RabbitMQ 4.x exchange addresses, amqps. Legs: Qpid JMS (Java), Qpid
+  # Proton (Python/C), rhea (Node.js), Azure go-amqp (Go), and RabbitMQ's own
+  # AMQP 1.0 Go client. (fe2o3-amqp's leg runs in the Test job.)
+  interop-matrix:
+    name: Interop matrix (5 client stacks)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.TAG }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: ramqp-broker/tests/interop/goamqp/go.mod
+      - name: Install python3-qpid-proton
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq python3-qpid-proton
+      - name: Feature interop matrix
+        run: ramqp-broker/tests/interop/matrix/run.sh
+
   # Process-level split-brain: a 3-node quorum cluster across Linux network
   # namespaces, iptables-partitioned into majority/minority, asserting the
   # majority stays available, the minority refuses (never silently accepts),
@@ -241,6 +271,7 @@ jobs:
       - interop-ramqp-broker
       - interop-jms
       - interop-proton
+      - interop-matrix
       - partition
     runs-on: ubuntu-latest
     timeout-minutes: 30
