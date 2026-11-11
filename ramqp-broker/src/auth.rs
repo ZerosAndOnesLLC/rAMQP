@@ -268,9 +268,507 @@ impl Authenticator for StaticScram {
     }
 }
 
+/// The identity anonymous connections are matched as in
+/// [`Permission::user`] (a configured user may not take this name).
+pub const ANONYMOUS_USER: &str = "anonymous";
+
+/// One access grant for [`StaticUsers`]: `user` may perform the allowed
+/// operations on addresses matching `address` within `vhost`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Permission {
+    /// The username, [`ANONYMOUS_USER`] for anonymous connections, or `*`
+    /// for everyone (anonymous included).
+    pub user: String,
+    /// The vhost (empty = the default vhost), or `*` for every vhost.
+    pub vhost: String,
+    /// An address glob matched against the full attach address
+    /// (`/queues/orders`, `/exchanges/events/order.created`, ...): `*`
+    /// matches any run of characters (including `/`), `?` exactly one.
+    pub address: String,
+    /// May publish (producer attach).
+    pub send: bool,
+    /// May consume (consumer attach).
+    pub receive: bool,
+}
+
+impl Permission {
+    /// A grant of `send`/`receive` on `address` in `vhost` to `user`.
+    pub fn new(
+        user: impl Into<String>,
+        vhost: impl Into<String>,
+        address: impl Into<String>,
+        send: bool,
+        receive: bool,
+    ) -> Self {
+        Permission {
+            user: user.into(),
+            vhost: vhost.into(),
+            address: address.into(),
+            send,
+            receive,
+        }
+    }
+
+    fn matches_principal(&self, user: &str, vhost: &str) -> bool {
+        (self.user == "*" || self.user == user) && (self.vhost == "*" || self.vhost == vhost)
+    }
+
+    fn allows(&self, operation: Operation) -> bool {
+        match operation {
+            Operation::Send => self.send,
+            Operation::Receive => self.receive,
+        }
+    }
+}
+
+/// Glob match: `*` = any run of characters (including none), `?` = exactly
+/// one character; everything else literal. Iterative with single-star
+/// backtracking — linear in practice, no recursion blow-up.
+pub(crate) fn glob_match(pattern: &str, text: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let mut star: Option<(usize, usize)> = None;
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some((pi, ti));
+            pi += 1;
+        } else if let Some((sp, st)) = star {
+            pi = sp + 1;
+            ti = st + 1;
+            star = Some((sp, st + 1));
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+/// Parse an RFC 5803 SCRAM verifier string:
+/// `SCRAM-SHA-256$<iterations>:<base64 salt>$<base64 StoredKey>:<base64 ServerKey>`
+/// (`SCRAM-SHA-1` / `SCRAM-SHA-512` likewise). The same format PostgreSQL
+/// stores; produce one with `ramqp-brokerd hash-password`.
+pub fn parse_scram_verifier(s: &str) -> Result<(ScramMechanism, ScramVerifier), String> {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
+    let s = s.trim();
+    let (mech, rest) = s
+        .split_once('$')
+        .ok_or("expected <mechanism>$<iterations>:<salt>$<stored-key>:<server-key>")?;
+    let mechanism = match mech.to_ascii_uppercase().as_str() {
+        "SCRAM-SHA-1" => ScramMechanism::Sha1,
+        "SCRAM-SHA-256" => ScramMechanism::Sha256,
+        "SCRAM-SHA-512" => ScramMechanism::Sha512,
+        other => return Err(format!("unknown SCRAM mechanism {other:?}")),
+    };
+    let (params, keys) = rest
+        .split_once('$')
+        .ok_or("missing `$<stored-key>:<server-key>`")?;
+    let (iterations, salt) = params
+        .split_once(':')
+        .ok_or("missing `<iterations>:<salt>`")?;
+    let (stored, server) = keys
+        .split_once(':')
+        .ok_or("missing `<stored-key>:<server-key>`")?;
+    let iterations: u32 = iterations
+        .parse()
+        .map_err(|_| format!("bad iteration count {iterations:?}"))?;
+    if iterations < 4096 {
+        return Err(format!(
+            "iteration count {iterations} is below the RFC 7677 minimum of 4096"
+        ));
+    }
+    let decode = |what: &str, v: &str| {
+        STANDARD
+            .decode(v)
+            .map_err(|e| format!("bad base64 in {what}: {e}"))
+    };
+    let salt = decode("salt", salt)?;
+    let stored_key = decode("stored key", stored)?;
+    let server_key = decode("server key", server)?;
+    let want = mechanism.h(b"").len();
+    if stored_key.len() != want || server_key.len() != want {
+        return Err(format!(
+            "{} keys must be {want} bytes (got {} / {})",
+            mechanism.name(),
+            stored_key.len(),
+            server_key.len()
+        ));
+    }
+    if salt.len() < 8 {
+        return Err("salt must be at least 8 bytes".to_owned());
+    }
+    Ok((
+        mechanism,
+        ScramVerifier {
+            salt,
+            iterations,
+            stored_key,
+            server_key,
+        },
+    ))
+}
+
+/// Format a verifier as an RFC 5803 string (inverse of
+/// [`parse_scram_verifier`]).
+pub fn format_scram_verifier(mechanism: ScramMechanism, verifier: &ScramVerifier) -> String {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
+    format!(
+        "{}${}:{}${}:{}",
+        mechanism.name(),
+        verifier.iterations,
+        STANDARD.encode(&verifier.salt),
+        STANDARD.encode(&verifier.stored_key),
+        STANDARD.encode(&verifier.server_key),
+    )
+}
+
+/// Derive a fresh SCRAM verifier (random 16-byte salt) from a password.
+/// `None` if SASLprep rejects the password.
+pub fn derive_scram_verifier(
+    mechanism: ScramMechanism,
+    password: &str,
+    iterations: u32,
+) -> Option<ScramVerifier> {
+    let salt = ramqp_core::sasl::scram::gen_nonce().into_bytes();
+    ScramVerifier::derive(mechanism, password, &salt[..16], iterations)
+}
+
+/// The production authenticator behind the daemon's config file: users held
+/// as **SCRAM verifiers only** (salted + iterated, never plaintext), with
+/// per-user × vhost × address-glob × operation [`Permission`]s.
+///
+/// - **SCRAM-SHA-1/256/512** is offered for each mechanism some user has a
+///   verifier for.
+/// - **PLAIN** (when enabled) is checked against the same verifier: the
+///   presented password is run through the verifier's PBKDF2 and compared to
+///   the StoredKey — so PLAIN-only clients work with no plaintext at rest.
+///   PLAIN sends the password in the clear; pair it with TLS off-host.
+/// - **ANONYMOUS** only when explicitly allowed; anonymous connections match
+///   permissions for [`ANONYMOUS_USER`] (or `*`).
+///
+/// Authorization is deny-by-default: an attach is allowed only when some
+/// permission matches the identity, vhost, address, and operation. The
+/// transaction coordinator (`$coordinator`) is allowed to anyone holding a
+/// `send` permission in the vhost.
+#[derive(Debug, Default)]
+pub struct StaticUsers {
+    /// username → verifiers (one per mechanism).
+    users: HashMap<String, Vec<(ScramMechanism, ScramVerifier)>>,
+    admins: std::collections::HashSet<String>,
+    permissions: Vec<Permission>,
+    allow_plain: bool,
+    allow_anonymous: bool,
+    mechs: Vec<&'static str>,
+}
+
+impl StaticUsers {
+    /// An empty directory: PLAIN enabled, anonymous refused.
+    pub fn new() -> Self {
+        let mut s = StaticUsers {
+            allow_plain: true,
+            ..Default::default()
+        };
+        s.recompute_mechs();
+        s
+    }
+
+    fn recompute_mechs(&mut self) {
+        let has = |m: ScramMechanism| {
+            self.users
+                .values()
+                .any(|vs| vs.iter().any(|(vm, _)| *vm == m))
+        };
+        let mut mechs = Vec::new();
+        // Strongest first: clients pick the first mutually supported one.
+        for m in [
+            ScramMechanism::Sha512,
+            ScramMechanism::Sha256,
+            ScramMechanism::Sha1,
+        ] {
+            if has(m) {
+                mechs.push(m.name());
+            }
+        }
+        if self.allow_plain && !self.users.is_empty() {
+            mechs.push("PLAIN");
+        }
+        if self.allow_anonymous {
+            mechs.push("ANONYMOUS");
+        }
+        self.mechs = mechs;
+    }
+
+    /// Add (or extend) a user with a stored verifier (builder-style).
+    /// Panics if `username` is [`ANONYMOUS_USER`] (reserved) — config
+    /// loading validates this first.
+    pub fn with_verifier(
+        mut self,
+        username: impl Into<String>,
+        mechanism: ScramMechanism,
+        verifier: ScramVerifier,
+    ) -> Self {
+        let username = username.into();
+        assert_ne!(
+            username, ANONYMOUS_USER,
+            "`anonymous` is a reserved user name"
+        );
+        let entry = self.users.entry(username).or_default();
+        entry.retain(|(m, _)| *m != mechanism);
+        entry.push((mechanism, verifier));
+        self.recompute_mechs();
+        self
+    }
+
+    /// Add a user from a password, derived into a SCRAM-SHA-256 verifier
+    /// immediately (the password is not kept). Panics on a password
+    /// SASLprep prohibits.
+    pub fn with_password(self, username: impl Into<String>, password: &str) -> Self {
+        let verifier =
+            derive_scram_verifier(ScramMechanism::Sha256, password, StaticScram::ITERATIONS)
+                .expect("password must survive SASLprep");
+        self.with_verifier(username, ScramMechanism::Sha256, verifier)
+    }
+
+    /// Mark `username` as a management-API administrator.
+    pub fn with_admin(mut self, username: impl Into<String>) -> Self {
+        self.admins.insert(username.into());
+        self
+    }
+
+    /// Add a permission grant.
+    pub fn with_permission(mut self, permission: Permission) -> Self {
+        self.permissions.push(permission);
+        self
+    }
+
+    /// Offer PLAIN (checked against the SCRAM verifier). Default `true`.
+    pub fn allow_plain(mut self, allow: bool) -> Self {
+        self.allow_plain = allow;
+        self.recompute_mechs();
+        self
+    }
+
+    /// Offer ANONYMOUS (and accept bare-AMQP connections). Default `false`.
+    pub fn allow_anonymous(mut self, allow: bool) -> Self {
+        self.allow_anonymous = allow;
+        self.recompute_mechs();
+        self
+    }
+
+    /// Number of configured users.
+    pub fn user_count(&self) -> usize {
+        self.users.len()
+    }
+
+    /// Whether `username` is an administrator.
+    pub fn is_admin(&self, username: &str) -> bool {
+        self.admins.contains(username)
+    }
+
+    /// Check a username/password pair against the stored verifier (the
+    /// PLAIN path; also used for management-API Basic auth). Runs the
+    /// PBKDF2 even for unknown users so timing doesn't reveal existence.
+    pub fn check_password(&self, username: &str, password: &str) -> bool {
+        use std::sync::OnceLock;
+        static DECOY: OnceLock<ScramVerifier> = OnceLock::new();
+        let found = self.users.get(username).and_then(|vs| {
+            vs.iter()
+                .find(|(m, _)| *m == ScramMechanism::Sha256)
+                .or_else(|| vs.first())
+        });
+        let (mechanism, verifier) = match found {
+            Some((m, v)) => (*m, v),
+            None => (
+                ScramMechanism::Sha256,
+                DECOY.get_or_init(|| {
+                    derive_scram_verifier(
+                        ScramMechanism::Sha256,
+                        "decoy-password-never-matches",
+                        StaticScram::ITERATIONS,
+                    )
+                    .expect("decoy derives")
+                }),
+            ),
+        };
+        let Some(prepared) = ramqp_core::sasl::scram::saslprep(password) else {
+            return false;
+        };
+        let salted = mechanism.pbkdf2(prepared.as_bytes(), &verifier.salt, verifier.iterations);
+        let client_key = mechanism.hmac(&salted, b"Client Key");
+        let stored = mechanism.h(&client_key);
+        let ok = ct_bytes_eq(&stored, &verifier.stored_key);
+        found.is_some() && ok
+    }
+}
+
+/// Constant-time byte comparison (lengths are public: fixed per mechanism).
+fn ct_bytes_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |d, (x, y)| d | (x ^ y)) == 0
+}
+
+impl Authenticator for StaticUsers {
+    fn mechanisms(&self) -> &[&'static str] {
+        &self.mechs
+    }
+
+    fn verify(&self, credentials: Credentials<'_>) -> bool {
+        match credentials {
+            Credentials::Anonymous => self.allow_anonymous,
+            Credentials::Plain { authcid, passwd } => {
+                self.allow_plain && self.check_password(authcid, passwd)
+            }
+        }
+    }
+
+    fn scram_verifier(&self, mechanism: ScramMechanism, username: &str) -> Option<ScramVerifier> {
+        self.users
+            .get(username)?
+            .iter()
+            .find(|(m, _)| *m == mechanism)
+            .map(|(_, v)| v.clone())
+    }
+
+    fn authorize(
+        &self,
+        identity: Option<&str>,
+        vhost: &str,
+        address: &str,
+        operation: Operation,
+    ) -> bool {
+        let user = identity.unwrap_or(ANONYMOUS_USER);
+        let mut grants = self
+            .permissions
+            .iter()
+            .filter(|p| p.matches_principal(user, vhost));
+        if address == "$coordinator" {
+            return grants.any(|p| p.send);
+        }
+        grants.any(|p| p.allows(operation) && glob_match(&p.address, address))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn glob_matching() {
+        assert!(glob_match("*", ""));
+        assert!(glob_match("*", "/queues/a"));
+        assert!(glob_match("/queues/*", "/queues/orders"));
+        assert!(glob_match("/queues/orders.*", "/queues/orders.eu"));
+        assert!(!glob_match("/queues/orders.*", "/queues/billing"));
+        assert!(glob_match("/exchanges/events/*", "/exchanges/events/a.b.c"));
+        assert!(glob_match("/q?eues/x", "/queues/x"));
+        assert!(!glob_match("/queues/x", "/queues/xy"));
+        assert!(glob_match("*/x*y", "a/b/xzzy"));
+    }
+
+    #[test]
+    fn rfc5803_round_trip_and_validation() {
+        let v = derive_scram_verifier(ScramMechanism::Sha256, "pencil", 4096).unwrap();
+        let s = format_scram_verifier(ScramMechanism::Sha256, &v);
+        assert!(s.starts_with("SCRAM-SHA-256$4096:"));
+        let (m, back) = parse_scram_verifier(&s).unwrap();
+        assert_eq!(m, ScramMechanism::Sha256);
+        assert_eq!(back.stored_key, v.stored_key);
+        assert_eq!(back.server_key, v.server_key);
+        assert_eq!(back.salt, v.salt);
+        // Too few iterations, wrong key length, junk.
+        assert!(parse_scram_verifier(&s.replace("$4096:", "$1000:")).is_err());
+        assert!(parse_scram_verifier("SCRAM-SHA-1$4096:AAAAAAAAAAA=$AA==:AA==").is_err());
+        assert!(parse_scram_verifier("nonsense").is_err());
+        assert!(parse_scram_verifier("MD5$4096:a$b:c").is_err());
+    }
+
+    #[test]
+    fn static_users_plain_checks_against_verifier() {
+        let users = StaticUsers::new().with_password("alice", "s3cret");
+        assert!(users.verify(Credentials::Plain {
+            authcid: "alice",
+            passwd: "s3cret"
+        }));
+        assert!(!users.verify(Credentials::Plain {
+            authcid: "alice",
+            passwd: "nope"
+        }));
+        assert!(!users.verify(Credentials::Plain {
+            authcid: "mallory",
+            passwd: "s3cret"
+        }));
+        assert!(!users.verify(Credentials::Anonymous));
+        assert_eq!(users.mechanisms(), &["SCRAM-SHA-256", "PLAIN"]);
+        let no_plain = StaticUsers::new()
+            .with_password("alice", "s3cret")
+            .allow_plain(false);
+        assert!(!no_plain.verify(Credentials::Plain {
+            authcid: "alice",
+            passwd: "s3cret"
+        }));
+        assert_eq!(no_plain.mechanisms(), &["SCRAM-SHA-256"]);
+        assert!(
+            no_plain
+                .scram_verifier(ScramMechanism::Sha256, "alice")
+                .is_some()
+        );
+        assert!(
+            no_plain
+                .scram_verifier(ScramMechanism::Sha512, "alice")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn static_users_permissions_deny_by_default() {
+        let users = StaticUsers::new()
+            .with_password("svc", "pw")
+            .with_permission(Permission::new("svc", "", "/queues/jobs.*", true, false))
+            .with_permission(Permission::new("svc", "", "/queues/replies", false, true))
+            .with_permission(Permission::new(
+                "*",
+                "tenant",
+                "/queues/public",
+                false,
+                true,
+            ))
+            .allow_anonymous(true);
+        let a = |id: Option<&str>, vh: &str, addr: &str, op| users.authorize(id, vh, addr, op);
+        assert!(a(Some("svc"), "", "/queues/jobs.email", Operation::Send));
+        assert!(!a(
+            Some("svc"),
+            "",
+            "/queues/jobs.email",
+            Operation::Receive
+        ));
+        assert!(a(Some("svc"), "", "/queues/replies", Operation::Receive));
+        assert!(!a(
+            Some("svc"),
+            "other",
+            "/queues/jobs.email",
+            Operation::Send
+        ));
+        assert!(!a(Some("svc"), "", "/queues/secret", Operation::Send));
+        // `*` user covers anonymous too; nothing else is granted to it.
+        assert!(a(None, "tenant", "/queues/public", Operation::Receive));
+        assert!(!a(None, "", "/queues/jobs.email", Operation::Send));
+        // Coordinator: any send grant in the vhost.
+        assert!(a(Some("svc"), "", "$coordinator", Operation::Send));
+        assert!(!a(None, "tenant", "$coordinator", Operation::Send));
+        assert!(users.verify(Credentials::Anonymous));
+        assert_eq!(users.mechanisms(), &["SCRAM-SHA-256", "PLAIN", "ANONYMOUS"]);
+    }
 
     #[test]
     fn allow_all_accepts_everything() {

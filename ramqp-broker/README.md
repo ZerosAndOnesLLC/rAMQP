@@ -16,8 +16,10 @@ protocol engine as the [`ramqp`](https://crates.io/crates/ramqp) client.
 ## Working today
 
 - **Any AMQP 1.0 client connects** — TCP acceptor, read-first server
-  handshake, SASL ANONYMOUS/PLAIN behind a pluggable `Authenticator`
-  (`AllowAll`, `StaticPlain` with constant-time comparison).
+  handshake, SASL ANONYMOUS/PLAIN/SCRAM-SHA-1/256/512 behind a pluggable
+  `Authenticator` (`StaticUsers` — the config-file backend: SCRAM verifiers
+  only, never plaintext, with per-user × vhost × address × operation
+  permissions; plus `AllowAll`, `StaticPlain`, `StaticScram`).
 - **Transient queues** — `/queues/<name>` (or bare names), auto-declared:
   one lock-free actor task per queue, competing consumers with round-robin
   dispatch, credit-based flow control, accept/release/modified/reject
@@ -45,8 +47,13 @@ protocol engine as the [`ramqp`](https://crates.io/crates/ramqp) client.
 
 ```sh
 cargo install ramqp-broker            # installs the ramqp-brokerd daemon
-ramqp-brokerd --listen 0.0.0.0:5672
+ramqp-brokerd --config /etc/ramqp/broker.toml
+ramqp-brokerd --listen 127.0.0.1:5672   # quick local run, no auth
 ```
+
+On a **non-loopback** listener the daemon refuses to start without users
+unless you opt into an open broker with `--allow-anonymous`
+(`RAMQP_ALLOW_ANONYMOUS=1`).
 
 (or from a repo checkout:
 `cargo run -p ramqp-broker --bin ramqp-brokerd -- --listen 0.0.0.0:5672`)
@@ -74,6 +81,57 @@ node — e.g. the repo's example:
 RAMQP_URL=amqp://localhost:5672 RAMQP_ADDRESS=/queues/demo \
     cargo run -p ramqp --example produce_consume
 ```
+
+### Configuration file
+
+`--config <path>` (or `RAMQP_CONFIG`) loads a TOML file; environment
+variables and flags override it. It replaces RabbitMQ's `definitions.json`:
+
+```toml
+listen = "0.0.0.0:5672"
+data_dir = "/var/lib/ramqp"           # needs --features store-redb
+management_listen = "0.0.0.0:15692"
+allow_plain = true                    # PLAIN is checked against the SCRAM verifier
+
+[limits]
+max_connections = 16384
+
+[cluster]
+node_id = 1
+listen = "0.0.0.0:7472"
+seeds = ["1=broker-0.broker:7472", "2=broker-1.broker:7472", "3=broker-2.broker:7472"]
+
+[[users]]
+name = "orders"
+verifier_file = "/etc/ramqp/users/orders.scram"   # RFC 5803 line(s)
+
+[[users]]
+name = "ops"
+password_file = "/etc/ramqp/users/ops"   # derived into a verifier at load
+admin = true                              # management API (see below)
+
+[[permissions]]                 # deny by default
+user = "orders"                 # or "anonymous", or "*"
+vhost = ""                      # default vhost; "*" = all
+address = "/queues/orders.*"    # glob over the attach address
+operations = ["send", "receive"]
+
+[[policies]]                    # first match wins
+prefix = "orders."
+message_ttl_ms = 600000
+max_length = 100000
+overflow = "reject-publish"     # or "drop-head"
+dead_letter = "/quorum/dead"
+max_delivery_attempts = 5
+
+[[queues]]                      # declared at startup, idempotent
+address = "/quorum/orders.created"
+```
+
+Secrets stay out of the file: point `verifier_file` / `password_file` at a
+mounted Kubernetes Secret. Generate a verifier with
+`echo -n "$PASSWORD" | ramqp-brokerd hash-password [--mechanism SCRAM-SHA-512]`.
+The daemon also shuts down gracefully on `SIGTERM`.
 
 Or embed it (`ramqp-broker = "0.9"` in `Cargo.toml`; add the `store-redb`
 feature for `/durable/*` queues):

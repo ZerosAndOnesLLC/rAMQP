@@ -52,6 +52,7 @@ mod connection;
 mod dispatch;
 #[cfg(feature = "store-redb")]
 mod durable;
+pub mod file_config;
 mod mgmt;
 mod policy;
 mod proxy;
@@ -63,6 +64,9 @@ mod serde_bin;
 mod store;
 mod txn;
 
-pub use auth::{AllowAll, Authenticator, Credentials, Operation, StaticPlain, StaticScram};
+pub use auth::{
+    AllowAll, Authenticator, Credentials, Operation, Permission, StaticPlain, StaticScram,
+    StaticUsers,
+};
 pub use broker::{BoundBroker, Broker, ShutdownHandle};
 pub use config::{BrokerConfig, ClusterMemberConfig, OverflowBehavior, QueuePolicy};

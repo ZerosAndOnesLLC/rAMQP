@@ -194,6 +194,15 @@ impl QueueRegistry {
         (!name.is_empty()).then_some((QueueKind::Transient, name))
     }
 
+    /// Whether `address` explicitly names a queue (`/queues/`, `/quorum/`,
+    /// `/durable/` with a non-empty name) — the strict form declarations
+    /// require (bare names are accepted only at attach, for compatibility).
+    pub fn is_queue_address(address: &str) -> bool {
+        ["/queues/", "/quorum/", "/durable/"]
+            .iter()
+            .any(|p| address.strip_prefix(p).is_some_and(|n| !n.is_empty()))
+    }
+
     /// Resolve an address in the default namespace — broker-INTERNAL callers
     /// only (the dead-letter router, management). Unlike client resolution,
     /// this accepts qualified names containing `/`: a per-vhost policy

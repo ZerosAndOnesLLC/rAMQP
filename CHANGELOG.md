@@ -5,6 +5,34 @@ All notable changes to ramqp will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **`ramqp-brokerd` config file** (`--config` / `RAMQP_CONFIG`, TOML; issue
+  #37 §2): listeners, data dir, management listener, limits, cluster
+  membership, **users** (RFC 5803 SCRAM verifiers from a file or inline, or
+  a password file derived into a verifier at load — never plaintext at
+  rest), **permissions** (user × vhost × address glob × send/receive,
+  deny-by-default), **policies** per vhost + name prefix (every
+  `QueuePolicy` field), and **pre-declared queues** (idempotent across
+  restarts). Flags and env vars override the file.
+- `StaticUsers` authenticator (the config-file backend): SCRAM-SHA-1/256/512
+  per stored verifier, PLAIN checked against the same verifier, opt-in
+  ANONYMOUS, admin flag, `Permission` grants. `auth::parse_scram_verifier` /
+  `format_scram_verifier` / `derive_scram_verifier` helpers.
+- `ramqp-brokerd hash-password` prints a verifier line from a password on
+  stdin.
+- `ramqp-brokerd --management-listen` flag (previously env-only) and
+  `--allow-anonymous`; the daemon now also shuts down gracefully on
+  `SIGTERM`.
+- `Broker::declare_queue` and `BoundBroker::broker`.
+
+### Changed
+- **Breaking (daemon):** `ramqp-brokerd` refuses to start on a non-loopback
+  listener with no users configured unless `--allow-anonymous`
+  (`RAMQP_ALLOW_ANONYMOUS=1`, `allow_anonymous = true`) is given. It used to
+  log a warning and run open.
+
 ## [ramqp-broker 0.9.5] - 2026-10-05
 
 Broker-only patch release; `ramqp` (0.8.3) and `ramqp-core` (0.2.6) are

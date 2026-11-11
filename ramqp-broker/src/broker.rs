@@ -142,6 +142,24 @@ impl Broker {
         }
     }
 
+    /// Declare a queue by address (`/queues/x`, `/quorum/x`, `/durable/x`)
+    /// within `vhost` (empty = default). Idempotent: an existing queue is
+    /// left as is. Used for startup topology from the config file and the
+    /// management API.
+    pub async fn declare_queue(&self, vhost: &str, address: &str) -> Result<(), String> {
+        if !QueueRegistry::is_queue_address(address) {
+            return Err(format!(
+                "{address:?} is not a queue address (expected /queues/<name>, \
+                 /quorum/<name> or /durable/<name>)"
+            ));
+        }
+        self.registry
+            .resolve_in(vhost, address)
+            .await
+            .map(|_| ())
+            .ok_or_else(|| format!("could not declare {address:?} in vhost {vhost:?}"))
+    }
+
     /// Serve a single already-established byte stream (in-process transports,
     /// tests, or custom acceptors). The returned task resolves when the
     /// connection completes.
@@ -188,6 +206,12 @@ impl ShutdownHandle {
 }
 
 impl BoundBroker {
+    /// The broker behind this listener (for declarations and diagnostics
+    /// while it runs; cheap to clone).
+    pub fn broker(&self) -> &Broker {
+        &self.broker
+    }
+
     /// The bound listen address (useful with port `0`).
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
