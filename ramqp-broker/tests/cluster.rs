@@ -30,38 +30,56 @@ async fn reserve_addrs(n: usize) -> Vec<String> {
 
 /// Start an `n`-node cluster, each node serving AMQP on an ephemeral port.
 async fn start_cluster(n: usize) -> Vec<Node> {
-    let fabric_addrs = reserve_addrs(n).await;
-    let seeds: Vec<(u64, String)> = (1..=n as u64).zip(fabric_addrs).collect();
-    let mut nodes = Vec::new();
-    for (id, fabric_addr) in &seeds {
-        let mut config = BrokerConfig::default();
-        config.cluster = Some(ClusterMemberConfig::new(
-            *id,
-            fabric_addr.clone(),
-            seeds.clone(),
-        ));
-        let broker = Broker::new(config);
-        let bound = broker
-            .clone()
-            .bind("127.0.0.1:0")
-            .await
-            .expect("bind AMQP listener");
-        let amqp_addr = bound.local_addr();
-        let shutdown = bound.shutdown_handle();
-        tokio::spawn(bound.run());
-        nodes.push(Node {
-            broker,
-            amqp_addr,
-            shutdown,
-        });
+    start_cluster_with(n, |_, _| {}).await
+}
+
+/// [`start_cluster`] with a per-node config hook. Fabric ports are reserved
+/// then released for the nodes to re-bind, so another process can take one
+/// in between: a lost race (bind fails) tears the attempt down and retries
+/// on fresh ports instead of failing the test.
+async fn start_cluster_with(n: usize, configure: impl Fn(u64, &mut BrokerConfig)) -> Vec<Node> {
+    'attempt: for _ in 0..5 {
+        let fabric_addrs = reserve_addrs(n).await;
+        let seeds: Vec<(u64, String)> = (1..=n as u64).zip(fabric_addrs).collect();
+        let mut nodes: Vec<Node> = Vec::new();
+        for (id, fabric_addr) in &seeds {
+            let mut config = BrokerConfig::default();
+            config.cluster = Some(ClusterMemberConfig::new(
+                *id,
+                fabric_addr.clone(),
+                seeds.clone(),
+            ));
+            configure(*id, &mut config);
+            let broker = Broker::new(config);
+            let bound = match broker.clone().bind("127.0.0.1:0").await {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!("cluster start: bind lost a port race ({e}); retrying");
+                    for node in &nodes {
+                        node.shutdown.shutdown();
+                    }
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    continue 'attempt;
+                }
+            };
+            let amqp_addr = bound.local_addr();
+            let shutdown = bound.shutdown_handle();
+            tokio::spawn(bound.run());
+            nodes.push(Node {
+                broker,
+                amqp_addr,
+                shutdown,
+            });
+        }
+        for node in &nodes {
+            assert!(
+                node.broker.cluster_formed(Duration::from_secs(15)).await,
+                "cluster formed on every node"
+            );
+        }
+        return nodes;
     }
-    for node in &nodes {
-        assert!(
-            node.broker.cluster_formed(Duration::from_secs(15)).await,
-            "cluster formed on every node"
-        );
-    }
-    nodes
+    panic!("could not bind a cluster in 5 attempts");
 }
 
 fn text_of(delivery: &ramqp::Delivery) -> String {
@@ -504,24 +522,21 @@ async fn exchanges_route_cluster_wide() {
 #[tokio::test(flavor = "multi_thread")]
 async fn per_queue_stats_are_real_on_every_node() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let fabric = reserve_addrs(3).await;
-    let mgmt = reserve_addrs(3).await;
-    let seeds: Vec<(u64, String)> = (1..=3u64).zip(fabric).collect();
-    let mut nodes = Vec::new();
-    for ((id, f), m) in seeds.iter().zip(&mgmt) {
-        let mut config = BrokerConfig::default();
-        config.cluster = Some(ClusterMemberConfig::new(*id, f.clone(), seeds.clone()));
-        config.management_listen = Some(m.clone());
-        let broker = Broker::new(config);
-        let bound = broker.clone().bind("127.0.0.1:0").await.expect("bind");
-        let addr = bound.local_addr();
-        let shutdown = bound.shutdown_handle();
-        tokio::spawn(bound.run());
-        nodes.push((broker, addr, shutdown));
-    }
-    for (b, _, _) in &nodes {
-        assert!(b.cluster_formed(Duration::from_secs(15)).await);
-    }
+    // Management ports are picked inside the hook (std bind-and-release),
+    // so a retried cluster start also gets fresh ones.
+    let mgmt_by_node = std::sync::Mutex::new(std::collections::BTreeMap::new());
+    let cluster = start_cluster_with(3, |id, config| {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        config.management_listen = Some(addr.clone());
+        mgmt_by_node.lock().unwrap().insert(id, addr);
+    })
+    .await;
+    let mgmt: Vec<String> = mgmt_by_node.into_inner().unwrap().into_values().collect();
+    let nodes: Vec<_> = cluster
+        .iter()
+        .map(|n| (n.broker.clone(), n.amqp_addr, n.shutdown.clone()))
+        .collect();
     let conn = ConnectionBuilder::new(format!("amqp://{}", nodes[0].1))
         .connect()
         .await

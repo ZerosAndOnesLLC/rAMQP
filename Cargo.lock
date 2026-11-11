@@ -1677,7 +1677,7 @@ dependencies = [
 
 [[package]]
 name = "ramqp-broker"
-version = "0.9.5"
+version = "0.10.0"
 dependencies = [
  "base64",
  "bytes",
@@ -1702,7 +1702,7 @@ dependencies = [
 
 [[package]]
 name = "ramqp-core"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "aws-lc-rs",
  "base64",

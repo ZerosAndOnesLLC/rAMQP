@@ -39,7 +39,8 @@ if python3 -c "import proton" >/dev/null 2>&1; then
     out="$(python3 "$SCRIPT" amqp://127.0.0.1:5680 "$ADDRESS")"
 elif command -v docker >/dev/null 2>&1; then
     echo ">> proton not on host — running docker fallback ..."
-    RAMQP_LISTEN=0.0.0.0:5680 "$BRK" >/tmp/ramqp-brokerd-proton.log 2>&1 &
+    # Non-loopback with no users: the daemon requires the explicit opt-in.
+    RAMQP_LISTEN=0.0.0.0:5680 "$BRK" --allow-anonymous >/tmp/ramqp-brokerd-proton.log 2>&1 &
     PIDS+=($!)
     sleep 2
     out="$(docker run --rm --add-host=host.docker.internal:host-gateway \
