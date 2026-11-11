@@ -27,9 +27,9 @@ use crate::proxy;
 use crate::queue::{self, QueueHandle, QueueMsg};
 use crate::quorum;
 
-/// The store key for standalone exchange definitions.
+/// The store key prefix for standalone exchange definitions.
 #[cfg(feature = "store-redb")]
-const EXCHANGES_KEY: &str = "exchanges";
+const EXCHANGE_ROW: &str = "exchange:";
 
 /// Why a queue deletion did not happen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -167,10 +167,11 @@ impl QueueRegistry {
                     .to_owned(),
             ));
         }
-        let mut next = (*self.exchanges.snapshot()).clone();
+        let current = self.exchanges.snapshot();
+        let mut next = (*current).clone();
         let changed = crate::exchange::apply_op(&mut next, &op)?;
         if changed {
-            self.persist_exchanges(&next).await?;
+            self.persist_exchanges(&current, &next).await?;
             self.exchanges.replace(next);
         }
         Ok(changed)
@@ -218,9 +219,14 @@ impl QueueRegistry {
         }
     }
 
-    /// Standalone: persist the definitions (no-op without a store).
+    /// Standalone: persist what changed between `before` and `after` (one
+    /// row per exchange; no-op without a store).
     #[cfg(feature = "store-redb")]
-    async fn persist_exchanges(&self, defs: &crate::exchange::Defs) -> Result<(), ExchangeError> {
+    async fn persist_exchanges(
+        &self,
+        before: &crate::exchange::Defs,
+        after: &crate::exchange::Defs,
+    ) -> Result<(), ExchangeError> {
         if self.data_dir.is_none() {
             return Ok(());
         }
@@ -228,31 +234,75 @@ impl QueueRegistry {
             .store()
             .await
             .ok_or_else(|| ExchangeError::Unavailable("durable store not openable".to_owned()))?;
-        let blob =
-            serde_json::to_vec(defs).map_err(|e| ExchangeError::Unavailable(e.to_string()))?;
-        tokio::task::spawn_blocking(move || store.put_definitions(EXCHANGES_KEY, &blob))
+        let mut puts = Vec::new();
+        for (k, def) in after {
+            if before.get(k) != Some(def) {
+                let blob = serde_json::to_vec(def)
+                    .map_err(|e| ExchangeError::Unavailable(e.to_string()))?;
+                puts.push((format!("{EXCHANGE_ROW}{k}"), blob));
+            }
+        }
+        let deletes: Vec<String> = before
+            .keys()
+            .filter(|k| !after.contains_key(*k))
+            .map(|k| format!("{EXCHANGE_ROW}{k}"))
+            .collect();
+        tokio::task::spawn_blocking(move || store.write_definitions(&puts, &deletes))
             .await
             .map_err(|e| ExchangeError::Unavailable(e.to_string()))?
             .map_err(ExchangeError::Unavailable)
     }
 
     #[cfg(not(feature = "store-redb"))]
-    async fn persist_exchanges(&self, _defs: &crate::exchange::Defs) -> Result<(), ExchangeError> {
+    async fn persist_exchanges(
+        &self,
+        _before: &crate::exchange::Defs,
+        _after: &crate::exchange::Defs,
+    ) -> Result<(), ExchangeError> {
         Ok(())
     }
 
-    /// Read the persisted standalone definitions (`None` = none stored).
+    /// Read the persisted standalone definitions (`None` = none stored). A
+    /// row that does not parse is moved aside (`corrupt:<key>`) with a loud
+    /// error instead of blocking every exchange: the config file's startup
+    /// declarations — or the admin API — can restore it.
     #[cfg(feature = "store-redb")]
     async fn read_persisted_exchanges(&self) -> Result<Option<crate::exchange::Defs>, String> {
         let store = self.store().await.ok_or_else(|| {
             "durable store not openable (previous instance still holds the lock?)".to_owned()
         })?;
-        match store.definitions(EXCHANGES_KEY)? {
-            Some(blob) => serde_json::from_slice(&blob)
-                .map(Some)
-                .map_err(|e| format!("corrupt exchange definitions: {e}")),
-            None => Ok(None),
+        let rows = store.definitions(EXCHANGE_ROW)?;
+        if rows.is_empty() {
+            return Ok(None);
         }
+        let mut defs = crate::exchange::Defs::new();
+        let mut quarantine = Vec::new();
+        for (key, blob) in rows {
+            match serde_json::from_slice::<crate::exchange::ExchangeDef>(&blob) {
+                Ok(def) => {
+                    defs.insert(key[EXCHANGE_ROW.len()..].to_owned(), def);
+                }
+                Err(e) => {
+                    tracing::error!(
+                        row = %key,
+                        error = %e,
+                        "corrupt exchange definition moved aside; redeclare the exchange"
+                    );
+                    quarantine.push((key, blob));
+                }
+            }
+        }
+        if !quarantine.is_empty() {
+            let puts: Vec<(String, Vec<u8>)> = quarantine
+                .iter()
+                .map(|(k, b)| (format!("corrupt:{k}"), b.clone()))
+                .collect();
+            let deletes: Vec<String> = quarantine.into_iter().map(|(k, _)| k).collect();
+            tokio::task::spawn_blocking(move || store.write_definitions(&puts, &deletes))
+                .await
+                .map_err(|e| e.to_string())??;
+        }
+        Ok(Some(defs))
     }
 
     #[cfg(not(feature = "store-redb"))]
@@ -382,7 +432,9 @@ impl QueueRegistry {
     pub async fn resolve_in(&self, vhost: &str, address: &str) -> Option<QueueHandle> {
         let (kind, bare) = Self::parse_address(address)?;
         let valid = |s: &str| !s.contains('/') && !s.chars().any(char::is_control);
-        if !valid(bare) || !valid(vhost) {
+        // `$`-prefixed names are reserved for broker pseudo-addresses (the
+        // transaction coordinator authorizes as `$coordinator`).
+        if !valid(bare) || !valid(vhost) || bare.starts_with('$') {
             tracing::debug!(
                 vhost,
                 address,
@@ -413,7 +465,7 @@ impl QueueRegistry {
     /// default vhost), or `None` if either part is invalid.
     pub fn qualify(vhost: &str, bare: &str) -> Option<String> {
         let valid = |s: &str| !s.contains('/') && !s.chars().any(char::is_control);
-        if bare.is_empty() || !valid(bare) || !valid(vhost) {
+        if bare.is_empty() || !valid(bare) || !valid(vhost) || bare.starts_with('$') {
             return None;
         }
         Some(if vhost.is_empty() {
@@ -447,6 +499,18 @@ impl QueueRegistry {
         for k in &kinds {
             if let Some(h) = self.lookup(*k, qualified) {
                 return Some((*k, h));
+            }
+        }
+        // A clustered quorum queue declared anywhere is in the replicated
+        // catalog: serve it here too (a leader-following proxy), so a lookup
+        // works on every node, not only where something attached.
+        if kinds.contains(&QueueKind::Quorum)
+            && let Some(node) = self.cluster.get()
+            && node.has_queue(qualified)
+        {
+            let vhost = qualified.split_once('/').map_or("", |(v, _)| v);
+            if let Some(h) = self.resolve_name(QueueKind::Quorum, qualified, vhost).await {
+                return Some((QueueKind::Quorum, h));
             }
         }
         #[cfg(feature = "store-redb")]
@@ -502,13 +566,32 @@ impl QueueRegistry {
         match rx.await {
             Ok(true) => {
                 let key = Self::key_for(kind, qualified);
-                let mut map = self.queues.lock().expect("registry lock");
-                if map
-                    .get(&key)
-                    .and_then(|c| c.get())
-                    .is_some_and(|h| h.tx.same_channel(&handle.tx))
                 {
-                    map.remove(&key);
+                    let mut map = self.queues.lock().expect("registry lock");
+                    if map
+                        .get(&key)
+                        .and_then(|c| c.get())
+                        .is_some_and(|h| h.tx.same_channel(&handle.tx))
+                    {
+                        map.remove(&key);
+                    }
+                }
+                // Drop the bindings that target it, or the next exchange
+                // publish would re-declare it (and it would fill unconsumed).
+                let (vhost, bare) = qualified.split_once('/').unwrap_or(("", qualified));
+                let prefix = match kind {
+                    QueueKind::Transient => "/queues/",
+                    QueueKind::Quorum => "/quorum/",
+                    QueueKind::Durable => "/durable/",
+                };
+                if let Err(e) = self
+                    .exchange_op(ExchangeOp::UnbindDestination {
+                        vhost: vhost.to_owned(),
+                        destination: format!("{prefix}{bare}"),
+                    })
+                    .await
+                {
+                    tracing::warn!(queue = %qualified, error = %e, "could not remove the deleted queue's bindings");
                 }
                 Ok(())
             }
@@ -772,6 +855,45 @@ async fn spawn_quorum_group(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review L10: an unreadable definitions row is moved aside (with an
+    /// error) instead of blocking every exchange; good rows still load.
+    #[cfg(feature = "store-redb")]
+    #[tokio::test]
+    async fn corrupt_exchange_rows_are_moved_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = BrokerConfig {
+            data_dir: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        };
+        let r = QueueRegistry::new(&config);
+        let store = r.store().await.expect("store opens");
+        let good = crate::exchange::ExchangeDef {
+            kind: crate::exchange::ExchangeKind::Topic,
+            alternate: None,
+            bindings: Vec::new(),
+        };
+        store
+            .write_definitions(
+                &[
+                    (
+                        "exchange:/good".to_owned(),
+                        serde_json::to_vec(&good).unwrap(),
+                    ),
+                    ("exchange:/bad".to_owned(), b"{oops".to_vec()),
+                ],
+                &[],
+            )
+            .unwrap();
+        assert!(r.ensure_exchanges_loaded().await, "loading is not blocked");
+        let defs = r.exchanges().snapshot();
+        assert_eq!(defs.get("/good"), Some(&good));
+        assert!(!defs.contains_key("/bad"));
+        let rows = store.definitions("exchange:").unwrap();
+        assert_eq!(rows.len(), 1, "the corrupt row left the live set");
+        let aside = store.definitions("corrupt:").unwrap();
+        assert_eq!(aside[0].0, "corrupt:exchange:/bad");
+    }
 
     #[test]
     fn address_normalization() {

@@ -59,7 +59,9 @@ impl Broker {
         self
     }
 
-    /// Bind a TCP listener (e.g. `"0.0.0.0:5672"` or `"127.0.0.1:0"`).
+    /// Bind a TCP listener (e.g. `"0.0.0.0:5672"` or `"127.0.0.1:0"`). An
+    /// empty `addr` binds no plain listener — TLS-only, which needs
+    /// [`BrokerConfig::tls_listen`].
     ///
     /// When the config carries a [`crate::config::ClusterMemberConfig`], this
     /// also starts the node's cluster half: the fabric listener, the
@@ -164,14 +166,27 @@ impl Broker {
                 }),
             );
         }
-        let listener = TcpListener::bind(addr).await?;
-        let local_addr = listener.local_addr()?;
+        if addr.is_empty() && self.config.tls_listen.is_none() {
+            return Err(std::io::Error::other(
+                "no listener: an empty plain address needs tls_listen (TLS-only mode)",
+            ));
+        }
+        let listener = if addr.is_empty() {
+            None
+        } else {
+            Some(TcpListener::bind(addr).await?)
+        };
         let tls = match &self.config.tls_listen {
             Some(tls_addr) => Some(
                 TlsListener::bind(tls_addr, self.config.tls.as_ref().expect("checked above"))
                     .await?,
             ),
             None => None,
+        };
+        let local_addr = match (&listener, &tls) {
+            (Some(l), _) => l.local_addr()?,
+            (None, Some(t)) => t.listener.local_addr()?,
+            (None, None) => unreachable!("checked above"),
         };
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         // A `0` cap disables the limit (unbounded); otherwise a permit is held
@@ -319,7 +334,8 @@ impl Broker {
 #[derive(Debug)]
 pub struct BoundBroker {
     broker: Broker,
-    listener: TcpListener,
+    /// The plain AMQP listener (`None` in TLS-only mode).
+    listener: Option<TcpListener>,
     /// The `amqps` listener, when `tls_listen` is configured.
     tls: Option<TlsListener>,
     local_addr: SocketAddr,
@@ -365,16 +381,21 @@ impl TlsListener {
 /// The management endpoint's TLS acceptor.
 #[cfg(any(feature = "tls", feature = "fips"))]
 fn tls_mgmt_acceptor(tls: &crate::config::TlsServerConfig) -> std::io::Result<mgmt::Acceptor> {
-    let acceptor = crate::tls::acceptor(tls).map_err(std::io::Error::other)?;
+    // The management port authenticates with tokens / admin users; it never
+    // demands client certificates (Prometheus and KEDA would need them).
+    let mut tls = tls.clone();
+    tls.client_ca_file = None;
+    let acceptor = crate::tls::acceptor(&tls).map_err(std::io::Error::other)?;
     Ok(Arc::new(move |stream: TcpStream| {
         let acceptor = acceptor.clone();
         Box::pin(async move {
-            match acceptor.accept(stream).await {
-                Ok(s) => Some(Box::new(s) as Box<dyn mgmt::MgmtStream>),
-                Err(e) => {
+            match tokio::time::timeout(mgmt::TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
+                Ok(Ok(s)) => Some(Box::new(s) as Box<dyn mgmt::MgmtStream>),
+                Ok(Err(e)) => {
                     tracing::debug!(error = %e, "management TLS handshake failed");
                     None
                 }
+                Err(_) => None,
             }
         })
     }))
@@ -383,6 +404,14 @@ fn tls_mgmt_acceptor(tls: &crate::config::TlsServerConfig) -> std::io::Result<mg
 #[cfg(not(any(feature = "tls", feature = "fips")))]
 fn tls_mgmt_acceptor(_tls: &crate::config::TlsServerConfig) -> std::io::Result<mgmt::Acceptor> {
     Err(std::io::Error::other("built without TLS"))
+}
+
+/// Accept on the plain listener, or never (TLS-only).
+async fn accept_plain(listener: Option<&TcpListener>) -> std::io::Result<(TcpStream, SocketAddr)> {
+    match listener {
+        Some(l) => l.accept().await,
+        None => std::future::pending().await,
+    }
 }
 
 /// Accept on the TLS listener, or never (no TLS listener).
@@ -415,7 +444,8 @@ impl BoundBroker {
         &self.broker
     }
 
-    /// The bound listen address (useful with port `0`).
+    /// The bound listen address (useful with port `0`): the plain listener,
+    /// or the TLS one in TLS-only mode.
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
     }
@@ -436,7 +466,7 @@ impl BoundBroker {
         tracing::info!(addr = %self.local_addr, "ramqp-broker listening");
         loop {
             tokio::select! {
-                accepted = self.listener.accept() => {
+                accepted = accept_plain(self.listener.as_ref()) => {
                     match accepted {
                         Ok((stream, peer)) => {
                             let Some(permit) = self.admit(peer) else {

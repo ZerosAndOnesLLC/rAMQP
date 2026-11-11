@@ -8,9 +8,10 @@ repository = "https://github.com/ZerosAndOnesLLC/rAMQP"
 keywords = ["amqp", "amqp1", "messaging", "codec", "async"]
 categories = ["network-programming", "asynchronous"]
 
-# Document every feature-gated API (SCRAM / transactions) on docs.rs.
+# Document the feature-gated APIs (SCRAM / transactions) on docs.rs —
+# not `scram-fips`: it needs CMake + Go to build and exposes the same API.
 [package.metadata.docs.rs]
-all-features = true
+features = ["scram", "transaction"]
 
 [dependencies]
 bytes = "1"

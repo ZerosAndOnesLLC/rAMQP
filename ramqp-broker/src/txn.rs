@@ -176,6 +176,30 @@ impl TxnManager {
         }
     }
 
+    /// Stage several publishes (one message routed to several queues) all
+    /// or none: a refusal stages nothing (and, at the cap, poisons the
+    /// transaction as [`Self::stage_publish`] does).
+    pub fn stage_publishes(
+        &mut self,
+        txn_id: &TxnId,
+        publishes: Vec<StagedPublish>,
+    ) -> PublishStage {
+        let bytes: usize = publishes.iter().map(|p| p.body.len()).sum();
+        let over_bytes = self.staged_bytes + bytes > MAX_STAGED_BYTES;
+        match self.txns.get_mut(txn_id) {
+            Some(txn) if !over_bytes && txn.staged() + publishes.len() <= MAX_STAGED => {
+                self.staged_bytes += bytes;
+                txn.publishes.extend(publishes);
+                PublishStage::Staged
+            }
+            Some(txn) => {
+                txn.rollback_only = true;
+                PublishStage::Capped
+            }
+            None => PublishStage::UnknownTxn,
+        }
+    }
+
     /// Stage a settlement under `txn_id`. A refusal hands the settle back so
     /// the caller can requeue the message — leaving it in flight would
     /// strand it invisibly (no redelivery timer; only connection teardown
@@ -404,7 +428,12 @@ mod tests {
 
     async fn stats(q: &QueueHandle) -> QueueStats {
         let (tx, rx) = oneshot::channel();
-        q.tx.send(QueueMsg::Stats { reply: tx }).await.unwrap();
+        q.tx.send(QueueMsg::Stats {
+            reply: tx,
+            forward: false,
+        })
+        .await
+        .unwrap();
         rx.await.unwrap()
     }
 

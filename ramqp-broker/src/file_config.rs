@@ -19,7 +19,11 @@
 //! node_id = 1
 //! listen = "0.0.0.0:7472"
 //! seeds = ["1=broker-0.broker:7472", "2=broker-1.broker:7472", "3=broker-2.broker:7472"]
-//! tls = true                      # mutual TLS on the fabric ([tls] cert + CA)
+//!
+//! [cluster.tls]                   # mutual TLS on the fabric (tls/fips build)
+//! cert_file = "/etc/ramqp/fabric/tls.crt"   # names this node's seed host
+//! key_file = "/etc/ramqp/fabric/tls.key"
+//! ca_file = "/etc/ramqp/fabric/ca.crt"      # a DEDICATED cluster CA
 //!
 //! [tls]                           # needs a `tls` or `fips` build
 //! listen = "0.0.0.0:5671"         # amqps listener (the plain one stays)
@@ -145,10 +149,26 @@ pub struct ClusterSection {
     pub seeds: Vec<String>,
     /// Replica count for new quorum queues (default 3).
     pub replicas: Option<u8>,
-    /// Mutual TLS on the fabric with the `[tls]` certificate and its
-    /// `client_ca_file` as the cluster CA.
-    #[serde(default)]
-    pub tls: bool,
+    /// Mutual TLS on the fabric — its own certificate and a DEDICATED
+    /// cluster CA (never the CA that signs application client
+    /// certificates: anything it signs could join the fabric).
+    pub tls: Option<FabricTlsSection>,
+}
+
+/// `[cluster.tls]`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct FabricTlsSection {
+    /// This node's PEM certificate chain; it must name the host of this
+    /// node's seed address (DNS or IP SAN) and allow client + server auth.
+    pub cert_file: PathBuf,
+    /// This node's PEM private key.
+    pub key_file: PathBuf,
+    /// The cluster CA bundle (PEM).
+    pub ca_file: PathBuf,
+    /// Seconds between certificate/CA change checks (default 10).
+    pub reload_interval_secs: Option<u64>,
 }
 
 /// `[tls]`.
@@ -480,14 +500,21 @@ impl FileConfig {
             if let Some(r) = c.replicas {
                 member.replicas = r;
             }
-            if c.tls {
-                let tls = config
-                    .tls
-                    .clone()
-                    .ok_or("cluster.tls needs a [tls] section")?;
-                if tls.client_ca_file.is_none() {
+            if let Some(t) = &c.tls {
+                let mut tls = crate::config::TlsServerConfig::new(
+                    self.resolve(&t.cert_file),
+                    self.resolve(&t.key_file),
+                );
+                tls.client_ca_file = Some(self.resolve(&t.ca_file));
+                if let Some(secs) = t.reload_interval_secs {
+                    tls.reload_interval = std::time::Duration::from_secs(secs.max(1));
+                }
+                if let Some(app) = &config.tls
+                    && app.client_ca_file == tls.client_ca_file
+                {
                     return Err(
-                        "cluster.tls needs [tls].client_ca_file (the cluster CA) for mutual auth"
+                        "[cluster.tls].ca_file must not be the [tls].client_ca_file: any client \
+                         certificate from that CA could join the cluster fabric"
                             .to_owned(),
                     );
                 }
@@ -655,7 +682,10 @@ mod tests {
             listen = "0.0.0.0:7472"
             seeds = ["1=a:7472", "2=b:7472"]
             replicas = 2
-            tls = true
+            [cluster.tls]
+            cert_file = "fabric.crt"
+            key_file = "fabric.key"
+            ca_file = "cluster-ca.crt"
             [tls]
             listen = "0.0.0.0:5671"
             cert_file = "tls.crt"
@@ -710,7 +740,12 @@ mod tests {
             Some(Path::new("/abs/ca.crt"))
         );
         assert_eq!(tls.reload_interval, std::time::Duration::from_secs(3));
-        assert_eq!(cluster.tls.as_ref(), Some(tls));
+        let fabric = cluster.tls.as_ref().unwrap();
+        assert_eq!(fabric.cert_file, dir.path().join("fabric.crt"));
+        assert_eq!(
+            fabric.client_ca_file.as_deref(),
+            Some(dir.path().join("cluster-ca.crt").as_path())
+        );
         assert_eq!(bc.tls_listen.as_deref(), Some("0.0.0.0:5671"));
         assert!(bc.management_tls);
         assert_eq!(bc.policies.len(), 1);
@@ -767,6 +802,16 @@ mod tests {
         assert!(
             bad("[cluster]\nnode_id = 1\nlisten = \"x\"\nseeds = [\"oops\"]").contains("bad seed")
         );
+        // Review H2: the fabric CA may not be the application client CA.
+        let shared = FileConfig::from_toml(
+            "[tls]\ncert_file = \"a\"\nkey_file = \"b\"\nclient_ca_file = \"/ca.crt\"\n\
+             [cluster]\nnode_id = 1\nlisten = \"x:1\"\nseeds = [\"1=x:1\"]\n\
+             [cluster.tls]\ncert_file = \"c\"\nkey_file = \"d\"\nca_file = \"/ca.crt\"",
+            Path::new("/"),
+        )
+        .unwrap();
+        let err = shared.apply(&mut BrokerConfig::default()).unwrap_err();
+        assert!(err.contains("must not be"), "{err}");
         // Permissions without users and without anonymous: nobody could use them.
         let cfg = FileConfig::from_toml(
             "[[permissions]]\nuser = \"a\"\noperations = [\"send\"]",

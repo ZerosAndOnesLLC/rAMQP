@@ -10,12 +10,17 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::SystemTime;
 
+use rustls::client::WebPkiServerVerifier;
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::CryptoProvider;
+use rustls::pki_types::UnixTime;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::server::{ClientHello, ResolvesServerCert, WebPkiClientVerifier};
 use rustls::sign::CertifiedKey;
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
+use rustls::{DigitallySignedStruct, DistinguishedName, SignatureScheme};
 
 use crate::config::TlsServerConfig;
 
@@ -115,14 +120,185 @@ fn reloading(
     let resolver = Arc::new(ReloadingResolver {
         current: RwLock::new(Arc::new(initial)),
     });
-    spawn_reloader(
-        Arc::downgrade(&resolver),
+    let (provider, cert, key) = (
         provider.clone(),
         tls.cert_file.clone(),
         tls.key_file.clone(),
+    );
+    spawn_watch(
+        vec![tls.cert_file.clone(), tls.key_file.clone()],
         tls.reload_interval,
+        Arc::downgrade(&resolver),
+        move |r: &ReloadingResolver| {
+            let ck = certified_key(&provider, &cert, &key)?;
+            *r.current.write().expect("cert lock") = Arc::new(ck);
+            tracing::info!(cert = %cert.display(), "TLS certificate reloaded");
+            Ok(())
+        },
     );
     Ok(resolver)
+}
+
+/// Poll `paths`; when any changes, run `rebuild` on the target (a failure —
+/// e.g. mid-rotation, cert written but key not yet — keeps the current state
+/// and retries next tick). Stops when the target is dropped.
+fn spawn_watch<T, F>(
+    paths: Vec<PathBuf>,
+    interval: std::time::Duration,
+    target: std::sync::Weak<T>,
+    rebuild: F,
+) where
+    T: Send + Sync + 'static,
+    F: Fn(&T) -> Result<(), String> + Send + 'static,
+{
+    let interval = interval.max(std::time::Duration::from_millis(100));
+    tokio::spawn(async move {
+        let refs = |p: &Vec<PathBuf>| fingerprint(&p.iter().collect::<Vec<_>>());
+        let mut seen = refs(&paths);
+        loop {
+            tokio::time::sleep(interval).await;
+            let Some(target) = target.upgrade() else {
+                return;
+            };
+            let now = refs(&paths);
+            if now == seen {
+                continue;
+            }
+            match rebuild(&target) {
+                Ok(()) => seen = now,
+                Err(e) => {
+                    tracing::warn!(error = %e, "TLS material reload failed; keeping the previous one")
+                }
+            }
+        }
+    });
+}
+
+/// The client-certificate verifier, rebuilt in place when the CA bundle
+/// changes (cert-manager CA rotation needs no restart).
+#[derive(Debug)]
+struct ReloadingClientVerifier {
+    inner: RwLock<Arc<dyn ClientCertVerifier>>,
+}
+
+impl ReloadingClientVerifier {
+    fn current(&self) -> Arc<dyn ClientCertVerifier> {
+        self.inner.read().expect("verifier lock").clone()
+    }
+}
+
+fn build_client_verifier(
+    provider: &Arc<CryptoProvider>,
+    ca: &Path,
+) -> Result<Arc<dyn ClientCertVerifier>, String> {
+    WebPkiClientVerifier::builder_with_provider(Arc::new(load_roots(ca)?), provider.clone())
+        .build()
+        .map_err(|e| format!("client CA {}: {e}", ca.display()))
+}
+
+impl ClientCertVerifier for ReloadingClientVerifier {
+    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+        // Hints would borrow from a swappable value; clients send their
+        // certificate without them.
+        &[]
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        now: UnixTime,
+    ) -> Result<ClientCertVerified, rustls::Error> {
+        self.current()
+            .verify_client_cert(end_entity, intermediates, now)
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.current().verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.current().verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.current().supported_verify_schemes()
+    }
+}
+
+/// The fabric dialer's server verifier (cluster CA), rebuilt in place when
+/// the CA bundle changes.
+#[derive(Debug)]
+struct ReloadingServerVerifier {
+    inner: RwLock<Arc<dyn ServerCertVerifier>>,
+}
+
+impl ReloadingServerVerifier {
+    fn current(&self) -> Arc<dyn ServerCertVerifier> {
+        self.inner.read().expect("verifier lock").clone()
+    }
+}
+
+fn build_server_verifier(
+    provider: &Arc<CryptoProvider>,
+    ca: &Path,
+) -> Result<Arc<dyn ServerCertVerifier>, String> {
+    let v: Arc<dyn ServerCertVerifier> =
+        WebPkiServerVerifier::builder_with_provider(Arc::new(load_roots(ca)?), provider.clone())
+            .build()
+            .map_err(|e| format!("cluster CA {}: {e}", ca.display()))?;
+    Ok(v)
+}
+
+impl ServerCertVerifier for ReloadingServerVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        self.current().verify_server_cert(
+            end_entity,
+            intermediates,
+            server_name,
+            ocsp_response,
+            now,
+        )
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.current().verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.current().verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.current().supported_verify_schemes()
+    }
 }
 
 /// A file's change fingerprint (mtime + length; a rotation that rewrites
@@ -147,12 +323,20 @@ pub(crate) fn server_config(tls: &TlsServerConfig) -> Result<Arc<ServerConfig>, 
         .map_err(|e| e.to_string())?;
     let builder = match &tls.client_ca_file {
         Some(ca) => {
-            let verifier = WebPkiClientVerifier::builder_with_provider(
-                Arc::new(load_roots(ca)?),
-                provider.clone(),
-            )
-            .build()
-            .map_err(|e| format!("client CA {}: {e}", ca.display()))?;
+            let verifier = Arc::new(ReloadingClientVerifier {
+                inner: RwLock::new(build_client_verifier(&provider, ca)?),
+            });
+            let (p, ca_path) = (provider.clone(), ca.clone());
+            spawn_watch(
+                vec![ca.clone()],
+                tls.reload_interval,
+                Arc::downgrade(&verifier),
+                move |v: &ReloadingClientVerifier| {
+                    *v.inner.write().expect("verifier lock") = build_client_verifier(&p, &ca_path)?;
+                    tracing::info!(ca = %ca_path.display(), "client CA reloaded");
+                    Ok(())
+                },
+            );
             builder.with_client_cert_verifier(verifier)
         }
         None => builder.with_no_client_auth(),
@@ -162,43 +346,6 @@ pub(crate) fn server_config(tls: &TlsServerConfig) -> Result<Arc<ServerConfig>, 
         return Err("the `fips` build produced a non-FIPS TLS configuration".to_owned());
     }
     Ok(Arc::new(config))
-}
-
-/// Poll the certificate files; on change, load and swap (a failed load
-/// keeps the previous certificate). Stops when the resolver is dropped.
-fn spawn_reloader(
-    resolver: std::sync::Weak<ReloadingResolver>,
-    provider: Arc<CryptoProvider>,
-    cert: PathBuf,
-    key: PathBuf,
-    interval: std::time::Duration,
-) {
-    let interval = interval.max(std::time::Duration::from_millis(100));
-    tokio::spawn(async move {
-        let mut seen = fingerprint(&[&cert, &key]);
-        loop {
-            tokio::time::sleep(interval).await;
-            let Some(resolver) = resolver.upgrade() else {
-                return;
-            };
-            let now = fingerprint(&[&cert, &key]);
-            if now == seen {
-                continue;
-            }
-            match certified_key(&provider, &cert, &key) {
-                Ok(ck) => {
-                    *resolver.current.write().expect("cert lock") = Arc::new(ck);
-                    seen = now;
-                    tracing::info!(cert = %cert.display(), "TLS certificate reloaded");
-                }
-                // Mid-rotation (cert written, key not yet) or broken: keep
-                // serving the old pair and try again next tick.
-                Err(e) => {
-                    tracing::warn!(error = %e, "TLS certificate reload failed; keeping the previous one")
-                }
-            }
-        }
-    });
 }
 
 /// The acceptor for a TLS listener.
@@ -217,10 +364,25 @@ pub(crate) fn fabric_connector(
         .ok_or("fabric TLS needs `client_ca_file` (the cluster CA)")?;
     let provider = provider();
     let resolver = reloading(&provider, tls)?;
+    let verifier = Arc::new(ReloadingServerVerifier {
+        inner: RwLock::new(build_server_verifier(&provider, ca)?),
+    });
+    let (p, ca_path) = (provider.clone(), ca.clone());
+    spawn_watch(
+        vec![ca.clone()],
+        tls.reload_interval,
+        Arc::downgrade(&verifier),
+        move |v: &ReloadingServerVerifier| {
+            *v.inner.write().expect("verifier lock") = build_server_verifier(&p, &ca_path)?;
+            tracing::info!(ca = %ca_path.display(), "cluster CA reloaded");
+            Ok(())
+        },
+    );
     let config = ClientConfig::builder_with_provider(provider.clone())
         .with_safe_default_protocol_versions()
         .map_err(|e| e.to_string())?
-        .with_root_certificates(load_roots(ca)?)
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
         .with_client_cert_resolver(resolver);
     if cfg!(feature = "fips") && !config.fips() {
         return Err("the `fips` build produced a non-FIPS TLS configuration".to_owned());
@@ -235,4 +397,44 @@ pub(crate) fn server_name(addr: &str) -> Result<ServerName<'static>, String> {
         None => addr,
     };
     ServerName::try_from(host.to_owned()).map_err(|e| format!("peer address {addr}: {e}"))
+}
+
+/// Whether `cert` (already chain-verified against the cluster CA) is valid
+/// for at least one of `hosts` — a fabric peer must be a cluster member,
+/// not merely hold some certificate from the same CA.
+pub(crate) fn names_one_of(cert: &CertificateDer<'_>, hosts: &[ServerName<'static>]) -> bool {
+    let Ok(ee) = webpki::EndEntityCert::try_from(cert) else {
+        return false;
+    };
+    hosts
+        .iter()
+        .any(|h| ee.verify_is_valid_for_subject_name(h).is_ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cert_for(sans: &[&str]) -> CertificateDer<'static> {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let params =
+            rcgen::CertificateParams::new(sans.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>())
+                .unwrap();
+        params.self_signed(&key).unwrap().der().clone()
+    }
+
+    /// Review H2: fabric membership is decided by the peer certificate
+    /// naming a seed host (DNS or IP), not just by its CA.
+    #[test]
+    fn fabric_identity_requires_a_seed_host_name() {
+        let seeds = vec![
+            server_name("10.0.0.1:7472").unwrap(),
+            server_name("broker-1.broker:7472").unwrap(),
+        ];
+        assert!(names_one_of(&cert_for(&["10.0.0.1"]), &seeds));
+        assert!(names_one_of(&cert_for(&["broker-1.broker"]), &seeds));
+        assert!(!names_one_of(&cert_for(&["app.example"]), &seeds));
+        assert!(!names_one_of(&cert_for(&["10.0.0.9"]), &seeds));
+        assert!(!names_one_of(&CertificateDer::from(vec![1, 2, 3]), &seeds));
+    }
 }

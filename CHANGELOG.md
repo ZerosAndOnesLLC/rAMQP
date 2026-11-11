@@ -67,6 +67,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SIGTERM`.
 - `Broker::declare_queue` and `BoundBroker::broker`.
 
+### Fixed (review of the issue #37 work, before release)
+- Exchange publishes whose destination queue cannot be resolved are now
+  **rejected** (nothing published, nothing cached) instead of accepted while
+  silently skipping that queue; a deleted exchange **detaches** its producers
+  (`amqp:resource-deleted`) instead of accepting and dropping.
+- Deleting a queue also removes the bindings to it, and answers everything
+  queued behind the delete (publishes refused, racing subscribes detached)
+  so no producer waits forever or leaks credit.
+- `GET /queues/<vhost>/<name>` follows a clustered queue to its leader and
+  returns `503` (never zeros) when stats are unknowable; node-local
+  `/metrics` and `/queues` omit queues another node leads.
+- Fabric mutual TLS has its own `[cluster.tls]` section and CA (refused if
+  it equals the amqps client CA), checks that a peer certificate names a
+  seed host, and management TLS never demands client certificates.
+- Client CA and cluster CA bundles reload on change, like certificates.
+- Startup topology from the config file is declared before the listener
+  accepts; configuration conflicts stop the daemon instead of retrying
+  forever.
+- Exchange metadata commands are proposed only once every cluster node
+  reports support (new fabric capability probe); metadata snapshots keep
+  the 0.9.x encoding until exchanges are used.
+- PLAIN and management Basic password checks (PBKDF2) run on the blocking
+  pool, bounded to one per CPU; verifier iterations are capped at 1,000,000;
+  the unknown-user decoy matches real users' parameters; failed management
+  logins are slowed.
+- Management requests: 3 s head deadline, TLS handshake bound, admin writes
+  run to completion even if the request times out, and the connection is
+  drained after the response so early `401`/`413` replies are not reset.
+- Exchange definitions persist one row per exchange; an unreadable row is
+  moved aside (`corrupt:`) instead of blocking every exchange.
+- Fan-out confirms are awaited in the connection (no task per message);
+  routing keys over 255 bytes are unroutable; multi-destination
+  transactional staging is all-or-nothing; `$`-prefixed queue names are
+  reserved.
+- `ramqp-core`: a transfer for an already-detached link still consumes the
+  session window (no next-incoming-id drift).
+- TLS-only mode: an empty plain listen address (`listen = ""`,
+  `--listen none`) binds only the amqps listener.
+- docs.rs builds without the `fips` feature (it needs CMake and Go).
+
 ### Changed
 - `ramqp-broker`'s SCRAM backend is now a feature: **`rustcrypto`** (on by
   default) or `fips`. Builds using `--no-default-features` must add

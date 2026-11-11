@@ -105,6 +105,18 @@ impl ReplicatedState for MetaState {
     }
 
     fn snapshot_bytes(&self) -> Result<Vec<u8>, String> {
+        // Until exchanges are used, keep the 0.9.x encoding: a node not yet
+        // upgraded (rolling upgrade, or a rollback) can still install it.
+        if self.exchanges.is_empty() && self.exchanges_epoch == 0 {
+            #[derive(Serialize)]
+            struct Legacy<'a> {
+                catalog: &'a BTreeMap<String, QueueSpec>,
+            }
+            return crate::serde_bin::to_vec(&Legacy {
+                catalog: &self.catalog,
+            })
+            .map_err(|e| e.to_string());
+        }
         crate::serde_bin::to_vec(self).map_err(|e| e.to_string())
     }
 
@@ -860,6 +872,13 @@ mod tests {
             catalog: BTreeMap::from([("orders".to_owned(), spec.clone())]),
         })
         .unwrap();
+        // Until exchanges are used, a snapshot keeps the legacy encoding so
+        // an older node can still install it (review M2).
+        let unused = MetaState {
+            catalog: BTreeMap::from([("orders".to_owned(), spec.clone())]),
+            ..Default::default()
+        };
+        assert_eq!(unused.snapshot_bytes().unwrap(), legacy);
         let mut state = MetaState::default();
         state.restore_snapshot(&legacy).expect("legacy restores");
         assert_eq!(state.catalog.get("orders"), Some(&spec));

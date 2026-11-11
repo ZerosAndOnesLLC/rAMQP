@@ -51,9 +51,15 @@ impl Pki {
 
     /// Mint a leaf for `127.0.0.1`/`localhost` named `cn`; returns PEMs.
     fn leaf(&self, cn: &str) -> (String, String) {
+        self.leaf_for(cn, &["127.0.0.1", "localhost"])
+    }
+
+    /// Mint a leaf with these subject alternative names.
+    fn leaf_for(&self, cn: &str, sans: &[&str]) -> (String, String) {
         let key = KeyPair::generate().unwrap();
         let mut params =
-            CertificateParams::new(vec!["127.0.0.1".to_owned(), "localhost".to_owned()]).unwrap();
+            CertificateParams::new(sans.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>())
+                .unwrap();
         params.distinguished_name.push(DnType::CommonName, cn);
         params.extended_key_usages = vec![
             ExtendedKeyUsagePurpose::ServerAuth,
@@ -371,4 +377,125 @@ async fn cluster_fabric_over_mutual_tls() {
     for (_, _, shutdown) in &nodes {
         shutdown.shutdown();
     }
+}
+
+/// Review H2: a fabric peer needs more than a certificate from the cluster
+/// CA — it must name one of the seed hosts. A same-CA certificate for some
+/// other name (an application cert, say) is refused after the handshake.
+#[tokio::test(flavor = "multi_thread")]
+async fn fabric_refuses_same_ca_certificates_that_name_no_seed() {
+    let pki = Pki::new("cluster-ca");
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let fabric = l.local_addr().unwrap().to_string();
+    drop(l);
+    let (cert, key) = pki.leaf_files("node1");
+    let mut tls = TlsServerConfig::new(cert, key);
+    tls.client_ca_file = Some(pki.ca_file());
+    let mut member = ClusterMemberConfig::new(1, fabric.clone(), vec![(1, fabric.clone())]);
+    member.tls = Some(tls);
+    let mut config = BrokerConfig::default();
+    config.cluster = Some(member);
+    let bound = Broker::new(config).bind("127.0.0.1:0").await.expect("bind");
+    let shutdown = bound.shutdown_handle();
+    tokio::spawn(bound.run());
+
+    // A client certificate from the SAME CA, naming an application host.
+    let (app_cert, app_key) = pki.leaf_for("app", &["app.example"]);
+    use rustls::pki_types::pem::PemObject;
+    let mut roots = rustls::RootCertStore::empty();
+    for c in rustls::pki_types::CertificateDer::pem_slice_iter(pki.ca_pem.as_bytes()) {
+        roots.add(c.unwrap()).unwrap();
+    }
+    let chain: Vec<_> = rustls::pki_types::CertificateDer::pem_slice_iter(app_cert.as_bytes())
+        .map(Result::unwrap)
+        .collect();
+    let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(app_key.as_bytes()).unwrap();
+    let client = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_root_certificates(roots)
+    .with_client_auth_cert(chain, key)
+    .unwrap();
+    let tcp = tokio::net::TcpStream::connect(&fabric).await.unwrap();
+    let mut stream = tokio_rustls::TlsConnector::from(Arc::new(client))
+        .connect("127.0.0.1".try_into().unwrap(), tcp)
+        .await
+        .expect("TLS itself succeeds: the chain is valid");
+    let _ = stream
+        .write_all(&[0, 0, 0, 8, 0, 2, 0, 0, 0, 0, 0, 0])
+        .await;
+    let mut buf = [0u8; 16];
+    let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
+        .await
+        .expect("closed promptly")
+        .unwrap_or(0);
+    assert_eq!(n, 0, "a non-member certificate is dropped, never served");
+    shutdown.shutdown();
+}
+
+/// Review M5: the client CA bundle reloads like the certificate does — a
+/// rotated CA is trusted without a restart.
+#[tokio::test]
+async fn client_ca_reloads_without_a_restart() {
+    let pki = Pki::new("ca");
+    let (cert, key) = pki.leaf_files("server");
+    let next_ca = Pki::new("next-ca");
+    let (ncert, nkey) = next_ca.leaf_files("client");
+    let ca_path = pki.dir.path().join("clients-ca.crt");
+    std::fs::write(&ca_path, &pki.ca_pem).unwrap();
+    let mut tls = TlsServerConfig::new(cert, key);
+    tls.client_ca_file = Some(ca_path.clone());
+    tls.reload_interval = Duration::from_millis(100);
+    let mut config = BrokerConfig::default();
+    config.tls = Some(tls);
+    config.tls_listen = Some("127.0.0.1:0".to_owned());
+    let (addr, shutdown) = start(config).await;
+    // A client of the next CA is refused…
+    assert!(
+        round_trip(addr, client_tls(&pki, Some((&ncert, &nkey))), "/queues/ca")
+            .await
+            .is_err()
+    );
+    // …until the CA bundle is rotated to include it.
+    std::fs::write(&ca_path, format!("{}{}", pki.ca_pem, next_ca.ca_pem)).unwrap();
+    let mut ok = false;
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if round_trip(addr, client_tls(&pki, Some((&ncert, &nkey))), "/queues/ca")
+            .await
+            .is_ok()
+        {
+            ok = true;
+            break;
+        }
+    }
+    assert!(ok, "the rotated client CA is trusted without a restart");
+    shutdown.shutdown();
+}
+
+/// Review L9: TLS-only — no plain listener at all.
+#[tokio::test]
+async fn tls_only_mode_binds_no_plain_listener() {
+    let pki = Pki::new("ca");
+    let (cert, key) = pki.leaf_files("server");
+    let mut config = BrokerConfig::default();
+    config.tls = Some(TlsServerConfig::new(cert, key));
+    config.tls_listen = Some("127.0.0.1:0".to_owned());
+    let bound = Broker::new(config).bind("").await.expect("TLS-only bind");
+    let addr = bound.local_addr();
+    assert_eq!(
+        bound.tls_local_addr(),
+        Some(addr),
+        "the only listener is TLS"
+    );
+    let shutdown = bound.shutdown_handle();
+    tokio::spawn(bound.run());
+    round_trip(addr, client_tls(&pki, None), "/queues/only")
+        .await
+        .expect("served over TLS");
+    // Without a TLS listener, an empty address is refused.
+    assert!(Broker::new(BrokerConfig::default()).bind("").await.is_err());
+    shutdown.shutdown();
 }

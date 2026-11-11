@@ -266,11 +266,17 @@ async fn main() -> std::io::Result<()> {
     if config.data_dir.is_some() && !cfg!(feature = "store-redb") {
         fail("a data dir is configured but this build lacks the `store-redb` feature");
     }
+    // `listen = ""` / `--listen none` disables the plain listener (TLS-only).
     let listen = args
         .listen
         .clone()
         .or_else(|| file.listen.clone())
         .unwrap_or_else(|| "0.0.0.0:5672".to_owned());
+    let listen = if listen == "none" {
+        String::new()
+    } else {
+        listen
+    };
     let allow_anonymous = args.allow_anonymous || file.allow_anonymous.unwrap_or(false);
 
     let users = {
@@ -312,82 +318,114 @@ async fn main() -> std::io::Result<()> {
         tracing::info!(node_id = ?args.node_id, "cluster member starting");
     }
 
-    // Startup topology: exchanges, then queues, then bindings — declared in
-    // the background (a clustered declare waits for the cluster to form),
-    // each retried until it lands. All idempotent across restarts.
-    if !(file.queues.is_empty() && file.exchanges.is_empty() && file.bindings.is_empty()) {
-        let broker = bound.broker().clone();
-        let file = file.clone();
+    // Signals first, so a stop request during the startup declarations
+    // below (which can wait on cluster formation) still ends the process.
+    let serving = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let shutdown = bound.shutdown_handle();
+    {
+        let serving = serving.clone();
         tokio::spawn(async move {
-            async fn retry<F, Fut, E>(what: String, mut op: F)
-            where
-                F: FnMut() -> Fut,
-                Fut: std::future::Future<Output = Result<(), E>>,
-                E: std::fmt::Display,
+            let ctrl_c = tokio::signal::ctrl_c();
+            #[cfg(unix)]
             {
-                let mut delay = std::time::Duration::from_millis(200);
-                loop {
-                    match op().await {
-                        Ok(()) => {
-                            tracing::info!(%what, "declared");
-                            return;
-                        }
-                        Err(e) => {
-                            tracing::warn!(%what, error = %e, "declare failed; retrying");
-                            tokio::time::sleep(delay).await;
-                            delay = (delay * 2).min(std::time::Duration::from_secs(10));
-                        }
-                    }
+                let mut term =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                        .expect("SIGTERM handler");
+                tokio::select! {
+                    _ = ctrl_c => {}
+                    _ = term.recv() => {}
                 }
             }
-            for e in &file.exchanges {
-                retry(format!("exchange {}", e.name), || async {
-                    broker
-                        .declare_exchange(&e.vhost, &e.name, e.kind(), e.alternate.as_deref())
-                        .await
-                        .map(|_| ())
-                })
-                .await;
+            #[cfg(not(unix))]
+            let _ = ctrl_c.await;
+            tracing::info!("shutdown signal received; shutting down");
+            if !serving.load(std::sync::atomic::Ordering::Acquire) {
+                std::process::exit(0);
             }
-            for q in &file.queues {
-                retry(format!("queue {}", q.address), || {
-                    broker.declare_queue(&q.vhost, &q.address)
-                })
-                .await;
-            }
-            for b in &file.bindings {
-                retry(
-                    format!("binding {} -> {} ({:?})", b.exchange, b.queue, b.key),
-                    || async {
-                        broker
-                            .bind_queue(&b.vhost, &b.exchange, &b.queue, &b.key)
-                            .await
-                            .map(|_| ())
-                    },
-                )
-                .await;
-            }
+            shutdown.shutdown();
         });
     }
 
-    let shutdown = bound.shutdown_handle();
-    tokio::spawn(async move {
-        let ctrl_c = tokio::signal::ctrl_c();
-        #[cfg(unix)]
-        {
-            let mut term =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                    .expect("SIGTERM handler");
-            tokio::select! {
-                _ = ctrl_c => {}
-                _ = term.recv() => {}
-            }
-        }
-        #[cfg(not(unix))]
-        let _ = ctrl_c.await;
-        tracing::info!("shutdown signal received; shutting down");
-        shutdown.shutdown();
-    });
+    // Startup topology — exchanges, then queues, then bindings — is in place
+    // BEFORE the listener starts accepting, so no client sees a missing
+    // exchange or publishes ahead of its bindings. All idempotent across
+    // restarts. Transient unavailability (cluster still forming, store lock
+    // lingering) is retried; anything else is a configuration error and
+    // stops the daemon.
+    declare_topology(bound.broker(), &file).await;
+    serving.store(true, std::sync::atomic::Ordering::Release);
 
     bound.run().await
+}
+
+/// Declare the config file's exchanges, queues, and bindings, retrying only
+/// transient failures. A permanent one (e.g. an exchange whose type changed
+/// while the old definition is persisted) exits with a clear message.
+async fn declare_topology(broker: &Broker, file: &FileConfig) {
+    use ramqp_broker::ExchangeError;
+    enum Outcome {
+        Done,
+        Retry(String),
+        Fatal(String),
+    }
+    async fn retry<F, Fut>(what: String, mut op: F)
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Outcome>,
+    {
+        let mut delay = std::time::Duration::from_millis(200);
+        loop {
+            match op().await {
+                Outcome::Done => {
+                    tracing::info!(%what, "declared");
+                    return;
+                }
+                Outcome::Retry(e) => {
+                    tracing::warn!(%what, error = %e, "declare not possible yet; retrying");
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(std::time::Duration::from_secs(10));
+                }
+                Outcome::Fatal(e) => fail(format!("{what}: {e}")),
+            }
+        }
+    }
+    let exchange_outcome = |r: Result<bool, ExchangeError>| match r {
+        Ok(_) => Outcome::Done,
+        Err(ExchangeError::Unavailable(e)) => Outcome::Retry(e),
+        Err(e) => Outcome::Fatal(e.to_string()),
+    };
+    for e in &file.exchanges {
+        retry(format!("exchange {:?}", e.name), || async {
+            exchange_outcome(
+                broker
+                    .declare_exchange(&e.vhost, &e.name, e.kind(), e.alternate.as_deref())
+                    .await,
+            )
+        })
+        .await;
+    }
+    for q in &file.queues {
+        // Addresses were validated at load; a failure here is the cluster,
+        // store, or a limit — all worth retrying.
+        retry(format!("queue {}", q.address), || async {
+            match broker.declare_queue(&q.vhost, &q.address).await {
+                Ok(()) => Outcome::Done,
+                Err(e) => Outcome::Retry(e),
+            }
+        })
+        .await;
+    }
+    for b in &file.bindings {
+        retry(
+            format!("binding {} -> {} ({:?})", b.exchange, b.queue, b.key),
+            || async {
+                exchange_outcome(
+                    broker
+                        .bind_queue(&b.vhost, &b.exchange, &b.queue, &b.key)
+                        .await,
+                )
+            },
+        )
+        .await;
+    }
 }

@@ -424,7 +424,7 @@ fn handle_msg(
                 }
             }
         }
-        QueueMsg::Stats { reply } => {
+        QueueMsg::Stats { reply, .. } => {
             let _ = reply.send(crate::queue::QueueStats {
                 ready: ready.len(),
                 unacked: inflight.len(),

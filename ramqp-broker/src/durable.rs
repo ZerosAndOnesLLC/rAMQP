@@ -226,7 +226,7 @@ async fn run(
                             }
                         }
                     }
-                    QueueMsg::Stats { reply } => {
+                    QueueMsg::Stats { reply, .. } => {
                         let _ = reply.send(crate::queue::QueueStats {
                             ready: ready.len(),
                             unacked: inflight.len(),
@@ -245,12 +245,12 @@ async fn run(
                                 refuse_publish(&name, done.ack);
                             }
                         }
-                        let (tx, rx) = tokio::sync::oneshot::channel();
+                        let (purge_tx, purge_rx) = tokio::sync::oneshot::channel();
                         let purged = store
-                            .submit(StoreOp::PurgeQueue { queue: queue_id, name: name.clone(), done: tx })
+                            .submit(StoreOp::PurgeQueue { queue: queue_id, name: name.clone(), done: purge_tx })
                             .await
                             .is_ok()
-                            && rx.await.unwrap_or(false);
+                            && purge_rx.await.unwrap_or(false);
                         if !purged {
                             tracing::error!(queue = %name, "durable queue purge failed; queue kept");
                             let _ = reply.send(false);
@@ -259,6 +259,7 @@ async fn run(
                         crate::queue::notify_deleted(&subs);
                         let _ = reply.send(true);
                         tracing::info!(queue = %name, "durable queue deleted");
+                        crate::queue::drain_after_delete(&name, &mut rx, next_sub_id).await;
                         return;
                     }
                     QueueMsg::Unsubscribe { sub } => {

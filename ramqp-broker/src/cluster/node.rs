@@ -73,6 +73,12 @@ pub struct NodeSettings {
     pub tls: Option<crate::config::TlsServerConfig>,
 }
 
+/// Capability bit: applies `MetaCommand::Exchange` (and the extended
+/// metadata snapshot).
+const CAP_EXCHANGES: u64 = 1;
+/// What this node supports (answered to `RequestKind::Capabilities`).
+const CAPABILITIES: u64 = CAP_EXCHANGES;
+
 /// One local member of a per-queue Raft group.
 struct GroupMember {
     raft: QueueRaft,
@@ -99,6 +105,9 @@ pub struct ClusterNode {
     /// which then answers the leader's appends with conflicts below its
     /// matched index ("follower log reversion", an openraft panic).
     stopping: std::sync::atomic::AtomicBool,
+    /// Every voter has confirmed it understands exchange metadata commands
+    /// (checked before the first one is proposed; sticky once true).
+    exchanges_capable: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for ClusterNode {
@@ -225,6 +234,7 @@ impl ClusterNode {
             shutdown,
             settings,
             stopping: std::sync::atomic::AtomicBool::new(false),
+            exchanges_capable: std::sync::atomic::AtomicBool::new(false),
         });
 
         tokio::spawn(serve_fabric(
@@ -705,14 +715,65 @@ impl ClusterNode {
         &self,
         op: crate::exchange::ExchangeOp,
     ) -> Result<(bool, u64), crate::exchange::ExchangeError> {
-        use crate::exchange::ExchangeError;
-        match self.meta_write(MetaCommand::Exchange(op)).await {
+        use crate::exchange::{ExchangeError, ExchangeOp};
+        self.ensure_exchange_capable().await?;
+        let removes = matches!(op, ExchangeOp::Delete { .. } | ExchangeOp::Unbind { .. });
+        let (result, ambiguous) = self.meta_write_tracked(MetaCommand::Exchange(op)).await;
+        match result {
+            // A retry after an ambiguous failure may find its own earlier
+            // attempt already applied: the requested state holds, so a
+            // removal reporting "not found" succeeded.
+            Ok(MetaResponse::Exchange(Err(ExchangeError::NotFound(_)))) if ambiguous && removes => {
+                Ok((true, self.exchanges_epoch()))
+            }
             Ok(MetaResponse::Exchange(result)) => result,
             Ok(other) => Err(ExchangeError::Unavailable(format!(
                 "unexpected metadata response {other:?}"
             ))),
             Err(e) => Err(ExchangeError::Unavailable(e)),
         }
+    }
+
+    /// Refuse exchange commands until every metadata voter runs a version
+    /// that can apply them: an older node would fail to decode the log entry
+    /// (or a snapshot carrying exchange state). Checked over the fabric
+    /// (`RequestKind::Capabilities`, which an older node cannot answer).
+    async fn ensure_exchange_capable(&self) -> Result<(), crate::exchange::ExchangeError> {
+        use std::sync::atomic::Ordering;
+        if self.exchanges_capable.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        for (id, addr) in self.voters() {
+            if id == self.node_id {
+                continue;
+            }
+            let capable = async {
+                let conn = self.peers.client(id, &addr).conn().await.ok()?;
+                let reply = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    conn.call(RequestKind::Capabilities, Bytes::new()),
+                )
+                .await
+                .ok()?
+                .ok()?;
+                crate::serde_bin::from_slice::<u64>(&reply).ok()
+            }
+            .await
+            .is_some_and(|caps| caps & CAP_EXCHANGES != 0);
+            if !capable {
+                return Err(crate::exchange::ExchangeError::Unavailable(format!(
+                    "cluster node {id} does not support exchanges yet: upgrade every node \
+                     before declaring exchanges or bindings"
+                )));
+            }
+        }
+        self.exchanges_capable.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// Whether the replicated catalog has this queue.
+    pub(crate) fn has_queue(&self, name: &str) -> bool {
+        self.meta_store.catalog().contains_key(name)
     }
 
     /// This node's applied exchange definitions and their epoch.
@@ -735,6 +796,25 @@ impl ClusterNode {
 
     /// Commit a catalog write, forwarding to the metadata leader if needed.
     pub async fn meta_write(&self, cmd: MetaCommand) -> Result<MetaResponse, String> {
+        self.meta_write_tracked(cmd).await.0
+    }
+
+    /// [`Self::meta_write`], also reporting whether an attempt failed
+    /// AMBIGUOUSLY before the final one (it may have been applied anyway).
+    pub(crate) async fn meta_write_tracked(
+        &self,
+        cmd: MetaCommand,
+    ) -> (Result<MetaResponse, String>, bool) {
+        let mut ambiguous = false;
+        let result = self.meta_write_inner(cmd, &mut ambiguous).await;
+        (result, ambiguous)
+    }
+
+    async fn meta_write_inner(
+        &self,
+        cmd: MetaCommand,
+        ambiguous: &mut bool,
+    ) -> Result<MetaResponse, String> {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         let mut hint: Option<(NodeId, Option<String>)> = None;
         loop {
@@ -751,6 +831,7 @@ impl ClusterNode {
                     hint = next.map(|id| (id, None));
                 }
                 Err(MetaWriteError::Other(e)) => {
+                    *ambiguous = true;
                     tracing::debug!(error = %e, "meta write retry");
                 }
             }
@@ -1031,6 +1112,26 @@ async fn accept_conn(
         Some(tls) => {
             match tokio::time::timeout(Duration::from_secs(10), tls.acceptor.accept(stream)).await {
                 Ok(Ok(stream)) => {
+                    // Chain verification proved the CA; also require the
+                    // certificate to name a seed host (cluster membership).
+                    let hosts: Vec<_> = node
+                        .settings
+                        .seeds
+                        .iter()
+                        .filter_map(|(_, addr)| crate::tls::server_name(addr).ok())
+                        .collect();
+                    let member = stream
+                        .get_ref()
+                        .1
+                        .peer_certificates()
+                        .and_then(|c| c.first())
+                        .is_some_and(|leaf| crate::tls::names_one_of(leaf, &hosts));
+                    if !member {
+                        tracing::warn!(
+                            "fabric peer certificate names no cluster seed host; refused"
+                        );
+                        return;
+                    }
                     let (r, w) = tokio::io::split(stream);
                     handle_conn(r, w, node).await;
                 }
@@ -1277,6 +1378,47 @@ async fn handle_request(
                     &writer,
                     corr,
                     crate::serde_bin::to_vec(&ok).map_err(|e| e.to_string()),
+                );
+            });
+        }
+        RequestKind::Capabilities => {
+            send_reply(
+                writer,
+                corr,
+                crate::serde_bin::to_vec(&CAPABILITIES).map_err(|e| e.to_string()),
+            );
+        }
+        RequestKind::QueueStats { queue } => {
+            let node = node.clone();
+            let writer = writer.clone();
+            tokio::spawn(async move {
+                let stats = match node.leader_actor(&queue).await {
+                    Ok(handle) => {
+                        let (tx, rx) = oneshot::channel();
+                        if handle
+                            .tx
+                            .send(QueueMsg::Stats {
+                                reply: tx,
+                                forward: false,
+                            })
+                            .await
+                            .is_ok()
+                        {
+                            tokio::time::timeout(Duration::from_secs(2), rx)
+                                .await
+                                .ok()
+                                .and_then(Result::ok)
+                                .map(|s| (s.ready as u64, s.unacked as u64, s.consumers as u64))
+                        } else {
+                            None
+                        }
+                    }
+                    Err(_) => None,
+                };
+                send_reply(
+                    &writer,
+                    corr,
+                    crate::serde_bin::to_vec(&stats).map_err(|e| e.to_string()),
                 );
             });
         }

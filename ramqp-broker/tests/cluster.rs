@@ -497,3 +497,66 @@ async fn exchanges_route_cluster_wide() {
         n.shutdown.shutdown();
     }
 }
+
+/// Review H3: `GET /queues/<vhost>/<name>` reports the real backlog on
+/// EVERY node — a non-leader fetches the leader's stats over the fabric —
+/// never zeros (an autoscaler polling through a Service hits any node).
+#[tokio::test(flavor = "multi_thread")]
+async fn per_queue_stats_are_real_on_every_node() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let fabric = reserve_addrs(3).await;
+    let mgmt = reserve_addrs(3).await;
+    let seeds: Vec<(u64, String)> = (1..=3u64).zip(fabric).collect();
+    let mut nodes = Vec::new();
+    for ((id, f), m) in seeds.iter().zip(&mgmt) {
+        let mut config = BrokerConfig::default();
+        config.cluster = Some(ClusterMemberConfig::new(*id, f.clone(), seeds.clone()));
+        config.management_listen = Some(m.clone());
+        let broker = Broker::new(config);
+        let bound = broker.clone().bind("127.0.0.1:0").await.expect("bind");
+        let addr = bound.local_addr();
+        let shutdown = bound.shutdown_handle();
+        tokio::spawn(bound.run());
+        nodes.push((broker, addr, shutdown));
+    }
+    for (b, _, _) in &nodes {
+        assert!(b.cluster_formed(Duration::from_secs(15)).await);
+    }
+    let conn = ConnectionBuilder::new(format!("amqp://{}", nodes[0].1))
+        .connect()
+        .await
+        .unwrap();
+    let s = conn.begin_session().await.unwrap();
+    let p = s.create_producer("/quorum/scaled").await.unwrap();
+    for i in 0..3 {
+        p.send(Message::text(format!("m{i}"))).await.unwrap();
+    }
+    conn.close().await.unwrap();
+
+    for m in &mgmt {
+        let mut body = String::new();
+        for _ in 0..50 {
+            let mut stream = tokio::net::TcpStream::connect(m).await.unwrap();
+            stream
+                .write_all(b"GET /queues/%2F/scaled?kind=quorum HTTP/1.1\r\nhost: x\r\n\r\n")
+                .await
+                .unwrap();
+            let mut buf = Vec::new();
+            stream.read_to_end(&mut buf).await.unwrap();
+            let text = String::from_utf8_lossy(&buf).into_owned();
+            if text.starts_with("HTTP/1.1 200") {
+                body = text.split_once("\r\n\r\n").unwrap().1.to_owned();
+                break;
+            }
+            // 503 while a leader settles: retry. (No 404: every node knows
+            // the queue from the replicated catalog.)
+            assert!(!text.starts_with("HTTP/1.1 404"), "node at {m}: {text}");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let v: serde_json::Value = serde_json::from_str(&body).expect("200 with JSON");
+        assert_eq!(v["ready"], 3, "node at {m}: {body}");
+    }
+    for (_, _, sd) in &nodes {
+        sd.shutdown();
+    }
+}

@@ -58,6 +58,11 @@ pub(crate) struct BrokerCounters {
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// Concurrent management connections; excess sockets are dropped.
 const MAX_CONCURRENT: usize = 64;
+/// How long a client has to send the request head.
+const HEAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+/// TLS handshake bound on the management port.
+#[cfg(any(feature = "tls", feature = "fips"))]
+pub(crate) const TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// Request head bound.
 const MAX_HEAD: usize = 8 * 1024;
 /// Request body bound (definitions are tiny).
@@ -242,11 +247,28 @@ async fn handle_request(
     counters: Arc<BrokerCounters>,
     auth: Arc<MgmtAuth>,
 ) {
-    let response = match read_request(&mut stream).await {
-        Ok(req) => route(req, &registry, &counters, &auth).await,
-        Err(resp) => resp,
+    // The head must arrive promptly: idle sockets must not hold one of the
+    // few connection slots for the whole request deadline.
+    let response = match tokio::time::timeout(HEAD_TIMEOUT, read_request(&mut stream)).await {
+        Ok(Ok(req)) => route(req, &registry, &counters, &auth).await,
+        Ok(Err(resp)) => resp,
+        Err(_) => Response::error(408, "request not received in time"),
     };
     let _ = respond(&mut stream, response).await;
+    // Swallow whatever the client still sends (an unread body behind an
+    // early 401/413) until it closes: closing with unread data would reset
+    // the connection and could destroy the response in flight.
+    let mut sink = [0u8; 4096];
+    let mut left = MAX_BODY;
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while left > 0 {
+            match stream.read(&mut sink).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => left = left.saturating_sub(n),
+            }
+        }
+    })
+    .await;
 }
 
 /// Constant-time byte comparison.
@@ -276,10 +298,46 @@ fn authenticated(req: &Request, auth: &MgmtAuth) -> bool {
             let Some((user, password)) = text.split_once(':') else {
                 return false;
             };
-            auth.authenticator.management_login(user, password)
+            // Checked off the async workers in `route` (PBKDF2).
+            let _ = (user, password);
+            false
         }
         _ => false,
     }
+}
+
+/// [`authenticated`], plus Basic credentials checked on the blocking pool
+/// (the authenticator runs PBKDF2).
+async fn authenticated_async(req: &Request, auth: &MgmtAuth) -> bool {
+    if authenticated(req, auth) {
+        return true;
+    }
+    let Some(header) = req.authorization.as_deref() else {
+        return false;
+    };
+    let Some((scheme, value)) = header.split_once(' ') else {
+        return false;
+    };
+    if !scheme.eq_ignore_ascii_case("basic") {
+        return false;
+    }
+    use base64::Engine;
+    let Some((user, password)) = base64::engine::general_purpose::STANDARD
+        .decode(value.trim())
+        .ok()
+        .and_then(|d| String::from_utf8(d).ok())
+        .and_then(|t| t.split_once(':').map(|(u, p)| (u.to_owned(), p.to_owned())))
+    else {
+        return false;
+    };
+    let authenticator = auth.authenticator.clone();
+    crate::auth::run_password_check(move || {
+        authenticator
+            .management_login(&user, &password)
+            .then_some(())
+    })
+    .await
+    .is_some()
 }
 
 /// Percent-decoded path segments; the RabbitMQ-style default vhost `%2F`
@@ -356,7 +414,7 @@ fn exchange_error(e: ExchangeError) -> Response {
 
 async fn route(
     req: Request,
-    registry: &QueueRegistry,
+    registry: &Arc<QueueRegistry>,
     counters: &BrokerCounters,
     auth: &MgmtAuth,
 ) -> Response {
@@ -365,7 +423,10 @@ async fn route(
         "PUT" | "DELETE" => true,
         _ => return Response::error(405, "method not allowed"),
     };
-    if (write || auth.auth_reads) && !authenticated(&req, auth) {
+    if (write || auth.auth_reads) && !authenticated_async(&req, auth).await {
+        // Slow every failed attempt down (with the connection cap this
+        // bounds guessing to a few hundred tries per second).
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         let mut r = Response::error(
             401,
             "credentials required: Authorization: Bearer <management token>, \
@@ -477,9 +538,16 @@ async fn route(
 }
 
 /// Apply a topology change: `201` changed, `204` already so (or deleted).
-async fn change(registry: &QueueRegistry, op: ExchangeOp) -> Response {
+async fn change(registry: &Arc<QueueRegistry>, op: ExchangeOp) -> Response {
     let deleting = matches!(op, ExchangeOp::Delete { .. } | ExchangeOp::Unbind { .. });
-    match registry.exchange_op(op).await {
+    // In its own task: the request deadline must not cancel a change midway
+    // (persisted but not yet swapped into the routing view).
+    let registry = registry.clone();
+    let result = match tokio::spawn(async move { registry.exchange_op(op).await }).await {
+        Ok(r) => r,
+        Err(e) => return Response::error(500, e),
+    };
+    match result {
         Ok(_) if deleting => Response::empty(204),
         Ok(true) => Response::empty(201),
         Ok(false) => Response::empty(204),
@@ -487,17 +555,25 @@ async fn change(registry: &QueueRegistry, op: ExchangeOp) -> Response {
     }
 }
 
-async fn queue_stats(handle: &QueueHandle) -> QueueStats {
-    let (tx, rx) = oneshot::channel();
-    if handle.tx.try_send(QueueMsg::Stats { reply: tx }).is_ok() {
-        tokio::time::timeout(std::time::Duration::from_millis(500), rx)
+/// One queue's stats for a single-queue lookup: waits for mailbox room
+/// (no `try_send`: a saturated queue is exactly when the number matters) and
+/// follows a clustered queue to its leader. `None` = not knowable right now.
+async fn queue_stats(handle: &QueueHandle) -> Option<QueueStats> {
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        let (tx, rx) = oneshot::channel();
+        handle
+            .tx
+            .send(QueueMsg::Stats {
+                reply: tx,
+                forward: true,
+            })
             .await
-            .ok()
-            .and_then(|r| r.ok())
-            .unwrap_or_default()
-    } else {
-        QueueStats::default()
-    }
+            .ok()?;
+        rx.await.ok()
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 fn requested_kind(req: &Request) -> Result<Option<QueueKind>, Response> {
@@ -520,7 +596,11 @@ async fn get_queue(registry: &QueueRegistry, req: &Request, vhost: &str, name: &
     let Some((kind, handle)) = registry.find_queue(kind, &qualified).await else {
         return Response::error(404, "no such queue");
     };
-    let stats = queue_stats(&handle).await;
+    let Some(stats) = queue_stats(&handle).await else {
+        // Never report zeros for an unknown backlog: an autoscaler would
+        // scale consumers away from a full queue.
+        return Response::error(503, "queue statistics unavailable right now; retry");
+    };
     Response::json(
         200,
         &json!({
@@ -536,7 +616,12 @@ async fn get_queue(registry: &QueueRegistry, req: &Request, vhost: &str, name: &
     )
 }
 
-async fn put_queue(registry: &QueueRegistry, req: &Request, vhost: &str, name: &str) -> Response {
+async fn put_queue(
+    registry: &Arc<QueueRegistry>,
+    req: &Request,
+    vhost: &str,
+    name: &str,
+) -> Response {
     let body = match body_json(req) {
         Ok(b) => b,
         Err(r) => return r,
@@ -563,7 +648,11 @@ async fn put_queue(registry: &QueueRegistry, req: &Request, vhost: &str, name: &
         None => {}
     }
     let address = format!("{}{name}", kind_prefix(kind));
-    match registry.resolve_in(vhost, &address).await {
+    let (reg, vh, addr) = (registry.clone(), vhost.to_owned(), address.clone());
+    let declared = tokio::spawn(async move { reg.resolve_in(&vh, &addr).await.is_some() })
+        .await
+        .unwrap_or(false);
+    match declared.then_some(()) {
         Some(_) => Response::empty(201),
         None => Response::error(
             503,
@@ -573,7 +662,7 @@ async fn put_queue(registry: &QueueRegistry, req: &Request, vhost: &str, name: &
 }
 
 async fn delete_queue(
-    registry: &QueueRegistry,
+    registry: &Arc<QueueRegistry>,
     req: &Request,
     vhost: &str,
     name: &str,
@@ -601,7 +690,11 @@ async fn delete_queue(
             }
         },
     };
-    match registry.delete_queue(kind, &qualified).await {
+    let reg = registry.clone();
+    let outcome = tokio::spawn(async move { reg.delete_queue(kind, &qualified).await })
+        .await
+        .unwrap_or(Err(QueueDeleteError::Failed));
+    match outcome {
         Ok(()) => Response::empty(204),
         Err(QueueDeleteError::NotFound) => Response::error(404, "no such queue"),
         Err(QueueDeleteError::Unsupported) => {
@@ -654,6 +747,7 @@ async fn respond(stream: &mut Box<dyn MgmtStream>, response: Response) -> std::i
         400 => "Bad Request",
         401 => "Unauthorized",
         404 => "Not Found",
+        408 => "Request Timeout",
         405 => "Method Not Allowed",
         409 => "Conflict",
         411 => "Length Required",
@@ -680,22 +774,27 @@ async fn respond(stream: &mut Box<dyn MgmtStream>, response: Response) -> std::i
     stream.shutdown().await
 }
 
-/// One queue's scrape: `(key like "t:name", stats)`; a dead/busy actor
-/// reports zeros rather than stalling the scrape.
+/// The node-local scrape: `(key like "t:name", stats)` for each queue this
+/// node can report.
 async fn collect(registry: &QueueRegistry) -> Vec<(String, QueueStats)> {
     let mut out = Vec::new();
     for (key, handle) in registry.queues() {
         let (tx, rx) = oneshot::channel();
-        let stats = if handle.tx.try_send(QueueMsg::Stats { reply: tx }).is_ok() {
-            tokio::time::timeout(std::time::Duration::from_millis(200), rx)
-                .await
-                .ok()
-                .and_then(|r| r.ok())
-                .unwrap_or_default()
-        } else {
-            QueueStats::default()
-        };
-        out.push((key, stats));
+        let sent = handle
+            .tx
+            .try_send(QueueMsg::Stats {
+                reply: tx,
+                forward: false,
+            })
+            .is_ok();
+        // Omitted — not zeroed — when unknown here: a busy actor, or a
+        // clustered queue another node leads (that node reports it).
+        if sent
+            && let Ok(Ok(stats)) =
+                tokio::time::timeout(std::time::Duration::from_millis(200), rx).await
+        {
+            out.push((key, stats));
+        }
     }
     out
 }

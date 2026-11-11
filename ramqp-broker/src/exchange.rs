@@ -104,6 +104,12 @@ pub(crate) enum ExchangeOp {
         destination: String,
         key: String,
     },
+    /// Remove every binding (in `vhost`) to `destination` — the queue was
+    /// deleted. Appended last: existing variants keep their wire tags.
+    UnbindDestination {
+        vhost: String,
+        destination: String,
+    },
 }
 
 /// Why a topology change was refused.
@@ -174,23 +180,37 @@ fn valid_vhost(s: &str) -> bool {
     s.len() <= 255 && !s.contains('/') && !s.chars().any(char::is_control)
 }
 
+/// Longest routing / binding key (bytes), as in AMQP 0-9-1 and RabbitMQ.
+pub(crate) const MAX_KEY_LEN: usize = 255;
+
 fn valid_key(s: &str) -> bool {
-    s.len() <= 255 && !s.chars().any(char::is_control)
+    s.len() <= MAX_KEY_LEN && !s.chars().any(char::is_control)
 }
 
 fn valid_destination(d: &str) -> bool {
-    ["/queues/", "/quorum/", "/durable/"]
-        .iter()
-        .any(|p| d.strip_prefix(p).is_some_and(valid_segment))
+    ["/queues/", "/quorum/", "/durable/"].iter().any(|p| {
+        d.strip_prefix(p)
+            .is_some_and(|n| valid_segment(n) && !n.starts_with('$'))
+    })
 }
 
 /// Structural validation, shared by every entry point.
 pub(crate) fn validate(op: &ExchangeOp) -> Result<(), ExchangeError> {
     let bad = |m: String| Err(ExchangeError::Invalid(m));
+    if let ExchangeOp::UnbindDestination { vhost, destination } = op {
+        if !valid_vhost(vhost) {
+            return bad(format!("invalid vhost {vhost:?}"));
+        }
+        if !valid_destination(destination) {
+            return bad(format!("{destination:?} is not a queue address"));
+        }
+        return Ok(());
+    }
     let (vhost, name) = match op {
         ExchangeOp::Declare { vhost, name, .. } | ExchangeOp::Delete { vhost, name } => {
             (vhost, name)
         }
+        ExchangeOp::UnbindDestination { .. } => unreachable!("handled above"),
         ExchangeOp::Bind {
             vhost, exchange, ..
         }
@@ -234,6 +254,7 @@ pub(crate) fn validate(op: &ExchangeOp) -> Result<(), ExchangeError> {
                 return bad(format!("invalid binding key {key:?}"));
             }
         }
+        ExchangeOp::UnbindDestination { .. } => {}
         ExchangeOp::Delete { name, .. } => {
             if builtin(name).is_some() {
                 return bad(format!("{name:?} is built in and cannot be deleted"));
@@ -305,6 +326,18 @@ pub(crate) fn apply_op(defs: &mut Defs, op: &ExchangeOp) -> Result<bool, Exchang
             }
             def.bindings.push(binding);
             Ok(true)
+        }
+        ExchangeOp::UnbindDestination { vhost, destination } => {
+            let prefix = format!("{vhost}/");
+            let mut changed = false;
+            for (k, def) in defs.iter_mut() {
+                if k.starts_with(&prefix) && !k[prefix.len()..].contains('/') {
+                    let before = def.bindings.len();
+                    def.bindings.retain(|b| b.destination != *destination);
+                    changed |= def.bindings.len() != before;
+                }
+            }
+            Ok(changed)
         }
         ExchangeOp::Unbind {
             vhost,

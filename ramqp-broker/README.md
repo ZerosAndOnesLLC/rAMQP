@@ -157,22 +157,28 @@ daemon logs `FIPS build: …` at startup and refuses to run if the module is
 not active (`ramqp_broker::fips_enabled()`).
 
 ```toml
+listen = ""                        # optional: TLS-only (no plain listener); or --listen none
+
 [tls]
-listen = "0.0.0.0:5671"            # amqps; the plain listener stays (bind it to loopback for TLS-only)
+listen = "0.0.0.0:5671"            # amqps
 cert_file = "/etc/ramqp/tls/tls.crt"
 key_file = "/etc/ramqp/tls/tls.key"
-client_ca_file = "/etc/ramqp/tls/ca.crt"   # optional: require client certificates
-management = true                  # serve the management endpoint over TLS
+client_ca_file = "/etc/ramqp/tls/ca.crt"   # optional: require client certificates (amqps only)
+management = true                  # management endpoint over TLS (never requires client certs)
 
-[cluster]
-# ...
-tls = true                         # mutual TLS on the fabric ([tls] cert, client_ca_file = cluster CA)
+[cluster.tls]                      # mutual TLS on the fabric
+cert_file = "/etc/ramqp/fabric/tls.crt"
+key_file = "/etc/ramqp/fabric/tls.key"
+ca_file = "/etc/ramqp/fabric/ca.crt"       # a DEDICATED cluster CA
 ```
 
-Certificate files are re-read when they change (cert-manager rotation): new
-handshakes get the new certificate, and a broken file keeps the previous one.
-Fabric certificates must carry the host of each node's seed address (DNS or IP
-SAN). Flags: `--tls-listen`, `--tls-cert`, `--tls-key`, `--tls-client-ca`.
+Certificates **and CA bundles** are re-read when they change (cert-manager
+rotation): new handshakes use them, and a broken file keeps the previous
+material. The fabric needs its **own CA** — the daemon refuses to share it
+with `client_ca_file`, since anything that CA signs could reach the fabric —
+and a peer's certificate must also name one of the seed hosts (DNS or IP
+SAN), so a stray certificate from the same CA is still refused. Flags:
+`--tls-listen`, `--tls-cert`, `--tls-key`, `--tls-client-ca`.
 
 ### Management API
 
@@ -183,7 +189,7 @@ inspection, and an idempotent admin API (the default vhost is `%2F`):
 |---|---|
 | `GET /metrics` | Prometheus text (connections, RSS, per-queue gauges) |
 | `GET /queues` | every queue with ready / unacked / consumers |
-| `GET /queues/<vhost>/<name>[?kind=]` | one queue: `{"ready", "unacked", "messages", "consumers", …}` — point KEDA's `metrics-api` scaler at `ready` |
+| `GET /queues/<vhost>/<name>[?kind=]` | one queue: `{"ready", "unacked", "messages", "consumers", …}` — point KEDA's `metrics-api` scaler at `ready`. Correct on **every** node (a non-leader asks the queue's leader); `503` when unknowable, never zeros |
 | `PUT /queues/<vhost>/<name>` `{"kind":"quorum"}` | declare (`transient` default); `201` created, `204` exists, `409` exists as another kind |
 | `DELETE /queues/<vhost>/<name>[?kind=]` | delete a transient or durable queue (consumers detached with `amqp:resource-deleted`); quorum → `501` for now |
 | `GET /exchanges`, `GET /exchanges/<vhost>/<name>` | definitions with bindings |

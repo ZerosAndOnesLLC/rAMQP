@@ -274,6 +274,26 @@ impl Authenticator for StaticScram {
     }
 }
 
+/// Run a password check (PBKDF2 — milliseconds of CPU) on the blocking
+/// pool, at most one per CPU at a time, so floods of PLAIN / Basic logins
+/// queue up instead of pinning the async workers that carry messages.
+pub(crate) async fn run_password_check<T: Send + 'static>(
+    check: impl FnOnce() -> Option<T> + Send + 'static,
+) -> Option<T> {
+    use std::sync::OnceLock;
+    static PERMITS: OnceLock<std::sync::Arc<tokio::sync::Semaphore>> = OnceLock::new();
+    let permits = PERMITS.get_or_init(|| {
+        let n = std::thread::available_parallelism().map_or(2, |n| n.get());
+        std::sync::Arc::new(tokio::sync::Semaphore::new(n))
+    });
+    let _permit = permits.clone().acquire_owned().await.ok()?;
+    tokio::task::spawn_blocking(check).await.ok().flatten()
+}
+
+/// Highest PBKDF2 iteration count a stored verifier may carry (a typo'd
+/// verifier must not turn every login into seconds of CPU).
+pub const MAX_ITERATIONS: u32 = 1_000_000;
+
 /// The identity anonymous connections are matched as in
 /// [`Permission::user`] (a configured user may not take this name).
 pub const ANONYMOUS_USER: &str = "anonymous";
@@ -389,6 +409,11 @@ pub fn parse_scram_verifier(s: &str) -> Result<(ScramMechanism, ScramVerifier), 
     if iterations < 4096 {
         return Err(format!(
             "iteration count {iterations} is below the RFC 7677 minimum of 4096"
+        ));
+    }
+    if iterations > MAX_ITERATIONS {
+        return Err(format!(
+            "iteration count {iterations} is above the maximum of {MAX_ITERATIONS}"
         ));
     }
     let decode = |what: &str, v: &str| {
@@ -584,26 +609,18 @@ impl StaticUsers {
     /// PLAIN path; also used for management-API Basic auth). Runs the
     /// PBKDF2 even for unknown users so timing doesn't reveal existence.
     pub fn check_password(&self, username: &str, password: &str) -> bool {
-        use std::sync::OnceLock;
-        static DECOY: OnceLock<ScramVerifier> = OnceLock::new();
         let found = self.users.get(username).and_then(|vs| {
             vs.iter()
                 .find(|(m, _)| *m == ScramMechanism::Sha256)
                 .or_else(|| vs.first())
         });
+        let decoy;
         let (mechanism, verifier) = match found {
             Some((m, v)) => (*m, v),
-            None => (
-                ScramMechanism::Sha256,
-                DECOY.get_or_init(|| {
-                    derive_scram_verifier(
-                        ScramMechanism::Sha256,
-                        "decoy-password-never-matches",
-                        StaticScram::ITERATIONS,
-                    )
-                    .expect("decoy derives")
-                }),
-            ),
+            None => {
+                decoy = self.decoy();
+                (decoy.0, &decoy.1)
+            }
         };
         let Some(prepared) = ramqp_core::sasl::scram::saslprep(password) else {
             return false;
@@ -613,6 +630,50 @@ impl StaticUsers {
         let stored = mechanism.h(&client_key);
         let ok = ct_bytes_eq(&stored, &verifier.stored_key);
         found.is_some() && ok
+    }
+
+    /// The verifier an unknown username is checked against: the same
+    /// mechanism and iteration count most real users have, so the check
+    /// costs the same and timing does not reveal whether a user exists.
+    fn decoy(&self) -> (ScramMechanism, ScramVerifier) {
+        let tag_of = |m: ScramMechanism| match m {
+            ScramMechanism::Sha1 => 1u8,
+            ScramMechanism::Sha256 => 2,
+            ScramMechanism::Sha512 => 3,
+        };
+        let mut counts: HashMap<(u8, u32), (usize, ScramMechanism)> = HashMap::new();
+        for vs in self.users.values() {
+            let (m, v) = vs
+                .iter()
+                .find(|(m, _)| *m == ScramMechanism::Sha256)
+                .or_else(|| vs.first())
+                .expect("a user has at least one verifier");
+            counts
+                .entry((tag_of(*m), v.iterations))
+                .or_insert((0, *m))
+                .0 += 1;
+        }
+        let (mechanism, iterations) = counts
+            .into_iter()
+            .max_by_key(|((_, it), (n, _))| (*n, *it))
+            .map(|((_, it), (_, m))| (m, it))
+            .unwrap_or((ScramMechanism::Sha256, StaticScram::ITERATIONS));
+        // Derived once per (mechanism, iterations) and cached.
+        use std::sync::{Mutex, OnceLock};
+        static DECOYS: OnceLock<Mutex<HashMap<(u8, u32), ScramVerifier>>> = OnceLock::new();
+        let tag = tag_of(mechanism);
+        let mut cache = DECOYS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .expect("decoy lock");
+        let v = cache
+            .entry((tag, iterations))
+            .or_insert_with(|| {
+                derive_scram_verifier(mechanism, "decoy-password-never-matches", iterations)
+                    .expect("decoy derives")
+            })
+            .clone();
+        (mechanism, v)
     }
 }
 
@@ -658,7 +719,9 @@ impl Authenticator for StaticUsers {
             .permissions
             .iter()
             .filter(|p| p.matches_principal(user, vhost));
-        if address == "$coordinator" {
+        // The transaction coordinator's pseudo-address (queue names may not
+        // start with `$`, so no queue can borrow this shortcut).
+        if address == "$coordinator" && operation == Operation::Send {
             return grants.any(|p| p.send);
         }
         grants.any(|p| p.allows(operation) && glob_match(&p.address, address))
@@ -700,6 +763,7 @@ mod tests {
         assert_eq!(back.salt, v.salt);
         // Too few iterations, wrong key length, junk.
         assert!(parse_scram_verifier(&s.replace("$4096:", "$1000:")).is_err());
+        assert!(parse_scram_verifier(&s.replace("$4096:", "$1000001:")).is_err());
         assert!(parse_scram_verifier("SCRAM-SHA-1$4096:AAAAAAAAAAA=$AA==:AA==").is_err());
         assert!(parse_scram_verifier("nonsense").is_err());
         assert!(parse_scram_verifier("MD5$4096:a$b:c").is_err());

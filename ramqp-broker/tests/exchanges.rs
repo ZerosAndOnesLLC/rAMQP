@@ -249,9 +249,19 @@ async fn binding_changes_apply_to_attached_producers() {
         .unwrap();
     p.send(Message::text("after")).await.unwrap();
     expect_exactly(&mut q, &["bound"]).await;
-    // Deleting the exchange makes the attached producer's messages unroutable.
+    // Deleting the exchange detaches the attached producer (instead of
+    // silently accepting and dropping everything it sends); the session
+    // itself survives.
     broker.delete_exchange("", "ev").await.unwrap();
-    assert!(accepted(&p.send(Message::text("gone")).await.unwrap()));
+    let gone = tokio::time::timeout(Duration::from_secs(5), p.send(Message::text("gone")))
+        .await
+        .expect("answer in time");
+    assert!(
+        !matches!(gone, Ok(DeliveryState::Accepted(_))),
+        "a publish to a deleted exchange must not be accepted: {gone:?}"
+    );
+    let other = s.create_producer("/queues/still-fine").await.unwrap();
+    assert!(accepted(&other.send(Message::text("ok")).await.unwrap()));
     assert!(matches!(
         broker.delete_exchange("", "ev").await,
         Err(ExchangeError::NotFound(_))
@@ -430,6 +440,79 @@ async fn definitions_survive_restart() {
     assert!(accepted(&p.send(Message::text("routed")).await.unwrap()));
     let mut c = s.create_consumer("/durable/kept").await.unwrap();
     expect_exactly(&mut c, &["routed"]).await;
+    conn.close().await.unwrap();
+    shutdown.shutdown();
+}
+
+/// Review H1: a destination that cannot be resolved (here: the queue cap)
+/// rejects the publish — nothing is half-delivered, nothing is cached — so
+/// the producer can retry instead of losing that queue's copy silently.
+#[tokio::test]
+async fn unresolvable_destination_rejects_instead_of_skipping() {
+    let mut config = BrokerConfig::default();
+    config.max_queues = 1;
+    let (broker, addr, shutdown) = start(config).await;
+    broker
+        .declare_exchange("", "ev", ExchangeKind::Fanout, None)
+        .await
+        .unwrap();
+    broker.declare_queue("", "/queues/first").await.unwrap();
+    broker
+        .bind_queue("", "ev", "/queues/first", "")
+        .await
+        .unwrap();
+    broker
+        .bind_queue("", "ev", "/queues/over-cap", "")
+        .await
+        .unwrap();
+    let (conn, s) = session(addr).await;
+    let mut first = s.create_consumer("/queues/first").await.unwrap();
+    let p = s.create_producer("/exchanges/ev").await.unwrap();
+    for _ in 0..2 {
+        let state = p.send(Message::text("x")).await.unwrap();
+        assert!(
+            matches!(state, DeliveryState::Rejected(_)),
+            "expected rejected, got {state:?}"
+        );
+    }
+    // Nothing reached the queue that did resolve.
+    let none = tokio::time::timeout(Duration::from_millis(200), first.recv()).await;
+    assert!(none.is_err(), "no partial delivery");
+    // Once the over-cap destination is unbound, routing works (no stale cache).
+    broker
+        .unbind_queue("", "ev", "/queues/over-cap", "")
+        .await
+        .unwrap();
+    assert!(accepted(&p.send(Message::text("ok")).await.unwrap()));
+    expect_exactly(&mut first, &["ok"]).await;
+    conn.close().await.unwrap();
+    shutdown.shutdown();
+}
+
+/// Review L2: `$`-prefixed queue names are reserved (the transaction
+/// coordinator authorizes as `$coordinator`).
+#[tokio::test]
+async fn dollar_queue_names_are_reserved() {
+    let (broker, addr, shutdown) = start(BrokerConfig::default()).await;
+    assert!(
+        broker
+            .declare_queue("", "/queues/$coordinator")
+            .await
+            .is_err()
+    );
+    assert!(matches!(
+        broker.bind_queue("", "amq.direct", "/queues/$x", "k").await,
+        Err(ExchangeError::Invalid(_))
+    ));
+    let (conn, s) = session(addr).await;
+    let mut c = s
+        .create_consumer("$coordinator")
+        .await
+        .expect("attach completes");
+    let r = tokio::time::timeout(Duration::from_secs(5), c.recv())
+        .await
+        .expect("refusal arrives");
+    assert!(r.is_err(), "a `$` queue must not be auto-declared");
     conn.close().await.unwrap();
     shutdown.shutdown();
 }

@@ -135,8 +135,13 @@ pub(crate) enum QueueMsg {
     },
     /// Report queue statistics (management surface; never on the hot path).
     Stats {
-        /// Where to reply.
+        /// Where to reply. Dropped unanswered when the stats are not known
+        /// here (callers report "unavailable", never zeros).
         reply: tokio::sync::oneshot::Sender<QueueStats>,
+        /// A clustered proxy whose queue is led by ANOTHER node fetches the
+        /// leader's stats over the fabric when set; otherwise it does not
+        /// answer (node-local scrapes then skip it rather than double-count).
+        forward: bool,
     },
     /// Delete the queue (management API): detach every consumer with
     /// `amqp:resource-deleted`, drop the messages, and stop. Replies `true`
@@ -367,7 +372,7 @@ async fn run(name: String, mut rx: mpsc::Receiver<QueueMsg>, policy: EffectivePo
                     }
                 }
             }
-            QueueMsg::Stats { reply } => {
+            QueueMsg::Stats { reply, .. } => {
                 let _ = reply.send(QueueStats {
                     ready: ready.len(),
                     unacked: unacked.len(),
@@ -378,6 +383,7 @@ async fn run(name: String, mut rx: mpsc::Receiver<QueueMsg>, policy: EffectivePo
                 notify_deleted(&subs);
                 let _ = reply.send(true);
                 tracing::info!(queue = %name, dropped = ready.len() + unacked.len(), "queue deleted");
+                drain_after_delete(&name, &mut rx, next_sub_id).await;
                 return;
             }
             QueueMsg::Unsubscribe { sub } => {
@@ -410,6 +416,54 @@ async fn run(name: String, mut rx: mpsc::Receiver<QueueMsg>, policy: EffectivePo
         .await;
     }
     tracing::debug!(queue = %name, "queue actor stopped");
+}
+
+/// After a delete: close the mailbox and answer everything already queued
+/// in it, so nothing waits forever — publishes are refused (their producers
+/// settle and get credit back), reservations fail, and a subscribe that
+/// raced the delete gets an id plus an immediate `QueueDeleted` (its link
+/// detaches cleanly instead of the session erroring).
+pub(crate) async fn drain_after_delete(
+    name: &str,
+    rx: &mut mpsc::Receiver<QueueMsg>,
+    mut next_sub_id: SubId,
+) {
+    rx.close();
+    while let Some(msg) = rx.recv().await {
+        match msg {
+            QueueMsg::Publish { ack, .. } | QueueMsg::PublishReserved { ack, .. } => {
+                crate::dispatch::refuse_publish(name, ack);
+            }
+            QueueMsg::Reserve { reply, .. } => {
+                let _ = reply.send(false);
+            }
+            QueueMsg::Subscribe {
+                conn,
+                channel,
+                handle,
+                binding_gen,
+                reply,
+            } => {
+                let _ = reply.send(next_sub_id);
+                next_sub_id += 1;
+                let _ = conn.send(ConnCmd::QueueDeleted {
+                    channel,
+                    handle,
+                    binding_gen,
+                });
+            }
+            QueueMsg::Delete { reply } => {
+                let _ = reply.send(true);
+            }
+            // Stats replies are dropped (the caller sees "unavailable");
+            // settles, demand, and unsubscribes are moot.
+            QueueMsg::Stats { .. }
+            | QueueMsg::Settle { .. }
+            | QueueMsg::Demand { .. }
+            | QueueMsg::Unsubscribe { .. }
+            | QueueMsg::Unreserve { .. } => {}
+        }
+    }
 }
 
 /// Tell every subscriber's connection its queue is gone.
@@ -510,6 +564,62 @@ mod tests {
         .await
         .unwrap();
         rx.await.unwrap()
+    }
+
+    /// Review M1: what is queued behind a `Delete` is answered, not dropped:
+    /// a publish is refused (its producer settles and regains credit) and a
+    /// racing subscribe gets an id plus an immediate `QueueDeleted`.
+    #[tokio::test]
+    async fn delete_answers_messages_queued_behind_it() {
+        let q = spawn("doomed".into(), EffectivePolicy::depth_only(100));
+        let (conn_tx, mut conn_rx) = mpsc::unbounded_channel();
+        let (del_tx, del_rx) = tokio::sync::oneshot::channel();
+        q.tx.send(QueueMsg::Delete { reply: del_tx }).await.unwrap();
+        q.tx.send(QueueMsg::Publish {
+            body: Bytes::from_static(b"late"),
+            ack: Some(PublishAck {
+                conn: conn_tx.clone(),
+                channel: 1,
+                handle: 2,
+                binding_gen: 3,
+                delivery_id: 4,
+            }),
+        })
+        .await
+        .unwrap();
+        let (sub_tx, sub_rx) = tokio::sync::oneshot::channel();
+        q.tx.send(QueueMsg::Subscribe {
+            conn: conn_tx.clone(),
+            channel: 5,
+            handle: 6,
+            binding_gen: 7,
+            reply: sub_tx,
+        })
+        .await
+        .unwrap();
+        assert!(del_rx.await.unwrap());
+        assert!(sub_rx.await.is_ok(), "the racing subscribe is answered");
+        let mut refused = false;
+        let mut detached = false;
+        while let Ok(Some(cmd)) =
+            tokio::time::timeout(std::time::Duration::from_millis(500), conn_rx.recv()).await
+        {
+            match cmd {
+                ConnCmd::SettleIncoming {
+                    delivery_id: 4,
+                    accepted,
+                    ..
+                } => refused = !accepted,
+                ConnCmd::QueueDeleted { handle: 6, .. } => detached = true,
+                _ => {}
+            }
+            if refused && detached {
+                break;
+            }
+        }
+        assert!(refused, "the publish behind the delete is refused");
+        assert!(detached, "the racing subscriber is told the queue is gone");
+        assert!(q.tx.is_closed(), "the actor stopped");
     }
 
     #[tokio::test]
@@ -1039,7 +1149,12 @@ mod tests {
         // 8 bytes held; 8 more need BOTH evicted.
         assert!(try_publish(&q, &conn_tx, &mut conn_rx, b"cccccccc").await);
         let (tx, rx) = tokio::sync::oneshot::channel();
-        q.tx.send(QueueMsg::Stats { reply: tx }).await.unwrap();
+        q.tx.send(QueueMsg::Stats {
+            reply: tx,
+            forward: false,
+        })
+        .await
+        .unwrap();
         assert_eq!(rx.await.unwrap().ready, 1, "both older messages evicted");
     }
 

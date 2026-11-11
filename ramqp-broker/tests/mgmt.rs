@@ -322,16 +322,11 @@ async fn admin_api_declares_routes_and_deletes() {
     let (s, _) = http(&mgmt, "DELETE", "/queues/%2F/jobs", Some(BEARER), None).await;
     assert_eq!(s, 404);
 
-    // Unbind, delete the exchange, and the cleanups are 404 afterwards.
-    let (s, _) = http(
-        &mgmt,
-        "DELETE",
-        "/bindings/%2F/events",
-        Some(BEARER),
-        Some(bind),
-    )
-    .await;
-    assert_eq!(s, 204);
+    // Deleting the queue also removed its binding (otherwise the next
+    // exchange publish would re-create the queue), so unbinding is a 404.
+    let (_, body) = http(&mgmt, "GET", "/exchanges/%2F/events", None, None).await;
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["bindings"].as_array().map(Vec::len), Some(0), "{body}");
     let (s, _) = http(
         &mgmt,
         "DELETE",

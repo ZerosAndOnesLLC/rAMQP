@@ -126,6 +126,17 @@ pub enum RequestKind {
         /// Slots to release.
         count: u32,
     },
+    /// Statistics of a queue this node leads. Reply body: serde_bin
+    /// `Option<(ready, unacked, consumers)>` (`None` = not the leader /
+    /// unavailable). Appended last: earlier variants keep their tags.
+    QueueStats {
+        /// The queue name.
+        queue: String,
+    },
+    /// Which optional features this node supports. Reply body: serde_bin
+    /// `u64` bitmask. A node predating this variant cannot decode it (its
+    /// connection drops), which reads as "no capabilities".
+    Capabilities,
 }
 
 /// One fabric frame's header. `corr`-carrying variants are request/reply

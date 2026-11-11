@@ -102,7 +102,7 @@ async fn handshake<S: IoStream>(
     // 2. SASL layer (when chosen): mechanisms → init → outcome → AMQP header.
     let mut identity = None;
     if chosen == ProtocolHeader::SASL {
-        identity = server_sasl(&mut transport, auth).await?;
+        identity = server_sasl(&mut transport, &auth_arc).await?;
         let after = accept_header(transport.stream_mut(), &[ProtocolHeader::AMQP]).await?;
         debug_assert_eq!(after, ProtocolHeader::AMQP);
     }
@@ -185,6 +185,7 @@ async fn handshake<S: IoStream>(
         next_gen: 0,
         settlements: FuturesUnordered::new(),
         txns: TxnManager::default(),
+        fanout_acks: FuturesUnordered::new(),
         txn_results: FuturesUnordered::new(),
         next_session_id: 0,
         metrics: noop_metrics(),
@@ -202,8 +203,9 @@ async fn handshake<S: IoStream>(
 /// Returns the authenticated identity (`None` for ANONYMOUS).
 async fn server_sasl<S: IoStream>(
     transport: &mut FramedTransport<S>,
-    auth: &dyn Authenticator,
+    auth_arc: &Arc<dyn Authenticator>,
 ) -> Result<Option<String>, ConnectError> {
+    let auth = auth_arc.as_ref();
     transport
         .send_sasl(&SaslFrame::Mechanisms(SaslMechanisms {
             sasl_server_mechanisms: auth.mechanisms().iter().map(|m| Symbol::new(*m)).collect(),
@@ -231,14 +233,31 @@ async fn server_sasl<S: IoStream>(
         "ANONYMOUS" if auth.mechanisms().contains(&"ANONYMOUS") => {
             auth.verify(Credentials::Anonymous).then_some(None)
         }
-        "PLAIN" if auth.mechanisms().contains(&"PLAIN") => init
-            .initial_response
-            .as_deref()
-            .and_then(parse_plain_response)
-            .and_then(|(_authzid, authcid, passwd)| {
-                auth.verify(Credentials::Plain { authcid, passwd })
-                    .then(|| Some(authcid.to_owned()))
-            }),
+        "PLAIN" if auth.mechanisms().contains(&"PLAIN") => {
+            match init
+                .initial_response
+                .as_deref()
+                .and_then(parse_plain_response)
+            {
+                Some((_authzid, authcid, passwd)) => {
+                    let (authcid, passwd) = (authcid.to_owned(), passwd.to_owned());
+                    // Verifier-backed PLAIN runs PBKDF2: keep it off the
+                    // async workers (and bounded) so login floods cannot
+                    // stall the message path.
+                    let auth = auth_arc.clone();
+                    let ok = crate::auth::run_password_check(move || {
+                        auth.verify(Credentials::Plain {
+                            authcid: &authcid,
+                            passwd: &passwd,
+                        })
+                        .then_some(authcid)
+                    })
+                    .await;
+                    ok.map(Some)
+                }
+                None => None,
+            }
+        }
         _ if scram.is_some() && auth.mechanisms().contains(&mechanism.as_str()) => {
             // RFC 5802 server flow: client-first → challenge → client-final
             // → outcome carrying the server-final signature.
@@ -438,16 +457,30 @@ impl ExchangeRoute {
     }
 }
 
+/// Where one message from an exchange producer goes.
+enum Routed {
+    /// These queues (empty = unroutable: accepted and dropped).
+    Targets(Arc<[QueueHandle]>),
+    /// The exchange no longer exists: the producer link is detached.
+    ExchangeGone,
+    /// A destination queue could not be resolved right now (cluster
+    /// election, queue cap, store not openable). Nothing is published and
+    /// nothing is cached; the message is rejected so the producer retries —
+    /// accepting it would silently skip that queue.
+    Unavailable(String),
+}
+
 /// Resolve `message`'s destinations through `route`: one atomic version
 /// check per message while the cached route is current; recomputed (and the
 /// destination queues resolved, declaring them on first use) after any
-/// topology change or when a cached queue actor has died.
+/// topology change or when a cached queue actor has died. Only a COMPLETE
+/// resolution is cached.
 async fn resolve_route(
     registry: &QueueRegistry,
     vhost: &str,
     route: &mut ExchangeRoute,
     message: &bytes::Bytes,
-) -> Arc<[QueueHandle]> {
+) -> Routed {
     for _ in 0..2 {
         let version = registry.exchanges().version();
         if version != route.version {
@@ -459,13 +492,13 @@ async fn resolve_route(
             route.by_key.clear();
         }
         let Some(kind) = route.kind else {
-            return Arc::from([]); // exchange deleted: unroutable
+            return Routed::ExchangeGone;
         };
         let keyed = route.key.is_some() || kind == ExchangeKind::Fanout;
         let routing_key = if keyed {
             if let Some(t) = &route.fixed {
                 if t.iter().all(|q| !q.tx.is_closed()) {
-                    return t.clone();
+                    return Routed::Targets(t.clone());
                 }
                 route.fixed = None;
                 continue;
@@ -473,9 +506,14 @@ async fn resolve_route(
             route.key.clone().unwrap_or_default()
         } else {
             let subject = crate::exchange::message_subject(message).unwrap_or_default();
+            // Routing keys are bounded (as in AMQP 0-9-1/RabbitMQ): an
+            // oversized subject is unroutable — never matched or cached.
+            if subject.len() > crate::exchange::MAX_KEY_LEN {
+                return Routed::Targets(Arc::from([]));
+            }
             if let Some(t) = route.by_key.get(&subject) {
                 if t.iter().all(|q| !q.tx.is_closed()) {
-                    return t.clone();
+                    return Routed::Targets(t.clone());
                 }
                 route.by_key.remove(&subject);
                 continue;
@@ -493,18 +531,24 @@ async fn resolve_route(
                         hits.into_iter().map(str::to_owned).collect()
                     }
                 }
-                None => Vec::new(),
+                None => return Routed::ExchangeGone,
             }
         };
         let mut handles = Vec::with_capacity(destinations.len());
         for dest in &destinations {
             match registry.resolve_in(vhost, dest).await {
                 Some(h) => handles.push(h),
-                None => tracing::warn!(
-                    exchange = %route.exchange,
-                    destination = %dest,
-                    "exchange destination unavailable; skipped"
-                ),
+                None => {
+                    tracing::warn!(
+                        exchange = %route.exchange,
+                        destination = %dest,
+                        "exchange destination unavailable; rejecting the publish"
+                    );
+                    return Routed::Unavailable(format!(
+                        "destination {dest} of exchange {} is unavailable; retry",
+                        route.exchange
+                    ));
+                }
             }
         }
         let handles: Arc<[QueueHandle]> = handles.into();
@@ -516,9 +560,12 @@ async fn resolve_route(
             }
             route.by_key.insert(routing_key, handles.clone());
         }
-        return handles;
+        return Routed::Targets(handles);
     }
-    Arc::from([])
+    Routed::Unavailable(format!(
+        "destinations of exchange {} keep stopping; retry",
+        route.exchange
+    ))
 }
 
 /// The disposition for a transactional publish's staging result.
@@ -609,6 +656,9 @@ struct BrokerConnection<S: IoStream> {
     settlements: FuturesUnordered<std::pin::Pin<Box<dyn Future<Output = SettlementResult> + Send>>>,
     /// Open transactions (staged work; dropped = rolled back).
     txns: TxnManager,
+    /// Fan-out publishes awaiting every destination's confirm; each resolves
+    /// to the single settlement for its delivery.
+    fanout_acks: FuturesUnordered<std::pin::Pin<Box<dyn Future<Output = ConnCmd> + Send>>>,
     /// In-flight transaction commits awaiting their staged work.
     txn_results: FuturesUnordered<std::pin::Pin<Box<dyn Future<Output = TxnDone> + Send>>>,
     next_session_id: u64,
@@ -663,6 +713,14 @@ impl<S: IoStream> BrokerConnection<S> {
                             Ok(next) => { self.handle_cmd(next); drained += 1; }
                             Err(_) => break,
                         }
+                    }
+                    self.flush().await?;
+                }
+
+                Some(cmd) = self.fanout_acks.next() => {
+                    self.handle_cmd(cmd);
+                    while let Some(Some(next)) = self.fanout_acks.next().now_or_never() {
+                        self.handle_cmd(next);
                     }
                     self.flush().await?;
                 }
@@ -1609,7 +1667,9 @@ impl<S: IoStream> BrokerConnection<S> {
     /// confirm — Raft commit, fsync), and rejected if any refused it. Like
     /// RabbitMQ, a rejection does not undo the copies other queues already
     /// took: a retry may duplicate there. A message routed nowhere (and
-    /// without an alternate) is accepted and dropped.
+    /// without an alternate) is accepted and dropped. If a destination cannot
+    /// be resolved the message goes nowhere and is rejected; if the exchange
+    /// was deleted the link is detached (`amqp:resource-deleted`).
     async fn publish_via_exchange(&mut self, channel: u16, d: ramqp_core::proto::IncomingDelivery) {
         let handle = d.handle.0;
         let Some(Binding::ExchangeProducer { route, epoch, .. }) =
@@ -1618,24 +1678,52 @@ impl<S: IoStream> BrokerConnection<S> {
             return;
         };
         let epoch = *epoch;
-        let targets = resolve_route(&self.registry, &self.vhost, route, &d.message).await;
+        let targets = match resolve_route(&self.registry, &self.vhost, route, &d.message).await {
+            Routed::Targets(t) => t,
+            Routed::ExchangeGone => {
+                self.detach_with_error(
+                    channel,
+                    handle,
+                    AmqpError::new(
+                        AmqpCondition::ResourceDeleted,
+                        Some("the exchange was deleted".to_owned()),
+                    ),
+                );
+                return;
+            }
+            Routed::Unavailable(why) => {
+                if !d.settled
+                    && let Some(session) = self.sessions.get_mut(&channel)
+                {
+                    session.send_disposition(
+                        handle,
+                        d.delivery_id,
+                        None,
+                        DeliveryState::Rejected(Rejected {
+                            error: Some(AmqpError::new(AmqpCondition::InternalError, Some(why))),
+                        }),
+                        true,
+                        &mut self.transport,
+                    );
+                }
+                self.replenish_producer_credit(channel, handle);
+                return;
+            }
+        };
 
         if let Some(ts) = d.state.as_ref().and_then(txn_state) {
-            let mut staged = crate::txn::PublishStage::Staged;
-            for q in targets.iter() {
-                let s = self.txns.stage_publish(
-                    &ts.txn_id,
-                    StagedPublish {
+            // All destinations stage, or none do.
+            let staged = self.txns.stage_publishes(
+                &ts.txn_id,
+                targets
+                    .iter()
+                    .map(|q| StagedPublish {
                         queue: q.tx.clone(),
                         queue_name: q.name.clone(),
                         body: d.message.clone(),
-                    },
-                );
-                if !matches!(s, crate::txn::PublishStage::Staged) {
-                    staged = s;
-                    break;
-                }
-            }
+                    })
+                    .collect(),
+            );
             if let Some(session) = self.sessions.get_mut(&channel) {
                 session.send_disposition(
                     handle,
@@ -1697,7 +1785,9 @@ impl<S: IoStream> BrokerConnection<S> {
                     let _ = self.cmd_tx.send(settle(false));
                 }
             }
-            // Fan-out: collect every destination's confirm, then settle once.
+            // Fan-out: collect every destination's confirm, then settle once
+            // (awaited in the connection's own future set — no task per
+            // message).
             n => {
                 let (ack_tx, mut ack_rx) = mpsc::unbounded_channel::<ConnCmd>();
                 let mut sent = 0usize;
@@ -1718,27 +1808,26 @@ impl<S: IoStream> BrokerConnection<S> {
                     sent += usize::from(ok);
                 }
                 drop(ack_tx);
-                let conn = self.cmd_tx.clone();
                 let mut accepted = sent == n;
-                tokio::spawn(async move {
+                self.fanout_acks.push(Box::pin(async move {
                     for _ in 0..sent {
                         match ack_rx.recv().await {
                             Some(ConnCmd::SettleIncoming { accepted: a, .. }) => accepted &= a,
-                            // A queue died before confirming.
+                            // A queue stopped before confirming.
                             _ => {
                                 accepted = false;
                                 break;
                             }
                         }
                     }
-                    let _ = conn.send(ConnCmd::SettleIncoming {
+                    ConnCmd::SettleIncoming {
                         channel,
                         handle,
                         binding_gen: epoch,
                         delivery_id,
                         accepted,
-                    });
-                });
+                    }
+                }));
             }
         }
     }

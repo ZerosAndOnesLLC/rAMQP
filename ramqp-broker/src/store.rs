@@ -36,8 +36,10 @@ const RAFT_LOG: TableDefinition<(u64, u64), &[u8]> = TableDefinition::new("raft_
 /// inline, atomic with the pointer — or `"snap_path"` — a file path for
 /// large paged-queue blobs).
 const RAFT_META: TableDefinition<(u64, &str), &[u8]> = TableDefinition::new("raft_meta");
-/// Standalone topology definitions: key (`"exchanges"`) → JSON blob. A
-/// clustered node keeps these in the metadata Raft group instead.
+/// Standalone topology definitions: `exchange:<vhost>/<name>` → JSON of
+/// that exchange (one row each, so a change rewrites only its own row;
+/// unreadable rows are moved aside under `corrupt:`). A clustered node
+/// keeps these in the metadata Raft group instead.
 const DEFINITIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("definitions");
 
 /// How many operations one commit may absorb.
@@ -207,24 +209,41 @@ impl Store {
         Ok(id)
     }
 
-    /// Read a definitions blob (`None` when never written).
-    pub fn definitions(&self, key: &str) -> Result<Option<Vec<u8>>, String> {
+    /// Every definitions row whose key starts with `prefix`.
+    pub fn definitions(&self, prefix: &str) -> Result<Vec<(String, Vec<u8>)>, String> {
         let txn = self.db.begin_read().map_err(|e| e.to_string())?;
         let table = txn.open_table(DEFINITIONS).map_err(|e| e.to_string())?;
-        Ok(table
-            .get(key)
-            .map_err(|e| e.to_string())?
-            .map(|v| v.value().to_vec()))
+        let mut out = Vec::new();
+        for entry in table.range(prefix..).map_err(|e| e.to_string())? {
+            let (k, v) = entry.map_err(|e| e.to_string())?;
+            let key = k.value();
+            if !key.starts_with(prefix) {
+                break;
+            }
+            out.push((key.to_owned(), v.value().to_vec()));
+        }
+        Ok(out)
     }
 
-    /// Durably replace a definitions blob (its own fsynced write
-    /// transaction — topology changes are rare and must not wait behind the
-    /// message group-commit). Blocking: call from `spawn_blocking`.
-    pub fn put_definitions(&self, key: &str, blob: &[u8]) -> Result<(), String> {
+    /// Durably write and delete definitions rows in one fsynced transaction
+    /// (topology changes are rare and must not wait behind the message
+    /// group-commit). Blocking: call from `spawn_blocking`.
+    pub fn write_definitions(
+        &self,
+        puts: &[(String, Vec<u8>)],
+        deletes: &[String],
+    ) -> Result<(), String> {
         let txn = self.db.begin_write().map_err(|e| e.to_string())?;
         {
             let mut table = txn.open_table(DEFINITIONS).map_err(|e| e.to_string())?;
-            table.insert(key, blob).map_err(|e| e.to_string())?;
+            for (k, v) in puts {
+                table
+                    .insert(k.as_str(), v.as_slice())
+                    .map_err(|e| e.to_string())?;
+            }
+            for k in deletes {
+                table.remove(k.as_str()).map_err(|e| e.to_string())?;
+            }
         }
         txn.commit().map_err(|e| e.to_string())
     }
