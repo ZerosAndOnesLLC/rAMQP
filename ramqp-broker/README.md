@@ -230,7 +230,7 @@ mounted Kubernetes Secret. Generate a verifier with
 `echo -n "$PASSWORD" | ramqp-brokerd hash-password [--mechanism SCRAM-SHA-512]`.
 The daemon also shuts down gracefully on `SIGTERM`.
 
-Or embed it (`ramqp-broker = "0.10"` in `Cargo.toml`; add the `store-redb`
+Or embed it (`ramqp-broker = "0.11"` in `Cargo.toml`; add the `store-redb`
 feature for `/durable/*` queues):
 
 ```rust,no_run
