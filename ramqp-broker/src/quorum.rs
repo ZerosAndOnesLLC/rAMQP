@@ -431,6 +431,11 @@ fn handle_msg(
                 consumers: subs.len(),
             });
         }
+        // Deleting a quorum queue means tearing down its Raft group and
+        // on-disk log on every replica: not supported yet.
+        QueueMsg::Delete { reply } => {
+            let _ = reply.send(false);
+        }
         QueueMsg::Unsubscribe { sub } => {
             subs.retain(|s| s.id != sub);
             // Everything that subscriber held becomes dispatchable again.

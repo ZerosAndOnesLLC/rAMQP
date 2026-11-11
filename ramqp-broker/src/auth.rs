@@ -74,6 +74,12 @@ pub trait Authenticator: Send + Sync + 'static {
         let _ = (identity, vhost, address, operation);
         true
     }
+    /// May `username` / `password` administer the broker through the
+    /// management API (HTTP Basic)? **The default allows no one.**
+    fn management_login(&self, username: &str, password: &str) -> bool {
+        let _ = (username, password);
+        false
+    }
 }
 
 /// Per-user vhost grants shared by the static authenticators: a user with a
@@ -656,6 +662,12 @@ impl Authenticator for StaticUsers {
             return grants.any(|p| p.send);
         }
         grants.any(|p| p.allows(operation) && glob_match(&p.address, address))
+    }
+
+    fn management_login(&self, username: &str, password: &str) -> bool {
+        // Always run the PBKDF2 (timing does not reveal admin status).
+        let ok = self.check_password(username, password);
+        ok && self.is_admin(username)
     }
 }
 

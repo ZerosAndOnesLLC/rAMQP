@@ -904,6 +904,26 @@ impl<S: IoStream> BrokerConnection<S> {
     /// the stale command would deliver/settle against the wrong queue).
     fn handle_cmd(&mut self, cmd: ConnCmd) {
         match cmd {
+            ConnCmd::QueueDeleted {
+                channel,
+                handle,
+                binding_gen,
+            } => {
+                let live = matches!(
+                    self.bindings.get(&(channel, handle)),
+                    Some(Binding::Consumer { epoch, .. }) if *epoch == binding_gen
+                );
+                if live {
+                    self.detach_with_error(
+                        channel,
+                        handle,
+                        AmqpError::new(
+                            AmqpCondition::ResourceDeleted,
+                            Some("the queue was deleted".to_owned()),
+                        ),
+                    );
+                }
+            }
             ConnCmd::Deliver {
                 channel,
                 handle,
@@ -1012,6 +1032,17 @@ impl<S: IoStream> BrokerConnection<S> {
                 // in-flight publish window and the queue→connection backlog.
                 self.replenish_producer_credit(channel, handle);
             }
+        }
+    }
+
+    /// Detach one of our links with an error (its queue went away) and drop
+    /// its binding. Unsettled consumer deliveries resolve as requeues via
+    /// their settlement futures — moot for a deleted queue.
+    fn detach_with_error(&mut self, channel: u16, handle: u32, error: AmqpError) {
+        self.bindings.remove(&(channel, handle));
+        if let Some(session) = self.sessions.get_mut(&channel) {
+            let (reply, _) = oneshot::channel();
+            session.detach_link(handle, true, Some(error), reply, &mut self.transport);
         }
     }
 
@@ -1789,7 +1820,22 @@ impl<S: IoStream> BrokerConnection<S> {
                         .await
                         .is_err()
                     {
-                        tracing::warn!(channel, handle, "publish to dead queue actor");
+                        // The queue actor is gone (deleted): detach the
+                        // producer so it learns instead of waiting on a
+                        // settlement that can never come.
+                        tracing::debug!(
+                            channel,
+                            handle,
+                            "publish to a stopped queue; detaching producer"
+                        );
+                        self.detach_with_error(
+                            channel,
+                            handle,
+                            AmqpError::new(
+                                AmqpCondition::ResourceDeleted,
+                                Some("the queue was deleted".to_owned()),
+                            ),
+                        );
                         continue;
                     }
                     // A pre-settled publish gets NO ack (no SettleIncoming), so

@@ -233,6 +233,34 @@ async fn run(
                             consumers: subs.len(),
                         });
                     }
+                    QueueMsg::Delete { reply } => {
+                        // Let in-flight inserts land (and confirm) first: the
+                        // purge then follows them through the FIFO writer, so
+                        // no row outlives the deletion to resurrect on a
+                        // re-declare.
+                        while let Some(done) = commits.next().await {
+                            if done.ok {
+                                confirm_publish(done.ack);
+                            } else {
+                                refuse_publish(&name, done.ack);
+                            }
+                        }
+                        let (tx, rx) = tokio::sync::oneshot::channel();
+                        let purged = store
+                            .submit(StoreOp::PurgeQueue { queue: queue_id, name: name.clone(), done: tx })
+                            .await
+                            .is_ok()
+                            && rx.await.unwrap_or(false);
+                        if !purged {
+                            tracing::error!(queue = %name, "durable queue purge failed; queue kept");
+                            let _ = reply.send(false);
+                            continue;
+                        }
+                        crate::queue::notify_deleted(&subs);
+                        let _ = reply.send(true);
+                        tracing::info!(queue = %name, "durable queue deleted");
+                        return;
+                    }
                     QueueMsg::Unsubscribe { sub } => {
                         subs.retain(|s| s.id != sub);
                         let mut requeued: Vec<(u64, u64, usize)> = Vec::new();

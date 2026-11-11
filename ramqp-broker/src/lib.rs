@@ -70,5 +70,5 @@ pub use auth::{
     StaticUsers,
 };
 pub use broker::{BoundBroker, Broker, ShutdownHandle};
-pub use config::{BrokerConfig, ClusterMemberConfig, OverflowBehavior, QueuePolicy};
+pub use config::{BrokerConfig, ClusterMemberConfig, OverflowBehavior, QueuePolicy, SecretString};
 pub use exchange::{ExchangeError, ExchangeKind};

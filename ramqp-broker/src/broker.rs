@@ -121,10 +121,22 @@ impl Broker {
         if let Some(mgmt_addr) = &self.config.management_listen {
             let mgmt_listener = TcpListener::bind(mgmt_addr).await?;
             tracing::info!(addr = %mgmt_listener.local_addr()?, "management endpoint listening");
+            if self.config.management_token.is_none() {
+                tracing::info!(
+                    "management API: no token configured — writes need an admin user's \
+                     Basic credentials (read-only if there are none)"
+                );
+            }
             mgmt::spawn_mgmt(
                 mgmt_listener,
+                mgmt::plain_acceptor(),
                 Arc::downgrade(&self.registry),
                 self.counters.clone(),
+                Arc::new(mgmt::MgmtAuth {
+                    token: self.config.management_token.clone(),
+                    auth_reads: self.config.management_auth_reads,
+                    authenticator: self.auth.clone(),
+                }),
             );
         }
         let listener = TcpListener::bind(addr).await?;

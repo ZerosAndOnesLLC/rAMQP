@@ -100,6 +100,7 @@ variables and flags override it. It replaces RabbitMQ's `definitions.json`:
 listen = "0.0.0.0:5672"
 data_dir = "/var/lib/ramqp"           # needs --features store-redb
 management_listen = "0.0.0.0:15692"
+management_token_file = "/etc/ramqp/mgmt-token"   # bearer token for admin writes
 allow_plain = true                    # PLAIN is checked against the SCRAM verifier
 
 [limits]
@@ -146,6 +147,27 @@ exchange = "events"
 queue = "/quorum/orders.created"
 key = "order.#"
 ```
+
+### Management API
+
+With `management_listen` set, one small HTTP/1.1 endpoint serves metrics,
+inspection, and an idempotent admin API (the default vhost is `%2F`):
+
+| Request | Purpose |
+|---|---|
+| `GET /metrics` | Prometheus text (connections, RSS, per-queue gauges) |
+| `GET /queues` | every queue with ready / unacked / consumers |
+| `GET /queues/<vhost>/<name>[?kind=]` | one queue: `{"ready", "unacked", "messages", "consumers", …}` — point KEDA's `metrics-api` scaler at `ready` |
+| `PUT /queues/<vhost>/<name>` `{"kind":"quorum"}` | declare (`transient` default); `201` created, `204` exists, `409` exists as another kind |
+| `DELETE /queues/<vhost>/<name>[?kind=]` | delete a transient or durable queue (consumers detached with `amqp:resource-deleted`); quorum → `501` for now |
+| `GET /exchanges`, `GET /exchanges/<vhost>/<name>` | definitions with bindings |
+| `PUT /exchanges/<vhost>/<name>` `{"type":"topic","alternate":"/queues/x"}` | declare; `409` on different arguments |
+| `DELETE /exchanges/<vhost>/<name>` | delete with its bindings |
+| `PUT` / `DELETE /bindings/<vhost>/<exchange>` `{"queue":"/queues/x","key":"a.*"}` | bind / unbind |
+
+Writes always need credentials: `Authorization: Bearer <token>` from
+`management_token_file` (`--management-token-file`), or HTTP Basic for a
+user with `admin = true`. Reads are open unless `management_auth_reads = true`.
 
 Secrets stay out of the file: point `verifier_file` / `password_file` at a
 mounted Kubernetes Secret. Generate a verifier with

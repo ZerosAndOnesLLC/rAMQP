@@ -24,12 +24,23 @@ use crate::config::{BrokerConfig, QueuePolicy};
 use crate::exchange::{ExchangeError, ExchangeOp, ExchangeRegistry};
 use crate::policy::{DeadLetterSender, EffectivePolicy};
 use crate::proxy;
-use crate::queue::{self, QueueHandle};
+use crate::queue::{self, QueueHandle, QueueMsg};
 use crate::quorum;
 
 /// The store key for standalone exchange definitions.
 #[cfg(feature = "store-redb")]
 const EXCHANGES_KEY: &str = "exchanges";
+
+/// Why a queue deletion did not happen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QueueDeleteError {
+    /// No such queue.
+    NotFound,
+    /// This kind cannot be deleted (quorum queues, for now).
+    Unsupported,
+    /// The deletion failed (store error); the queue is unchanged.
+    Failed,
+}
 
 /// How a resolved address wants its queue backed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -389,6 +400,123 @@ impl QueueRegistry {
         self.resolve_name(kind, name, vhost).await
     }
 
+    /// The registry key for a kind + namespace-qualified name.
+    fn key_for(kind: QueueKind, name: &str) -> String {
+        match kind {
+            QueueKind::Transient => format!("t:{name}"),
+            QueueKind::Quorum => format!("q:{name}"),
+            QueueKind::Durable => format!("d:{name}"),
+        }
+    }
+
+    /// The namespace-qualified name (`<vhost>/<name>`, or `<name>` in the
+    /// default vhost), or `None` if either part is invalid.
+    pub fn qualify(vhost: &str, bare: &str) -> Option<String> {
+        let valid = |s: &str| !s.contains('/') && !s.chars().any(char::is_control);
+        if bare.is_empty() || !valid(bare) || !valid(vhost) {
+            return None;
+        }
+        Some(if vhost.is_empty() {
+            bare.to_owned()
+        } else {
+            format!("{vhost}/{bare}")
+        })
+    }
+
+    /// The declared (live) queue of `kind` with this qualified name.
+    pub fn lookup(&self, kind: QueueKind, qualified: &str) -> Option<QueueHandle> {
+        let map = self.queues.lock().expect("registry lock");
+        map.get(&Self::key_for(kind, qualified))
+            .and_then(|c| c.get().cloned())
+            .filter(|h| !h.tx.is_closed())
+    }
+
+    /// Find a declared queue (of `kind`, or any kind preferring quorum,
+    /// durable, transient). A durable queue with persisted messages but no
+    /// live actor (not attached since a restart) is recovered so callers see
+    /// its real contents.
+    pub async fn find_queue(
+        &self,
+        kind: Option<QueueKind>,
+        qualified: &str,
+    ) -> Option<(QueueKind, QueueHandle)> {
+        let kinds = match kind {
+            Some(k) => vec![k],
+            None => vec![QueueKind::Quorum, QueueKind::Durable, QueueKind::Transient],
+        };
+        for k in &kinds {
+            if let Some(h) = self.lookup(*k, qualified) {
+                return Some((*k, h));
+            }
+        }
+        #[cfg(feature = "store-redb")]
+        if kinds.contains(&QueueKind::Durable)
+            && self.data_dir.is_some()
+            && let Some(store) = self.store().await
+            && store.has_queue(qualified).unwrap_or(false)
+        {
+            let vhost = qualified.split_once('/').map_or("", |(v, _)| v);
+            if let Some(h) = self
+                .resolve_name(QueueKind::Durable, qualified, vhost)
+                .await
+            {
+                return Some((QueueKind::Durable, h));
+            }
+        }
+        None
+    }
+
+    /// Which kinds currently have a live queue under this qualified name.
+    pub fn kinds_of(&self, qualified: &str) -> Vec<QueueKind> {
+        [QueueKind::Quorum, QueueKind::Durable, QueueKind::Transient]
+            .into_iter()
+            .filter(|k| self.lookup(*k, qualified).is_some())
+            .collect()
+    }
+
+    /// Delete a queue (management API). Transient and durable queues
+    /// detach their consumers (`amqp:resource-deleted`), drop their
+    /// messages (a durable queue purges its rows), and stop; the next
+    /// attach to the address declares a fresh, empty queue.
+    pub async fn delete_queue(
+        &self,
+        kind: QueueKind,
+        qualified: &str,
+    ) -> Result<(), QueueDeleteError> {
+        if kind == QueueKind::Quorum {
+            return Err(QueueDeleteError::Unsupported);
+        }
+        let (_, handle) = self
+            .find_queue(Some(kind), qualified)
+            .await
+            .ok_or(QueueDeleteError::NotFound)?;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if handle
+            .tx
+            .send(QueueMsg::Delete { reply: tx })
+            .await
+            .is_err()
+        {
+            return Err(QueueDeleteError::NotFound);
+        }
+        match rx.await {
+            Ok(true) => {
+                let key = Self::key_for(kind, qualified);
+                let mut map = self.queues.lock().expect("registry lock");
+                if map
+                    .get(&key)
+                    .and_then(|c| c.get())
+                    .is_some_and(|h| h.tx.same_channel(&handle.tx))
+                {
+                    map.remove(&key);
+                }
+                Ok(())
+            }
+            Ok(false) => Err(QueueDeleteError::Failed),
+            Err(_) => Err(QueueDeleteError::NotFound),
+        }
+    }
+
     /// Count declared queues belonging to `vhost` (any kind). Keys are
     /// `<kind>:<vhost>/<name>`, so a queue is in `vhost` when the part after
     /// the kind prefix begins with `<vhost>/`.
@@ -411,11 +539,7 @@ impl QueueRegistry {
     async fn resolve_name(&self, kind: QueueKind, name: &str, vhost: &str) -> Option<QueueHandle> {
         // Kind-qualified key: `/queues/foo`, `/quorum/foo`, and
         // `/durable/foo` are distinct queues.
-        let key = match kind {
-            QueueKind::Transient => format!("t:{name}"),
-            QueueKind::Quorum => format!("q:{name}"),
-            QueueKind::Durable => format!("d:{name}"),
-        };
+        let key = Self::key_for(kind, name);
         // Bounded retry so a queue that dies on spawn can't loop forever.
         for _ in 0..3 {
             // Brief lock: get or create this key's init cell, then release. A

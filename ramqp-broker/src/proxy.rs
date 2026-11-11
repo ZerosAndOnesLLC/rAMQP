@@ -506,6 +506,10 @@ impl Proxy {
                     });
                 }
             }
+            // Clustered quorum queues cannot be deleted yet.
+            QueueMsg::Delete { reply } => {
+                let _ = reply.send(false);
+            }
             QueueMsg::Unsubscribe { sub } => {
                 let Ok(key) = u32::try_from(sub) else {
                     return true;
@@ -704,8 +708,9 @@ impl Proxy {
                 body,
                 ..
             } => self.forward_delivery(key, msg_id, body),
-            // Publish acks ride per-publish channels, not this one.
-            ConnCmd::SettleIncoming { .. } => {}
+            // Publish acks ride per-publish channels, not this one; quorum
+            // actors are never deleted.
+            ConnCmd::SettleIncoming { .. } | ConnCmd::QueueDeleted { .. } => {}
         }
     }
 

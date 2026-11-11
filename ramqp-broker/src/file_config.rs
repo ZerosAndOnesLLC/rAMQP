@@ -6,6 +6,8 @@
 //! listen = "0.0.0.0:5672"
 //! data_dir = "/var/lib/ramqp"
 //! management_listen = "0.0.0.0:15692"
+//! management_token_file = "/etc/ramqp/mgmt-token"   # bearer token for PUT/DELETE
+//! management_auth_reads = false   # true: GETs need credentials too
 //! allow_anonymous = false      # default
 //! allow_plain = true           # PLAIN checked against the SCRAM verifier
 //!
@@ -84,6 +86,10 @@ pub struct FileConfig {
     pub data_dir: Option<PathBuf>,
     /// Management/metrics HTTP listen address.
     pub management_listen: Option<String>,
+    /// File holding the management API bearer token.
+    pub management_token_file: Option<PathBuf>,
+    /// Require credentials for management reads too (default false).
+    pub management_auth_reads: Option<bool>,
     /// Offer ANONYMOUS / accept unauthenticated connections. Required to
     /// start on a non-loopback listener with no users configured.
     pub allow_anonymous: Option<bool>,
@@ -392,6 +398,12 @@ impl FileConfig {
         if let Some(m) = &self.management_listen {
             config.management_listen = Some(m.clone());
         }
+        if let Some(f) = &self.management_token_file {
+            config.management_token = Some(read_token(&self.resolve(f))?);
+        }
+        if let Some(r) = self.management_auth_reads {
+            config.management_auth_reads = r;
+        }
         if let Some(l) = &self.limits {
             macro_rules! set {
                 ($($f:ident),*) => { $(if let Some(v) = l.$f { config.$f = v; })* };
@@ -530,6 +542,20 @@ fn policy_key(vhost: &str, prefix: &str) -> String {
     } else {
         format!("{vhost}/{prefix}")
     }
+}
+
+/// Read a secret token file (a trailing newline is not part of it).
+pub fn read_token(path: &Path) -> Result<crate::config::SecretString, String> {
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| format!("reading token file {}: {e}", path.display()))?;
+    let token = raw.trim_end_matches(['\n', '\r']);
+    if token.len() < 16 {
+        return Err(format!(
+            "token in {} is shorter than 16 characters",
+            path.display()
+        ));
+    }
+    Ok(crate::config::SecretString::new(token))
 }
 
 /// Parse a `"<id>=<host:port>"` seed.

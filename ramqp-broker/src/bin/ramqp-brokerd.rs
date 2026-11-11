@@ -50,6 +50,7 @@ struct Args {
     seeds: Vec<(u64, String)>,
     data_dir: Option<std::path::PathBuf>,
     management_listen: Option<String>,
+    management_token_file: Option<std::path::PathBuf>,
     allow_anonymous: bool,
 }
 
@@ -58,12 +59,14 @@ fn usage() -> ! {
         "usage: ramqp-brokerd [--config <file.toml>] [--listen <addr:port>]\n\
          \x20                    [--node-id <n> --cluster-listen <addr:port> --seed <id>=<addr> ...]\n\
          \x20                    [--data-dir <path>] [--management-listen <addr:port>]\n\
+         \x20                    [--management-token-file <path>]\n\
          \x20                    [--allow-anonymous]\n\
          \x20      ramqp-brokerd hash-password [--mechanism SCRAM-SHA-256|SCRAM-SHA-512|SCRAM-SHA-1]\n\
          \x20                    [--iterations <n>]   (password on stdin)\n\
          env: RAMQP_CONFIG, RAMQP_LISTEN, RAMQP_NODE_ID, RAMQP_CLUSTER_LISTEN,\n\
          \x20    RAMQP_SEEDS=1=a:7472,2=b:7472, RAMQP_DATA_DIR (durable queues need a build with\n\
-         \x20    --features store-redb), RAMQP_MANAGEMENT_LISTEN, RAMQP_ALLOW_ANONYMOUS=1"
+         \x20    --features store-redb), RAMQP_MANAGEMENT_LISTEN,\n\
+         \x20    RAMQP_MANAGEMENT_TOKEN_FILE, RAMQP_ALLOW_ANONYMOUS=1"
     );
     std::process::exit(2);
 }
@@ -91,6 +94,9 @@ fn parse_args(argv: impl Iterator<Item = String>) -> Args {
             .unwrap_or_default(),
         data_dir: std::env::var("RAMQP_DATA_DIR").ok().map(Into::into),
         management_listen: std::env::var("RAMQP_MANAGEMENT_LISTEN").ok(),
+        management_token_file: std::env::var("RAMQP_MANAGEMENT_TOKEN_FILE")
+            .ok()
+            .map(Into::into),
         allow_anonymous: env_flag("RAMQP_ALLOW_ANONYMOUS"),
     };
     let mut argv = argv;
@@ -106,6 +112,7 @@ fn parse_args(argv: impl Iterator<Item = String>) -> Args {
             "--cluster-listen" => args.cluster_listen = Some(value()),
             "--data-dir" => args.data_dir = Some(value().into()),
             "--management-listen" => args.management_listen = Some(value()),
+            "--management-token-file" => args.management_token_file = Some(value().into()),
             "--seed" => flag_seeds.push(parse_seed(&value()).unwrap_or_else(|| usage())),
             "--allow-anonymous" => args.allow_anonymous = true,
             "--help" | "-h" => usage(),
@@ -212,6 +219,10 @@ async fn main() -> std::io::Result<()> {
     }
     if let Some(m) = &args.management_listen {
         config.management_listen = Some(m.clone());
+    }
+    if let Some(f) = &args.management_token_file {
+        config.management_token =
+            Some(ramqp_broker::file_config::read_token(f).unwrap_or_else(|e| fail(e)));
     }
     if config.data_dir.is_some() && !cfg!(feature = "store-redb") {
         fail("a data dir is configured but this build lacks the `store-redb` feature");

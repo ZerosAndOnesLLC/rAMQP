@@ -138,6 +138,14 @@ pub(crate) enum QueueMsg {
         /// Where to reply.
         reply: tokio::sync::oneshot::Sender<QueueStats>,
     },
+    /// Delete the queue (management API): detach every consumer with
+    /// `amqp:resource-deleted`, drop the messages, and stop. Replies `true`
+    /// once done, `false` if this queue kind does not support deletion
+    /// (the actor then keeps running).
+    Delete {
+        /// Where to reply.
+        reply: tokio::sync::oneshot::Sender<bool>,
+    },
 }
 
 /// A point-in-time queue statistics snapshot.
@@ -170,6 +178,16 @@ pub(crate) struct PublishAck {
 /// Commands into a connection driver (from queue actors).
 #[derive(Debug)]
 pub(crate) enum ConnCmd {
+    /// The queue a consumer link is subscribed to was deleted: detach the
+    /// link with `amqp:resource-deleted`.
+    QueueDeleted {
+        /// The session channel (ours).
+        channel: u16,
+        /// The consumer link handle.
+        handle: u32,
+        /// The binding generation (stale commands are dropped).
+        binding_gen: u64,
+    },
     /// Dispatch a message to a consumer link.
     Deliver {
         /// The session channel (ours) the link lives on.
@@ -356,6 +374,12 @@ async fn run(name: String, mut rx: mpsc::Receiver<QueueMsg>, policy: EffectivePo
                     consumers: subs.len(),
                 });
             }
+            QueueMsg::Delete { reply } => {
+                notify_deleted(&subs);
+                let _ = reply.send(true);
+                tracing::info!(queue = %name, dropped = ready.len() + unacked.len(), "queue deleted");
+                return;
+            }
             QueueMsg::Unsubscribe { sub } => {
                 subs.retain(|s| s.id != sub);
                 // Requeue everything that subscriber held, oldest first.
@@ -386,6 +410,17 @@ async fn run(name: String, mut rx: mpsc::Receiver<QueueMsg>, policy: EffectivePo
         .await;
     }
     tracing::debug!(queue = %name, "queue actor stopped");
+}
+
+/// Tell every subscriber's connection its queue is gone.
+pub(crate) fn notify_deleted(subs: &[Subscriber]) {
+    for s in subs {
+        let _ = s.conn.send(ConnCmd::QueueDeleted {
+            channel: s.channel,
+            handle: s.handle,
+            binding_gen: s.binding_gen,
+        });
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

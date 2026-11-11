@@ -76,16 +76,47 @@ pub struct BrokerConfig {
     /// page out to disk under `data_dir` (deep queues must not live in RAM —
     /// broker.md §3.1/§8). Ignored without a `data_dir`.
     pub resident_bytes_max: usize,
-    /// Management/metrics HTTP listen address (e.g. `127.0.0.1:15692`):
-    /// `GET /metrics` (Prometheus) and `GET /queues` (JSON). `None` (the
-    /// default) disables the endpoint. No auth — bind it to loopback or a
-    /// management network.
+    /// Management HTTP listen address (e.g. `127.0.0.1:15692`): metrics,
+    /// queue/exchange inspection, and the declare/delete admin API (see the
+    /// `mgmt` module docs). `None` (the default) disables the endpoint.
     pub management_listen: Option<String>,
+    /// Bearer token for the management API (`Authorization: Bearer
+    /// <token>`). Writes (`PUT`/`DELETE`) need this token or an admin
+    /// user's Basic credentials ([`crate::Authenticator::management_login`]);
+    /// with neither configured, the API is read-only.
+    pub management_token: Option<SecretString>,
+    /// Require credentials for management reads too (`GET`). Default
+    /// `false`, so Prometheus and autoscaler scrapes need no secret; turn it
+    /// on when the endpoint is reachable beyond a trusted network.
+    pub management_auth_reads: bool,
     /// Queue policies: `(name prefix, policy)` pairs, first match wins (an
     /// empty prefix matches every queue). Matched against the normalized
     /// queue name (no `/queues/` etc. prefix) at declaration. The management
     /// API (Phase 9) will supersede this interim surface.
     pub policies: Vec<(String, QueuePolicy)>,
+}
+
+/// A secret string whose `Debug` output is redacted (config structs are
+/// logged; their secrets must not be).
+#[derive(Clone, PartialEq, Eq)]
+pub struct SecretString(String);
+
+impl SecretString {
+    /// Wrap a secret.
+    pub fn new(secret: impl Into<String>) -> Self {
+        SecretString(secret.into())
+    }
+
+    /// The secret itself.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for SecretString {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SecretString(<redacted>)")
+    }
 }
 
 /// Per-queue behavior policies: TTL, length bounds, dead-lettering.
@@ -205,6 +236,8 @@ impl Default for BrokerConfig {
             data_dir: None,
             resident_bytes_max: 64 * 1024 * 1024,
             management_listen: None,
+            management_token: None,
+            management_auth_reads: false,
             policies: Vec::new(),
         }
     }

@@ -8,6 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Admin API** on the management listener (issue #37 §3): `PUT`/`DELETE`
+  for queues, exchanges, and bindings (idempotent: `201` created, `204`
+  already so, `409` different arguments), `GET /queues/<vhost>/<name>` for
+  one queue's ready/unacked/consumers (KEDA `metrics-api`), and
+  `GET /exchanges[/<vhost>/<name>]`. Writes need a bearer token
+  (`BrokerConfig::management_token`, `management_token_file`,
+  `--management-token-file`) or Basic credentials of an admin user
+  (`Authenticator::management_login`); `management_auth_reads` protects
+  reads too. Bounded request bodies, still no HTTP dependency.
+- **Queue deletion** for transient and durable queues: consumers are
+  detached with `amqp:resource-deleted`, producers on their next publish,
+  and a durable queue's rows (and name) are purged. Quorum-queue deletion
+  answers `501` for now.
+- `SecretString` (redacted `Debug`) for secrets in `BrokerConfig`.
 - **Exchange routing** (issue #37 §1) with RabbitMQ 4.x AMQP 1.0 addressing:
   producers publish to `/exchanges/<name>/<routing-key>` or `/exchanges/<name>`
   (routing key from `properties.subject`). Kinds: fanout, direct, topic
