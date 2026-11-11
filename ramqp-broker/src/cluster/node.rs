@@ -76,8 +76,11 @@ pub struct NodeSettings {
 /// Capability bit: applies `MetaCommand::Exchange` (and the extended
 /// metadata snapshot).
 const CAP_EXCHANGES: u64 = 1;
+/// Capability bit: applies `MetaCommand::DeleteQueue` with incarnations
+/// (and understands `RequestKind::StartGroupAt`).
+const CAP_QUEUE_DELETE: u64 = 2;
 /// What this node supports (answered to `RequestKind::Capabilities`).
-const CAPABILITIES: u64 = CAP_EXCHANGES;
+const CAPABILITIES: u64 = CAP_EXCHANGES | CAP_QUEUE_DELETE;
 
 /// One local member of a per-queue Raft group.
 struct GroupMember {
@@ -92,9 +95,11 @@ pub struct ClusterNode {
     meta: MetaRaft,
     meta_store: MetaStore,
     peers: Arc<fabric::Peers>,
-    /// Local members of per-queue groups, keyed by queue name.
+    /// Local members of per-queue groups, keyed by GROUP ID
+    /// ([`super::group_id`]: the queue name plus its incarnation).
     groups: std::sync::Mutex<HashMap<String, Arc<GroupMember>>>,
-    /// Leader-local queue actors (spawned only while this node leads).
+    /// Leader-local queue actors (spawned only while this node leads),
+    /// keyed by group id.
     actors: std::sync::Mutex<HashMap<String, QueueHandle>>,
     /// The bound fabric address (useful with port `0`).
     pub fabric_addr: std::net::SocketAddr,
@@ -108,6 +113,8 @@ pub struct ClusterNode {
     /// Every voter has confirmed it understands exchange metadata commands
     /// (checked before the first one is proposed; sticky once true).
     exchanges_capable: std::sync::atomic::AtomicBool,
+    /// Every voter has confirmed it supports quorum-queue deletion.
+    delete_capable: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for ClusterNode {
@@ -235,6 +242,7 @@ impl ClusterNode {
             settings,
             stopping: std::sync::atomic::AtomicBool::new(false),
             exchanges_capable: std::sync::atomic::AtomicBool::new(false),
+            delete_capable: std::sync::atomic::AtomicBool::new(false),
         });
 
         tokio::spawn(serve_fabric(
@@ -353,8 +361,8 @@ impl ClusterNode {
     /// Declare (or look up) a quorum queue and make sure its group is
     /// running. Returns the authoritative spec.
     pub async fn declare_quorum(self: &Arc<Self>, name: &str) -> Result<QueueSpec, String> {
-        if let Some(spec) = self.meta_store.catalog().get(name).cloned() {
-            self.ensure_group(name, &spec).await?;
+        if let Some((spec, incarnation)) = self.meta_store.queue(name) {
+            self.ensure_group(name, &spec, incarnation).await?;
             return Ok(spec);
         }
 
@@ -378,19 +386,40 @@ impl ClusterNode {
                 spec: spec.clone(),
             })
             .await?;
-        let spec = match response {
-            MetaResponse::Created => spec,
-            // Raced another declarer: adopt the winner's placement.
-            MetaResponse::AlreadyExists(existing) => existing,
+        match response {
+            MetaResponse::Created | MetaResponse::AlreadyExists(_) => {}
             other => return Err(format!("unexpected catalog response: {other:?}")),
+        }
+        // Read the entry back from THIS node's applied state, once it has
+        // caught up to the create: the incarnation must reflect every delete
+        // ordered before it (and a racing declarer's placement wins).
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let (spec, incarnation) = loop {
+            if let Some(entry) = self.meta_store.queue(name) {
+                break entry;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(format!("queue {name} not visible in the local catalog yet"));
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
         };
-        self.ensure_group(name, &spec).await?;
+        self.ensure_group(name, &spec, incarnation).await?;
         Ok(spec)
+    }
+
+    /// The current group id for a queue name (its present incarnation).
+    fn current_gid(&self, name: &str) -> String {
+        super::group_id(name, self.meta_store.incarnation(name))
     }
 
     /// Make sure the queue's Raft group is running on its placement nodes
     /// and has a leader.
-    async fn ensure_group(self: &Arc<Self>, name: &str, spec: &QueueSpec) -> Result<(), String> {
+    async fn ensure_group(
+        self: &Arc<Self>,
+        name: &str,
+        spec: &QueueSpec,
+        incarnation: u64,
+    ) -> Result<(), String> {
         let members: Vec<(NodeId, String)> = spec
             .placement
             .iter()
@@ -407,14 +436,15 @@ impl ClusterNode {
         let mut starts = Vec::new();
         for (id, _addr) in &members {
             if *id == self.node_id {
-                self.start_local_member(name, &members).await?;
+                self.start_local_member(name, &members, incarnation).await?;
             } else {
                 let node = self.clone();
                 let name = name.to_owned();
                 let members = members.clone();
                 let id = *id;
                 starts.push(tokio::spawn(async move {
-                    node.start_remote_member(id, &name, &members).await
+                    node.start_remote_member(id, &name, &members, incarnation)
+                        .await
                 }));
             }
         }
@@ -433,6 +463,7 @@ impl ClusterNode {
         id: NodeId,
         name: &str,
         members: &[(NodeId, String)],
+        incarnation: u64,
     ) -> Result<(), String> {
         let addr = members
             .iter()
@@ -445,15 +476,21 @@ impl ClusterNode {
             .conn()
             .await
             .map_err(|e| e.to_string())?;
-        conn.call(
+        // Incarnation 0 keeps the original request, so nodes that predate
+        // deletion still serve every queue that was never deleted.
+        let request = if incarnation == 0 {
             RequestKind::StartGroup {
                 queue: name.to_owned(),
                 members: members.to_vec(),
-            },
-            Bytes::new(),
-        )
-        .await
-        .map(|_| ())
+            }
+        } else {
+            RequestKind::StartGroupAt {
+                queue: name.to_owned(),
+                members: members.to_vec(),
+                incarnation,
+            }
+        };
+        conn.call(request, Bytes::new()).await.map(|_| ())
     }
 
     /// Create (idempotently) this node's member of a queue group. The lowest
@@ -462,6 +499,7 @@ impl ClusterNode {
         &self,
         name: &str,
         members: &[(NodeId, String)],
+        incarnation: u64,
     ) -> Result<(), String> {
         if self.stopping.load(std::sync::atomic::Ordering::Acquire) {
             return Err("node is stopping".to_owned());
@@ -469,13 +507,21 @@ impl ClusterNode {
         if !members.iter().any(|(id, _)| *id == self.node_id) {
             return Err(format!("node {} not in placement for {name}", self.node_id));
         }
-        if self.groups.lock().expect("groups lock").contains_key(name) {
+        // Never (re)start a superseded incarnation: its queue was deleted.
+        if incarnation < self.meta_store.incarnation(name) {
+            return Err(format!(
+                "queue {name} incarnation {incarnation} was deleted"
+            ));
+        }
+        let gid = super::group_id(name, incarnation);
+        let gid = gid.as_str();
+        if self.groups.lock().expect("groups lock").contains_key(gid) {
             return Ok(());
         }
         let config = Arc::new(queue_raft_config().validate().map_err(|e| e.to_string())?);
         let store = paged_queue_store(
             self.settings.data_dir.as_deref(),
-            name,
+            gid,
             self.settings.resident_bytes_max,
             self.settings.persist.as_ref(),
         )?;
@@ -485,7 +531,7 @@ impl ClusterNode {
             config,
             FabricNetworkFactory {
                 peers: self.peers.clone(),
-                group: GroupRef::Queue(name.to_owned()),
+                group: GroupRef::Queue(gid.to_owned()),
             },
             log_store,
             state_machine,
@@ -507,12 +553,12 @@ impl ClusterNode {
             // exact failure the flag exists to prevent).
             if self.stopping.load(std::sync::atomic::Ordering::Acquire) {
                 Insert::Stopping
-            } else if groups.contains_key(name) {
+            } else if groups.contains_key(gid) {
                 // Raced another creator: keep the first, drop ours.
                 Insert::Raced
             } else {
                 groups.insert(
-                    name.to_owned(),
+                    gid.to_owned(),
                     Arc::new(GroupMember {
                         raft: raft.clone(),
                         store,
@@ -543,7 +589,7 @@ impl ClusterNode {
                 .iter()
                 .map(|(id, addr)| (*id, BasicNode::new(addr.clone())))
                 .collect();
-            let queue = name.to_owned();
+            let queue = gid.to_owned();
             tokio::spawn(async move {
                 loop {
                     match raft.initialize(membership.clone()).await {
@@ -566,14 +612,25 @@ impl ClusterNode {
         Ok(())
     }
 
-    /// The local member of a queue group, lazily healed from the catalog
-    /// (covers restarts and members that missed the StartGroup fanout).
+    /// The local member of a queue's CURRENT group, lazily healed from the
+    /// catalog (covers restarts and members that missed the StartGroup
+    /// fanout).
     async fn group_member(&self, name: &str) -> Option<Arc<GroupMember>> {
-        if let Some(member) = self.groups.lock().expect("groups lock").get(name) {
+        let (_, incarnation) = self.meta_store.queue(name)?;
+        self.member_for_gid(&super::group_id(name, incarnation))
+            .await
+    }
+
+    /// The local member of group `gid`, lazily healed — but only while that
+    /// incarnation is the queue's current one: a deleted (superseded) group
+    /// is never resurrected by a straggling Raft RPC.
+    async fn member_for_gid(&self, gid: &str) -> Option<Arc<GroupMember>> {
+        if let Some(member) = self.groups.lock().expect("groups lock").get(gid) {
             return Some(member.clone());
         }
-        let spec = self.meta_store.catalog().get(name).cloned()?;
-        if !spec.placement.contains(&self.node_id) {
+        let (name, incarnation) = super::parse_group_id(gid);
+        let (spec, current) = self.meta_store.queue(name)?;
+        if current != incarnation || !spec.placement.contains(&self.node_id) {
             return None;
         }
         let members: Vec<(NodeId, String)> = spec
@@ -584,11 +641,11 @@ impl ClusterNode {
         if members.len() != spec.placement.len() {
             return None;
         }
-        if let Err(e) = self.start_local_member(name, &members).await {
-            tracing::warn!(queue = %name, error = %e, "lazy group member start failed");
+        if let Err(e) = self.start_local_member(name, &members, incarnation).await {
+            tracing::warn!(group = %gid, error = %e, "lazy group member start failed");
             return None;
         }
-        self.groups.lock().expect("groups lock").get(name).cloned()
+        self.groups.lock().expect("groups lock").get(gid).cloned()
     }
 
     /// Which node currently leads `name`'s group, from this node's view:
@@ -664,8 +721,9 @@ impl ClusterNode {
         let leader = member.raft.metrics().borrow().current_leader;
         match leader {
             Some(id) if id == self.node_id => {
+                let gid = self.current_gid(name);
                 let mut actors = self.actors.lock().expect("actors lock");
-                if let Some(handle) = actors.get(name)
+                if let Some(handle) = actors.get(&gid)
                     && !handle.tx.is_closed()
                 {
                     return Ok(handle.clone());
@@ -701,7 +759,7 @@ impl ClusterNode {
                     policy,
                     true, // exit when leadership is lost
                 );
-                actors.insert(name.to_owned(), handle.clone());
+                actors.insert(gid, handle.clone());
                 Ok(handle)
             }
             Some(other) => Err(Some(other)),
@@ -739,8 +797,21 @@ impl ClusterNode {
     /// (or a snapshot carrying exchange state). Checked over the fabric
     /// (`RequestKind::Capabilities`, which an older node cannot answer).
     async fn ensure_exchange_capable(&self) -> Result<(), crate::exchange::ExchangeError> {
+        self.ensure_capable(&self.exchanges_capable, CAP_EXCHANGES, "exchanges")
+            .await
+            .map_err(crate::exchange::ExchangeError::Unavailable)
+    }
+
+    /// Refuse a feature until every metadata voter reports `bit` (probed
+    /// over the fabric; an older node cannot answer). Sticky once true.
+    async fn ensure_capable(
+        &self,
+        flag: &std::sync::atomic::AtomicBool,
+        bit: u64,
+        feature: &str,
+    ) -> Result<(), String> {
         use std::sync::atomic::Ordering;
-        if self.exchanges_capable.load(Ordering::Acquire) {
+        if flag.load(Ordering::Acquire) {
             return Ok(());
         }
         for (id, addr) in self.voters() {
@@ -759,16 +830,136 @@ impl ClusterNode {
                 crate::serde_bin::from_slice::<u64>(&reply).ok()
             }
             .await
-            .is_some_and(|caps| caps & CAP_EXCHANGES != 0);
+            .is_some_and(|caps| caps & bit != 0);
             if !capable {
-                return Err(crate::exchange::ExchangeError::Unavailable(format!(
-                    "cluster node {id} does not support exchanges yet: upgrade every node \
-                     before declaring exchanges or bindings"
-                )));
+                return Err(format!(
+                    "cluster node {id} does not support {feature} yet: upgrade every node first"
+                ));
             }
         }
-        self.exchanges_capable.store(true, Ordering::Release);
+        flag.store(true, Ordering::Release);
         Ok(())
+    }
+
+    /// Delete a quorum queue cluster-wide: commit the delete through the
+    /// metadata group (which moves the name to its next incarnation on every
+    /// node). Each node then tears down its member of the old group and
+    /// purges its stored state ([`Self::reconcile`]); a node that is down
+    /// does so when it catches up. `Ok(false)` = no such queue.
+    pub(crate) async fn delete_quorum(&self, name: &str) -> Result<bool, String> {
+        self.ensure_capable(
+            &self.delete_capable,
+            CAP_QUEUE_DELETE,
+            "quorum-queue deletion",
+        )
+        .await?;
+        let (result, ambiguous) = self
+            .meta_write_tracked(MetaCommand::DeleteQueue {
+                name: name.to_owned(),
+            })
+            .await;
+        match result? {
+            MetaResponse::Deleted => Ok(true),
+            // A retry after an ambiguous failure may find its own earlier
+            // attempt applied: the queue is gone either way.
+            MetaResponse::NotFound if ambiguous => Ok(true),
+            MetaResponse::NotFound => Ok(false),
+            other => Err(format!("unexpected catalog response: {other:?}")),
+        }
+    }
+
+    /// Bring this node in line with the catalog's incarnations: stop and
+    /// discard every local group member whose incarnation is superseded
+    /// (its queue was deleted), and purge the stored state — Raft log,
+    /// snapshot, spill segments — of every superseded group, running or
+    /// not (a node that was down at delete time cleans up here). Groups
+    /// whose name the catalog does not know are left alone (the metadata
+    /// state may still be replaying). Idempotent.
+    pub(crate) async fn reconcile(&self) {
+        let incarnations = self.meta_store.incarnations();
+        if incarnations.is_empty() {
+            return;
+        }
+        let superseded = |gid: &str| {
+            let (name, inc) = super::parse_group_id(gid);
+            incarnations.get(name).is_some_and(|current| inc < *current)
+        };
+        let stale: Vec<(String, Arc<GroupMember>, Option<QueueHandle>)> = {
+            let mut groups = self.groups.lock().expect("groups lock");
+            let mut actors = self.actors.lock().expect("actors lock");
+            let gids: Vec<String> = groups.keys().filter(|g| superseded(g)).cloned().collect();
+            gids.into_iter()
+                .filter_map(|g| {
+                    let actor = actors.remove(&g);
+                    groups.remove(&g).map(|m| (g, m, actor))
+                })
+                .collect()
+        };
+        for (gid, member, actor) in stale {
+            tracing::info!(group = %gid, "quorum queue deleted: stopping its local member");
+            if let Some(actor) = actor {
+                // Detach its subscribers; the actor's own raft clone is shut
+                // down below.
+                let (tx, _rx) = tokio::sync::oneshot::channel();
+                let _ = actor.tx.send(QueueMsg::Delete { reply: tx }).await;
+            }
+            let _ = member.raft.shutdown().await;
+            drop(member);
+            self.purge_group(&gid).await;
+        }
+        // Stored state of superseded groups that are not running here.
+        if let Some(persist) = self.settings.persist.clone() {
+            let stored = tokio::task::spawn_blocking(move || persist.groups())
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .unwrap_or_default();
+            for group in stored {
+                if let Some(gid) = group.strip_prefix("queue/")
+                    && superseded(gid)
+                    && !self.groups.lock().expect("groups lock").contains_key(gid)
+                {
+                    self.purge_group(gid).await;
+                }
+            }
+        }
+    }
+
+    /// Remove one (stopped) group's on-disk state: spill and snapshot
+    /// directories first, then its Raft rows — so an interruption leaves a
+    /// row set that the next reconcile still finds and finishes.
+    async fn purge_group(&self, gid: &str) {
+        if let Some(dir) = self.settings.data_dir.as_deref() {
+            let (spill, snapshots) = super::queue_dirs(dir, gid);
+            for d in [spill, snapshots] {
+                if let Err(e) = std::fs::remove_dir_all(&d)
+                    && e.kind() != std::io::ErrorKind::NotFound
+                {
+                    tracing::warn!(dir = %d.display(), error = %e, "could not remove a deleted queue's files");
+                }
+            }
+        }
+        if let Some(persist) = self.settings.persist.clone() {
+            let group = format!("queue/{gid}");
+            match tokio::task::spawn_blocking(move || persist.purge_group(&group)).await {
+                Ok(Ok(())) => tracing::info!(group = %gid, "deleted queue's stored state purged"),
+                Ok(Err(e)) => {
+                    tracing::warn!(group = %gid, error = %e, "purge failed; retried on the next reconcile")
+                }
+                Err(e) => tracing::warn!(group = %gid, error = %e, "purge task failed"),
+            }
+        }
+    }
+
+    /// Every deleted name's current incarnation (change detection for the
+    /// reconcile watcher).
+    pub(crate) fn incarnations(&self) -> BTreeMap<String, u64> {
+        self.meta_store.incarnations()
+    }
+
+    /// A queue's current incarnation in the applied catalog.
+    pub(crate) fn queue_incarnation(&self, name: &str) -> u64 {
+        self.meta_store.incarnation(name)
     }
 
     /// Whether the replicated catalog has this queue.
@@ -1318,18 +1509,34 @@ async fn handle_request(
             let writer = writer.clone();
             tokio::spawn(async move {
                 let reply = node
-                    .start_local_member(&queue, &members)
+                    .start_local_member(&queue, &members, 0)
+                    .await
+                    .map(|()| Vec::new());
+                send_reply(&writer, corr, reply);
+            });
+        }
+        RequestKind::StartGroupAt {
+            queue,
+            members,
+            incarnation,
+        } => {
+            let node = node.clone();
+            let writer = writer.clone();
+            tokio::spawn(async move {
+                let reply = node
+                    .start_local_member(&queue, &members, incarnation)
                     .await
                     .map(|()| Vec::new());
                 send_reply(&writer, corr, reply);
             });
         }
         RequestKind::WhoLeads { queue } => {
+            let gid = node.current_gid(&queue);
             let leader = node
                 .groups
                 .lock()
                 .expect("groups lock")
-                .get(&queue)
+                .get(&gid)
                 .map(|m| m.raft.metrics().borrow().current_leader);
             let leader: Option<NodeId> = leader.flatten();
             send_reply(
@@ -1472,11 +1679,11 @@ async fn handle_raft(
             let raft = node.meta.clone();
             raft_dispatch::<MetaTypeConfig>(&raft, kind, &body).await
         }
-        GroupRef::Queue(name) => {
+        GroupRef::Queue(gid) => {
             let member = node
-                .group_member(&name)
+                .member_for_gid(&gid)
                 .await
-                .ok_or_else(|| format!("no local member of queue group {name}"))?;
+                .ok_or_else(|| format!("no local member of queue group {gid}"))?;
             raft_dispatch::<QueueTypeConfig>(&member.raft, kind, &body).await
         }
     }
@@ -1677,6 +1884,67 @@ fn send_publish_status(writer: &mpsc::UnboundedSender<OutFrame>, corr: u64, stat
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A node that did not run a deleted queue's group at delete time (it
+    /// was down) still purges that group's stored state once it sees the
+    /// delete, and never resurrects it; groups of other queues are kept.
+    #[cfg(feature = "store-redb")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reconcile_purges_a_deleted_queues_stored_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open(dir.path()).unwrap();
+        let persist: Arc<dyn super::super::store::RaftPersistFactory> = Arc::new(store);
+        let addr = reserve_addrs(1).await.remove(0);
+        let node = ClusterNode::bootstrap(NodeSettings {
+            node_id: 1,
+            listen: addr.clone(),
+            seeds: vec![(1, addr)],
+            replicas: 1,
+            max_queue_depth: 10_000,
+            max_queue_bytes: 0,
+            data_dir: Some(dir.path().to_path_buf()),
+            resident_bytes_max: usize::MAX,
+            policies: Vec::new(),
+            dlx: None,
+            persist: Some(persist.clone()),
+            tls: None,
+        })
+        .await
+        .expect("bootstrap");
+        node.await_membership(Duration::from_secs(15))
+            .await
+            .unwrap();
+        node.declare_quorum("doomed").await.expect("declare");
+        node.declare_quorum("kept").await.expect("declare");
+        let stored = || persist.groups().unwrap();
+        assert!(stored().contains(&"queue/doomed".to_owned()));
+
+        // Simulate "this node was down": its member is not running.
+        let member = node.groups.lock().unwrap().remove("doomed").unwrap();
+        member.raft.shutdown().await.unwrap();
+        drop(member);
+
+        assert!(node.delete_quorum("doomed").await.unwrap());
+        assert_eq!(node.queue_incarnation("doomed"), 1);
+        node.reconcile().await;
+        assert!(
+            !stored().contains(&"queue/doomed".to_owned()),
+            "the deleted group's stored state is purged: {:?}",
+            stored()
+        );
+        assert!(
+            stored().contains(&"queue/kept".to_owned()),
+            "other queues are untouched"
+        );
+        // A straggling Raft RPC for the old group does not resurrect it.
+        assert!(node.member_for_gid("doomed").await.is_none());
+        // A re-declare is a new incarnation with its own group.
+        node.declare_quorum("doomed").await.expect("re-declare");
+        assert!(stored().contains(&"queue/doomed//1".to_owned()));
+        assert!(!stored().contains(&"queue/doomed".to_owned()));
+        node.stop().await;
+    }
+
     use crate::proxy;
     use crate::queue::SettleOutcome;
 

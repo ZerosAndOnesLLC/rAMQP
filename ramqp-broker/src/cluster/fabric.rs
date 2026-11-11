@@ -137,6 +137,17 @@ pub enum RequestKind {
     /// `u64` bitmask. A node predating this variant cannot decode it (its
     /// connection drops), which reads as "no capabilities".
     Capabilities,
+    /// [`RequestKind::StartGroup`] for a re-declared queue: start this
+    /// node's member of incarnation `incarnation` (only sent for incarnation
+    /// > 0, which requires every node to support deletion).
+    StartGroupAt {
+        /// The queue name.
+        queue: String,
+        /// The full replica set: `(node id, fabric address)`.
+        members: Vec<(NodeId, String)>,
+        /// The queue's incarnation.
+        incarnation: u64,
+    },
 }
 
 /// One fabric frame's header. `corr`-carrying variants are request/reply

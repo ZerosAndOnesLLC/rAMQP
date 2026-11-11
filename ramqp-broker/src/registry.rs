@@ -32,12 +32,13 @@ use crate::quorum;
 const EXCHANGE_ROW: &str = "exchange:";
 
 /// Why a queue deletion did not happen.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum QueueDeleteError {
     /// No such queue.
     NotFound,
-    /// This kind cannot be deleted (quorum queues, for now).
-    Unsupported,
+    /// The deletion cannot proceed right now (e.g. a cluster node still
+    /// runs a version without quorum-queue deletion).
+    Unavailable(String),
     /// The deletion failed (store error); the queue is unchanged.
     Failed,
 }
@@ -106,6 +107,11 @@ pub(crate) struct QueueRegistry {
     exchanges: ExchangeRegistry,
     /// Serializes standalone topology changes (read-modify-persist-swap).
     exchange_write: tokio::sync::Mutex<()>,
+    /// Quorum queue incarnations this registry is serving: standalone,
+    /// the authority when there is no store (in memory); clustered, the
+    /// incarnation each proxy was created for (a newer one means the queue
+    /// was deleted underneath it).
+    quorum_incarnations: std::sync::Mutex<HashMap<String, u64>>,
     /// Whether the routing view reflects the persisted definitions. False
     /// only for a standalone broker with a store that has not been read yet
     /// (e.g. the previous instance still held its lock at bind); until then
@@ -132,6 +138,7 @@ impl QueueRegistry {
             dlx: OnceLock::new(),
             exchanges: ExchangeRegistry::default(),
             exchange_write: tokio::sync::Mutex::new(()),
+            quorum_incarnations: std::sync::Mutex::new(HashMap::new()),
             exchanges_loaded: std::sync::atomic::AtomicBool::new(
                 !cfg!(feature = "store-redb") || config.data_dir.is_none(),
             ),
@@ -538,17 +545,18 @@ impl QueueRegistry {
             .collect()
     }
 
-    /// Delete a queue (management API). Transient and durable queues
-    /// detach their consumers (`amqp:resource-deleted`), drop their
-    /// messages (a durable queue purges its rows), and stop; the next
-    /// attach to the address declares a fresh, empty queue.
+    /// Delete a queue (management API). Its consumers are detached
+    /// (`amqp:resource-deleted`), its messages and stored state removed (a
+    /// durable queue purges its rows; a quorum queue its Raft group — see
+    /// [`Self::delete_quorum`]), and the next attach to the address
+    /// declares a fresh, empty queue.
     pub async fn delete_queue(
         &self,
         kind: QueueKind,
         qualified: &str,
     ) -> Result<(), QueueDeleteError> {
         if kind == QueueKind::Quorum {
-            return Err(QueueDeleteError::Unsupported);
+            return self.delete_quorum(qualified).await;
         }
         let (_, handle) = self
             .find_queue(Some(kind), qualified)
@@ -597,6 +605,204 @@ impl QueueRegistry {
             }
             Ok(false) => Err(QueueDeleteError::Failed),
             Err(_) => Err(QueueDeleteError::NotFound),
+        }
+    }
+
+    /// A standalone quorum queue's current incarnation: persisted in the
+    /// store when there is one (so a crash mid-delete never revives the old
+    /// queue), else in memory. `None` if the store cannot be read.
+    async fn standalone_incarnation(&self, name: &str) -> Option<u64> {
+        #[cfg(feature = "store-redb")]
+        if self.data_dir.is_some() {
+            let store = self.store().await?;
+            return store.quorum_incarnation(name).ok();
+        }
+        Some(
+            self.quorum_incarnations
+                .lock()
+                .expect("incarnations lock")
+                .get(name)
+                .copied()
+                .unwrap_or(0),
+        )
+    }
+
+    /// Delete a quorum queue. Clustered: committed through the metadata
+    /// group (every node then tears down its member and purges its state —
+    /// see `ClusterNode::reconcile`), and this node's proxy detaches its
+    /// consumers at once. Standalone: the next incarnation is recorded
+    /// FIRST (durably), so a re-declare — even after a crash mid-delete —
+    /// starts empty; then the actor stops and the old group's state is
+    /// purged.
+    async fn delete_quorum(&self, qualified: &str) -> Result<(), QueueDeleteError> {
+        let (vhost, bare) = qualified.split_once('/').unwrap_or(("", qualified));
+        if let Some(node) = self.cluster.get().cloned() {
+            match node.delete_quorum(qualified).await {
+                Ok(true) => {}
+                Ok(false) => return Err(QueueDeleteError::NotFound),
+                Err(e) => return Err(QueueDeleteError::Unavailable(e)),
+            }
+            self.reconcile_quorum().await;
+            node.reconcile().await;
+        } else {
+            let (_, handle) = self
+                .find_queue(Some(QueueKind::Quorum), qualified)
+                .await
+                .ok_or(QueueDeleteError::NotFound)?;
+            let current = self
+                .standalone_incarnation(qualified)
+                .await
+                .ok_or(QueueDeleteError::Failed)?;
+            self.set_standalone_incarnation(qualified, current + 1)
+                .await
+                .map_err(QueueDeleteError::Unavailable)?;
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let _ = handle.tx.send(QueueMsg::Delete { reply: tx }).await;
+            let _ = rx.await;
+            self.evict(QueueKind::Quorum, qualified, &handle);
+            self.purge_standalone_group(&crate::cluster::group_id(qualified, current))
+                .await;
+        }
+        if let Err(e) = self
+            .exchange_op(ExchangeOp::UnbindDestination {
+                vhost: vhost.to_owned(),
+                destination: format!("/quorum/{bare}"),
+            })
+            .await
+        {
+            tracing::warn!(queue = %qualified, error = %e, "could not remove the deleted queue's bindings");
+        }
+        Ok(())
+    }
+
+    /// Record a standalone quorum queue's next incarnation.
+    async fn set_standalone_incarnation(&self, name: &str, incarnation: u64) -> Result<(), String> {
+        #[cfg(feature = "store-redb")]
+        if self.data_dir.is_some() {
+            let store = self.store().await.ok_or("durable store not openable")?;
+            let name = name.to_owned();
+            return tokio::task::spawn_blocking(move || {
+                store.set_quorum_incarnation(&name, incarnation)
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+        }
+        self.quorum_incarnations
+            .lock()
+            .expect("incarnations lock")
+            .insert(name.to_owned(), incarnation);
+        Ok(())
+    }
+
+    /// Drop a registry entry if it still holds `handle`.
+    fn evict(&self, kind: QueueKind, qualified: &str, handle: &QueueHandle) {
+        let key = Self::key_for(kind, qualified);
+        let mut map = self.queues.lock().expect("registry lock");
+        if map
+            .get(&key)
+            .and_then(|c| c.get())
+            .is_some_and(|h| h.tx.same_channel(&handle.tx))
+        {
+            map.remove(&key);
+        }
+    }
+
+    /// Remove a stopped standalone quorum group's files, then its Raft rows
+    /// (files first: an interruption leaves rows the next GC still finds).
+    async fn purge_standalone_group(&self, gid: &str) {
+        if let Some(dir) = self.data_dir.as_deref() {
+            let (spill, snapshots) = crate::cluster::queue_dirs(dir, gid);
+            for d in [spill, snapshots] {
+                if let Err(e) = std::fs::remove_dir_all(&d)
+                    && e.kind() != std::io::ErrorKind::NotFound
+                {
+                    tracing::warn!(dir = %d.display(), error = %e, "could not remove a deleted queue's files");
+                }
+            }
+        }
+        if let Some(persist) = self.persist_factory().await {
+            let group = format!("queue/{gid}");
+            match tokio::task::spawn_blocking(move || persist.purge_group(&group)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    tracing::warn!(group = %gid, error = %e, "purge failed; retried at next startup")
+                }
+                Err(e) => tracing::warn!(group = %gid, error = %e, "purge task failed"),
+            }
+        }
+    }
+
+    /// Standalone startup: purge the stored state of quorum groups that a
+    /// delete superseded (a crash between recording the new incarnation and
+    /// finishing the purge leaves some behind). Groups of names never
+    /// deleted are untouched.
+    pub async fn gc_quorum_groups(&self) {
+        if self.cluster.get().is_some() {
+            return;
+        }
+        let Some(persist) = self.persist_factory().await else {
+            return;
+        };
+        let p = persist.clone();
+        let stored = tokio::task::spawn_blocking(move || p.groups())
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or_default();
+        for group in stored {
+            let Some(gid) = group.strip_prefix("queue/") else {
+                continue;
+            };
+            let (name, inc) = crate::cluster::parse_group_id(gid);
+            if self
+                .standalone_incarnation(name)
+                .await
+                .is_some_and(|current| inc < current)
+            {
+                self.purge_standalone_group(gid).await;
+            }
+        }
+    }
+
+    /// Clustered: stop this node's proxies for quorum queues that were
+    /// deleted (by any node) — they detach their consumers with
+    /// `amqp:resource-deleted` — so the next attach declares afresh.
+    pub async fn reconcile_quorum(&self) {
+        let Some(node) = self.cluster.get().cloned() else {
+            return;
+        };
+        let served: Vec<(String, u64)> = self
+            .quorum_incarnations
+            .lock()
+            .expect("incarnations lock")
+            .iter()
+            .map(|(n, i)| (n.clone(), *i))
+            .collect();
+        for (name, served_inc) in served {
+            // A delete always moves the name to a newer incarnation (even
+            // if it was re-declared since), so that alone says "gone".
+            if node.queue_incarnation(&name) == served_inc {
+                continue;
+            }
+            let handle = self.lookup(QueueKind::Quorum, &name);
+            self.quorum_incarnations
+                .lock()
+                .expect("incarnations lock")
+                .remove(&name);
+            if let Some(handle) = handle {
+                // Bounded: a proxy busy re-binding notices the delete itself.
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                if tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    handle.tx.send(QueueMsg::Delete { reply: tx }),
+                )
+                .await
+                .is_ok_and(|sent| sent.is_ok())
+                {
+                    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), rx).await;
+                }
+                self.evict(QueueKind::Quorum, &name, &handle);
+            }
         }
     }
 
@@ -683,6 +889,10 @@ impl QueueRegistry {
                                     tracing::warn!(queue = %name, error = %e, "quorum declare failed");
                                     InitAbort::Failed
                                 })?;
+                                self.quorum_incarnations
+                                    .lock()
+                                    .expect("incarnations lock")
+                                    .insert(name.to_owned(), node.queue_incarnation(name));
                                 proxy::spawn(name.to_owned(), node.clone())
                             }
                             None => {
@@ -701,8 +911,13 @@ impl QueueRegistry {
                                     );
                                     return Err(InitAbort::Failed);
                                 }
+                                let group = crate::cluster::group_id(
+                                    name,
+                                    self.standalone_incarnation(name).await.ok_or(InitAbort::Failed)?,
+                                );
                                 spawn_quorum_group(
                                     name.to_owned(),
+                                    &group,
                                     self.node_id,
                                     self.policy_for(name),
                                     self.data_dir.as_deref(),
@@ -779,6 +994,7 @@ impl QueueRegistry {
 /// silently swallows) each failure so a resolution error is diagnosable.
 async fn spawn_quorum_group(
     name: String,
+    group: &str,
     node_id: NodeId,
     policy: EffectivePolicy,
     data_dir: Option<&std::path::Path>,
@@ -808,7 +1024,7 @@ async fn spawn_quorum_group(
     .ok()?;
     let store = crate::cluster::node::paged_queue_store(
         data_dir,
-        &name,
+        group,
         resident_bytes_max,
         persist.as_ref(),
     )

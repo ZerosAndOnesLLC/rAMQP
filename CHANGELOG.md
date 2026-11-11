@@ -5,6 +5,31 @@ All notable changes to ramqp will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Quorum-queue deletion** (`DELETE /queues/<vhost>/<name>?kind=quorum`),
+  standalone and clustered. Each quorum queue name now has an
+  *incarnation* in the metadata group, bumped by a delete; the queue's
+  Raft group id — its fabric address and on-disk storage — is the name for
+  incarnation 0 (so every existing queue is unchanged) and `<name>//<n>`
+  after a delete. A re-declared queue therefore never shares a log, a
+  snapshot, spill files, or Raft traffic with the deleted one.
+  - Clustered: the delete commits through the metadata group; every node
+    then stops its member of the old group, detaches the consumers and
+    producers attached through it (`amqp:resource-deleted`), and purges
+    the group's Raft log, snapshot, and spill/snapshot files. A node that
+    was down does the same when it catches up; a straggling Raft RPC for
+    a deleted group never resurrects it.
+  - Standalone: the next incarnation is recorded durably *before* the old
+    group is purged, so a crash mid-delete can never revive the queue; a
+    startup pass finishes any interrupted purge.
+  - The deleted queue's bindings are removed.
+  - Gated like exchanges: refused (`503`) until every cluster node supports
+    it. Metadata snapshots keep the 0.10.0 encoding until a queue is
+    deleted. New fabric request `StartGroupAt` (sent only for re-declared
+    queues); existing request tags are unchanged.
+
 ## [ramqp-broker 0.10.0] - 2026-11-11
 
 `ramqp-broker` **0.10.0** + `ramqp-core` **0.2.7** (issue #37: replace

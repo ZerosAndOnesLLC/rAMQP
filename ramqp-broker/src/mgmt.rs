@@ -697,9 +697,7 @@ async fn delete_queue(
     match outcome {
         Ok(()) => Response::empty(204),
         Err(QueueDeleteError::NotFound) => Response::error(404, "no such queue"),
-        Err(QueueDeleteError::Unsupported) => {
-            Response::error(501, "deleting quorum queues is not supported yet")
-        }
+        Err(QueueDeleteError::Unavailable(why)) => Response::error(503, why),
         Err(QueueDeleteError::Failed) => Response::error(500, "queue deletion failed"),
     }
 }

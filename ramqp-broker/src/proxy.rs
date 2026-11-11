@@ -47,7 +47,9 @@ pub(crate) fn spawn(name: String, node: Arc<ClusterNode>) -> QueueHandle {
         tx,
     };
     tokio::spawn(async move {
-        Proxy::new(name, node).run(rx).await;
+        let mut proxy = Proxy::new(name, node);
+        proxy.incarnation = proxy.node.queue_incarnation(&proxy.name);
+        proxy.run(rx).await;
     });
     handle
 }
@@ -125,6 +127,11 @@ struct Proxy {
     /// Local-mode publish acks are tagged with this token so a stale ack
     /// from a previous binding is never misread.
     binding_epoch: u64,
+    /// Set by a delete: the run loop then answers what is still queued.
+    deleted: bool,
+    /// The queue incarnation this proxy serves: a newer one in the catalog
+    /// means the queue was deleted underneath it.
+    incarnation: u64,
 }
 
 impl Proxy {
@@ -142,6 +149,8 @@ impl Proxy {
             remote_chans: HashMap::new(),
             pubs: FuturesUnordered::new(),
             binding_epoch: 0,
+            deleted: false,
+            incarnation: 0,
         }
     }
 
@@ -195,6 +204,18 @@ impl Proxy {
                 }
             }
         }
+        if self.deleted {
+            // Settle what was in flight (refused: the queue is gone) and
+            // answer everything still queued, so no producer or consumer is
+            // left waiting on a proxy that no longer exists.
+            while let Ok(Some(done)) =
+                tokio::time::timeout(std::time::Duration::from_secs(2), self.pubs.next()).await
+            {
+                crate::dispatch::refuse_publish(&self.name, done.ack);
+            }
+            crate::queue::drain_after_delete(&self.name, &mut rx, u64::from(self.next_sub_key))
+                .await;
+        }
         tracing::debug!(queue = %self.name, "queue proxy stopped");
     }
 
@@ -225,6 +246,13 @@ impl Proxy {
             // A stopping node will never produce a leader again — exit
             // instead of pinning the node (and its store) for the deadline.
             if self.node.is_stopping() {
+                return false;
+            }
+            // Deleted (cluster-wide) while we looked for its leader: there
+            // will be no leader for this incarnation again.
+            if self.node.queue_incarnation(&self.name) != self.incarnation {
+                tracing::info!(queue = %self.name, "queue deleted; proxy detaching its consumers");
+                self.mark_deleted();
                 return false;
             }
             match self.try_bind().await {
@@ -528,9 +556,12 @@ impl Proxy {
                 // Remote without forwarding, or unbound mid-failover.
                 _ => drop(reply),
             },
-            // Clustered quorum queues cannot be deleted yet.
+            // The queue was deleted (cluster-wide, through the catalog): this
+            // node's subscribers are told, and the proxy stops.
             QueueMsg::Delete { reply } => {
-                let _ = reply.send(false);
+                self.mark_deleted();
+                let _ = reply.send(true);
+                return false;
             }
             QueueMsg::Unsubscribe { sub } => {
                 let Ok(key) = u32::try_from(sub) else {
@@ -552,6 +583,19 @@ impl Proxy {
             }
         }
         true
+    }
+
+    /// The queue is gone: tell every subscriber (`amqp:resource-deleted`)
+    /// and let the run loop wind down.
+    fn mark_deleted(&mut self) {
+        for (_, sub) in self.subs.drain() {
+            let _ = sub.conn.send(ConnCmd::QueueDeleted {
+                channel: sub.channel,
+                handle: sub.handle,
+                binding_gen: sub.binding_gen,
+            });
+        }
+        self.deleted = true;
     }
 
     /// Bind one (new) subscriber to the current downstream.

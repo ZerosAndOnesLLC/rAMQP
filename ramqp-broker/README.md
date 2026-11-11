@@ -215,7 +215,7 @@ inspection, and an idempotent admin API (the default vhost is `%2F`):
 | `GET /queues` | every queue with ready / unacked / consumers |
 | `GET /queues/<vhost>/<name>[?kind=]` | one queue: `{"ready", "unacked", "messages", "consumers", …}` — point KEDA's `metrics-api` scaler at `ready`. Correct on **every** node (a non-leader asks the queue's leader); `503` when unknowable, never zeros |
 | `PUT /queues/<vhost>/<name>` `{"kind":"quorum"}` | declare (`transient` default); `201` created, `204` exists, `409` exists as another kind |
-| `DELETE /queues/<vhost>/<name>[?kind=]` | delete a transient or durable queue (consumers detached with `amqp:resource-deleted`); quorum → `501` for now |
+| `DELETE /queues/<vhost>/<name>[?kind=]` | delete a queue of any kind: consumers and producers are detached with `amqp:resource-deleted`, its messages and stored state removed, and its bindings dropped. A clustered quorum queue is deleted through the metadata group — every replica tears down its Raft member and purges its log and files (a replica that is down does so when it rejoins), and a re-declare of the same name is a fresh, empty queue. Clustered deletion needs every node on a version that supports it (`503` otherwise) |
 | `GET /exchanges`, `GET /exchanges/<vhost>/<name>` | definitions with bindings |
 | `PUT /exchanges/<vhost>/<name>` `{"type":"topic","alternate":"/queues/x"}` | declare; `409` on different arguments |
 | `DELETE /exchanges/<vhost>/<name>` | delete with its bindings |
