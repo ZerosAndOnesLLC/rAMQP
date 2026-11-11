@@ -168,6 +168,29 @@ impl Store {
             .map_err(|_| "store writer stopped".to_owned())
     }
 
+    /// A standalone quorum queue's incarnation (how many times it has been
+    /// deleted; 0 if never).
+    pub fn quorum_incarnation(&self, name: &str) -> Result<u64, String> {
+        let txn = self.db.begin_read().map_err(|e| e.to_string())?;
+        let meta = txn.open_table(META).map_err(|e| e.to_string())?;
+        Ok(meta
+            .get(format!("qinc:{name}").as_str())
+            .map_err(|e| e.to_string())?
+            .map(|v| v.value())
+            .unwrap_or(0))
+    }
+
+    /// Durably record a standalone quorum queue's new incarnation. Blocking.
+    pub fn set_quorum_incarnation(&self, name: &str, incarnation: u64) -> Result<(), String> {
+        let txn = self.db.begin_write().map_err(|e| e.to_string())?;
+        {
+            let mut meta = txn.open_table(META).map_err(|e| e.to_string())?;
+            meta.insert(format!("qinc:{name}").as_str(), incarnation)
+                .map_err(|e| e.to_string())?;
+        }
+        txn.commit().map_err(|e| e.to_string())
+    }
+
     /// Whether a durable queue with this name was ever declared.
     pub fn has_queue(&self, name: &str) -> Result<bool, String> {
         let txn = self.db.begin_read().map_err(|e| e.to_string())?;
@@ -432,6 +455,37 @@ impl crate::cluster::store::RaftLogSink for GroupSink {
 }
 
 impl crate::cluster::store::RaftPersistFactory for Store {
+    fn groups(&self) -> Result<Vec<String>, String> {
+        let txn = self.db.begin_read().map_err(|e| e.to_string())?;
+        let table = txn.open_table(RAFT_GROUPS).map_err(|e| e.to_string())?;
+        let mut out = Vec::new();
+        for entry in table.iter().map_err(|e| e.to_string())? {
+            let (k, _) = entry.map_err(|e| e.to_string())?;
+            out.push(k.value().to_owned());
+        }
+        Ok(out)
+    }
+
+    fn purge_group(&self, group: &str) -> Result<(), String> {
+        let txn = self.db.begin_write().map_err(|e| e.to_string())?;
+        {
+            let mut groups = txn.open_table(RAFT_GROUPS).map_err(|e| e.to_string())?;
+            let id = groups
+                .remove(group)
+                .map_err(|e| e.to_string())?
+                .map(|v| v.value());
+            if let Some(id) = id {
+                let mut log = txn.open_table(RAFT_LOG).map_err(|e| e.to_string())?;
+                log.retain_in((id, 0)..=(id, u64::MAX), |_, _| false)
+                    .map_err(|e| e.to_string())?;
+                let mut meta = txn.open_table(RAFT_META).map_err(|e| e.to_string())?;
+                meta.retain_in((id, "")..=(id, "\u{10ffff}"), |_, _| false)
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+        txn.commit().map_err(|e| e.to_string())
+    }
+
     fn open_group(
         &self,
         group: &str,

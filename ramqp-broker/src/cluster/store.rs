@@ -74,6 +74,12 @@ pub struct MetaState {
     /// Bumped on every applied exchange change, so nodes can tell whether
     /// their local routing view is current.
     pub exchanges_epoch: u64,
+    /// Per quorum-queue name: how many times it has been deleted. The
+    /// queue's Raft group id (fabric address and on-disk storage) is derived
+    /// from `(name, incarnation)` — see [`super::group_id`] — so a queue
+    /// re-declared after a delete never shares state with the old one, and
+    /// every node can discard any group older than the current incarnation.
+    pub incarnations: BTreeMap<String, u64>,
 }
 
 /// The pre-exchange (0.9.x) snapshot encoding, still readable so a node
@@ -81,6 +87,14 @@ pub struct MetaState {
 #[derive(serde::Deserialize)]
 struct LegacyMetaState {
     catalog: BTreeMap<String, QueueSpec>,
+}
+
+/// The 0.10.0 snapshot encoding (no incarnations).
+#[derive(serde::Deserialize)]
+struct MetaStateV2 {
+    catalog: BTreeMap<String, QueueSpec>,
+    exchanges: crate::exchange::Defs,
+    exchanges_epoch: u64,
 }
 
 impl ReplicatedState for MetaState {
@@ -97,6 +111,16 @@ impl ReplicatedState for MetaState {
             });
             return MetaResponse::Exchange(result);
         }
+        if let MetaCommand::DeleteQueue { name } = command {
+            // Every node applies this, so every node moves the name to its
+            // next incarnation in the same log position.
+            return if self.catalog.remove(name).is_some() {
+                *self.incarnations.entry(name.clone()).or_default() += 1;
+                MetaResponse::Deleted
+            } else {
+                MetaResponse::NotFound
+            };
+        }
         meta::apply(&mut self.catalog, command)
     }
 
@@ -105,9 +129,25 @@ impl ReplicatedState for MetaState {
     }
 
     fn snapshot_bytes(&self) -> Result<Vec<u8>, String> {
-        // Until exchanges are used, keep the 0.9.x encoding: a node not yet
-        // upgraded (rolling upgrade, or a rollback) can still install it.
-        if self.exchanges.is_empty() && self.exchanges_epoch == 0 {
+        // Use the oldest encoding that holds the state, so a node not yet
+        // upgraded (rolling upgrade, or a rollback) can still install it:
+        // 0.9.x until exchanges are used, 0.10.0 until a queue is deleted.
+        if self.incarnations.is_empty() && !(self.exchanges.is_empty() && self.exchanges_epoch == 0)
+        {
+            #[derive(Serialize)]
+            struct V2<'a> {
+                catalog: &'a BTreeMap<String, QueueSpec>,
+                exchanges: &'a crate::exchange::Defs,
+                exchanges_epoch: u64,
+            }
+            return crate::serde_bin::to_vec(&V2 {
+                catalog: &self.catalog,
+                exchanges: &self.exchanges,
+                exchanges_epoch: self.exchanges_epoch,
+            })
+            .map_err(|e| e.to_string());
+        }
+        if self.incarnations.is_empty() && self.exchanges.is_empty() && self.exchanges_epoch == 0 {
             #[derive(Serialize)]
             struct Legacy<'a> {
                 catalog: &'a BTreeMap<String, QueueSpec>,
@@ -121,16 +161,26 @@ impl ReplicatedState for MetaState {
     }
 
     fn restore_snapshot(&mut self, bytes: &[u8]) -> Result<(), String> {
+        // Newest encoding first; each older one is a strict prefix-shape, and
+        // decoding is exact (trailing bytes fail), so the first match wins.
         *self = match crate::serde_bin::from_slice(bytes) {
             Ok(state) => state,
-            Err(e) => {
-                let legacy: LegacyMetaState =
-                    crate::serde_bin::from_slice(bytes).map_err(|_| e.to_string())?;
-                MetaState {
-                    catalog: legacy.catalog,
+            Err(e) => match crate::serde_bin::from_slice::<MetaStateV2>(bytes) {
+                Ok(v2) => MetaState {
+                    catalog: v2.catalog,
+                    exchanges: v2.exchanges,
+                    exchanges_epoch: v2.exchanges_epoch,
                     ..Default::default()
+                },
+                Err(_) => {
+                    let legacy: LegacyMetaState =
+                        crate::serde_bin::from_slice(bytes).map_err(|_| e.to_string())?;
+                    MetaState {
+                        catalog: legacy.catalog,
+                        ..Default::default()
+                    }
                 }
-            }
+            },
         };
         Ok(())
     }
@@ -217,6 +267,11 @@ pub trait RaftLogSink: Send + Sync + std::fmt::Debug {
 pub trait RaftPersistFactory: Send + Sync + std::fmt::Debug {
     /// The sink + whatever was recovered for `group`.
     fn open_group(&self, group: &str) -> Result<(Arc<dyn RaftLogSink>, RaftLogRecovery), String>;
+    /// Every group with persisted state.
+    fn groups(&self) -> Result<Vec<String>, String>;
+    /// Durably remove a group's persisted state (log, vote, snapshot
+    /// pointer, and its id). The group must no longer be running.
+    fn purge_group(&self, group: &str) -> Result<(), String>;
 }
 
 /// What a [`RaftLogSink`] recovered from disk at startup.
@@ -446,6 +501,26 @@ impl MetaStore {
     /// A point-in-time copy of the applied queue catalog.
     pub fn catalog(&self) -> BTreeMap<String, QueueSpec> {
         self.with_state(|s| s.catalog.clone())
+    }
+
+    /// A quorum queue's catalog entry and current incarnation, read together
+    /// (one consistent applied state).
+    pub fn queue(&self, name: &str) -> Option<(QueueSpec, u64)> {
+        self.with_state(|s| {
+            s.catalog
+                .get(name)
+                .map(|spec| (spec.clone(), s.incarnations.get(name).copied().unwrap_or(0)))
+        })
+    }
+
+    /// A queue name's current incarnation (0 until it is first deleted).
+    pub fn incarnation(&self, name: &str) -> u64 {
+        self.with_state(|s| s.incarnations.get(name).copied().unwrap_or(0))
+    }
+
+    /// Every name's incarnation (names never deleted are absent).
+    pub fn incarnations(&self) -> BTreeMap<String, u64> {
+        self.with_state(|s| s.incarnations.clone())
     }
 
     /// The applied exchange-definitions epoch.
@@ -900,6 +975,44 @@ mod tests {
         assert_eq!(back.exchanges_epoch, 1);
         assert!(back.exchanges.contains_key("/events"));
         assert_eq!(back.catalog.get("orders"), Some(&spec));
+
+        // Exchanges but no deletes yet: the 0.10.0 encoding (no
+        // incarnations field), still readable by a 0.10.0 node.
+        #[derive(serde::Deserialize)]
+        struct V2 {
+            catalog: BTreeMap<String, QueueSpec>,
+            exchanges: crate::exchange::Defs,
+            exchanges_epoch: u64,
+        }
+        let v2: V2 = crate::serde_bin::from_slice(&bytes).expect("0.10.0 shape");
+        assert_eq!(
+            (v2.catalog.len(), v2.exchanges.len(), v2.exchanges_epoch),
+            (1, 1, 1)
+        );
+
+        // A delete moves the name to its next incarnation; the snapshot
+        // then carries the incarnations and round-trips.
+        assert_eq!(
+            state.apply(&MetaCommand::DeleteQueue {
+                name: "orders".into()
+            }),
+            MetaResponse::Deleted
+        );
+        assert_eq!(state.incarnations.get("orders"), Some(&1));
+        assert_eq!(
+            state.apply(&MetaCommand::DeleteQueue {
+                name: "orders".into()
+            }),
+            MetaResponse::NotFound,
+            "deleting again changes nothing"
+        );
+        assert_eq!(state.incarnations.get("orders"), Some(&1));
+        let bytes = state.snapshot_bytes().unwrap();
+        let mut back = MetaState::default();
+        back.restore_snapshot(&bytes).unwrap();
+        assert_eq!(back.incarnations.get("orders"), Some(&1));
+        assert!(back.catalog.is_empty());
+        assert!(back.exchanges.contains_key("/events"));
     }
 
     /// Reopen the redb store, waiting out the writer thread's lock release

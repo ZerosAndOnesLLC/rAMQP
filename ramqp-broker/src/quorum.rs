@@ -182,6 +182,30 @@ async fn run(
                     mailbox_open = false;
                     continue;
                 };
+                if let QueueMsg::Delete { reply } = msg {
+                    // Let in-flight proposals finish so their producers get
+                    // an answer, then detach every subscriber, stop the
+                    // Raft member (standalone owns it; clustered, the node's
+                    // reconcile does), and answer whatever is still queued.
+                    while let Ok(Some(done)) =
+                        tokio::time::timeout(std::time::Duration::from_secs(2), commits.next()).await
+                    {
+                        if let Committed::Publish { ack, result, .. } = done {
+                            match result {
+                                Ok(_) => confirm_publish(ack),
+                                Err(_) => refuse_publish(&name, ack),
+                            }
+                        }
+                    }
+                    crate::queue::notify_deleted(&subs);
+                    let _ = reply.send(true);
+                    if !exit_on_demotion {
+                        let _ = raft.shutdown().await;
+                    }
+                    crate::queue::drain_after_delete(&name, &mut rx, next_sub_id).await;
+                    tracing::info!(queue = %name, "quorum queue deleted");
+                    return;
+                }
                 handle_msg(
                     msg,
                     &name,
@@ -431,11 +455,8 @@ fn handle_msg(
                 consumers: subs.len(),
             });
         }
-        // Deleting a quorum queue means tearing down its Raft group and
-        // on-disk log on every replica: not supported yet.
-        QueueMsg::Delete { reply } => {
-            let _ = reply.send(false);
-        }
+        // Handled in the run loop (it ends the actor).
+        QueueMsg::Delete { .. } => unreachable!("intercepted by the run loop"),
         QueueMsg::Unsubscribe { sub } => {
             subs.retain(|s| s.id != sub);
             // Everything that subscriber held becomes dispatchable again.

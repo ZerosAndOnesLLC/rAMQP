@@ -602,5 +602,7 @@ Ordered by how much they threaten the plan. Status as of Phases 0–9 complete
   (`ClusterMemberConfig::tls`, issue #37); without it the fabric must still sit
   on a trusted network.
 - ✅ **Management surface** — admin API (declare/delete queues, exchanges,
-  bindings; per-queue stats) landed with issue #37. Still open: deleting
-  **quorum** queues (Raft group + log teardown on every replica).
+  bindings; per-queue stats) landed with issue #37. Quorum-queue deletion
+  followed: per-name incarnations in the metadata group give a re-declared
+  queue a fresh Raft group id (fabric address + storage), and every node
+  tears down / purges superseded groups, including after downtime.

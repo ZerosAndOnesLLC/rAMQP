@@ -575,3 +575,164 @@ async fn per_queue_stats_are_real_on_every_node() {
         sd.shutdown();
     }
 }
+
+/// One HTTP request to a management endpoint (bearer token).
+async fn mgmt_call(addr: &str, method: &str, path: &str, body: &str) -> (u16, String) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    stream
+        .write_all(
+            format!(
+                "{method} {path} HTTP/1.1\r\nhost: x\r\nauthorization: Bearer cluster-test-token-0123\r\ncontent-length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).await.unwrap();
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    let status = text
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    (
+        status,
+        text.split_once("\r\n\r\n")
+            .map(|(_, b)| b.to_owned())
+            .unwrap_or_default(),
+    )
+}
+
+/// Deleting a clustered quorum queue: committed once, torn down on every
+/// node — consumers and producers on OTHER nodes are detached — and a
+/// re-declare of the same name is a fresh, empty queue everywhere.
+#[tokio::test(flavor = "multi_thread")]
+async fn deleting_a_clustered_quorum_queue() {
+    let mgmt_by_node = std::sync::Mutex::new(std::collections::BTreeMap::new());
+    let nodes = start_cluster_with(3, |id, config| {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        config.management_listen = Some(addr.clone());
+        config.management_token = Some(ramqp_broker::SecretString::new("cluster-test-token-0123"));
+        mgmt_by_node.lock().unwrap().insert(id, addr);
+    })
+    .await;
+    let mgmt: Vec<String> = mgmt_by_node.into_inner().unwrap().into_values().collect();
+
+    // Producer on node 0, consumer on node 1.
+    let pconn = ConnectionBuilder::new(format!("amqp://{}", nodes[0].amqp_addr))
+        .connect()
+        .await
+        .unwrap();
+    let ps = pconn.begin_session().await.unwrap();
+    let producer = ps.create_producer("/quorum/doomed").await.unwrap();
+    for i in 0..3 {
+        producer
+            .send(Message::text(format!("old{i}")))
+            .await
+            .unwrap();
+    }
+    let cconn = ConnectionBuilder::new(format!("amqp://{}", nodes[1].amqp_addr))
+        .connect()
+        .await
+        .unwrap();
+    let cs = cconn.begin_session().await.unwrap();
+    let mut consumer = cs.create_consumer("/quorum/doomed").await.unwrap();
+    let first = tokio::time::timeout(Duration::from_secs(10), consumer.recv())
+        .await
+        .expect("delivery in time")
+        .unwrap();
+    consumer.accept(&first).await.unwrap();
+
+    // Delete through node 2.
+    let (s, body) = mgmt_call(&mgmt[2], "DELETE", "/queues/%2F/doomed?kind=quorum", "").await;
+    assert_eq!(s, 204, "{body}");
+
+    // The consumer on node 1 is detached (after any copies already in flight).
+    let detached = loop {
+        match tokio::time::timeout(Duration::from_secs(10), consumer.recv()).await {
+            Ok(Ok(d)) => consumer.release(&d).await.unwrap_or(()),
+            other => break other,
+        }
+    };
+    assert!(
+        matches!(detached, Ok(Err(_))),
+        "consumer detached: {detached:?}"
+    );
+    // The producer on node 0 can no longer publish into the old queue.
+    let late = tokio::time::timeout(
+        Duration::from_secs(10),
+        producer.send(Message::text("late")),
+    )
+    .await
+    .expect("answered in time");
+    assert!(
+        !matches!(late, Ok(DeliveryState::Accepted(_))),
+        "publish into a deleted queue is not accepted: {late:?}"
+    );
+    // Gone on every node.
+    for m in &mgmt {
+        let mut status = 0;
+        for _ in 0..50 {
+            status = mgmt_call(m, "GET", "/queues/%2F/doomed?kind=quorum", "")
+                .await
+                .0;
+            if status == 404 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(status, 404, "deleted queue still visible at {m}");
+    }
+
+    // Re-declared (through node 1): a fresh, empty queue everywhere.
+    let (s, body) = mgmt_call(
+        &mgmt[1],
+        "PUT",
+        "/queues/%2F/doomed",
+        r#"{"kind":"quorum"}"#,
+    )
+    .await;
+    assert_eq!(s, 201, "{body}");
+    for m in &mgmt {
+        let mut last = String::new();
+        let mut ok = false;
+        for _ in 0..50 {
+            let (s, body) = mgmt_call(m, "GET", "/queues/%2F/doomed?kind=quorum", "").await;
+            last = body.clone();
+            if s == 200 && body.contains("\"ready\":0") {
+                ok = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(
+            ok,
+            "re-declared queue not empty / not served at {m}: {last}"
+        );
+    }
+    let conn = ConnectionBuilder::new(format!("amqp://{}", nodes[2].amqp_addr))
+        .connect()
+        .await
+        .unwrap();
+    let s2 = conn.begin_session().await.unwrap();
+    s2.create_producer("/quorum/doomed")
+        .await
+        .unwrap()
+        .send(Message::text("new"))
+        .await
+        .unwrap();
+    let mut c2 = s2.create_consumer("/quorum/doomed").await.unwrap();
+    let d = tokio::time::timeout(Duration::from_secs(10), c2.recv())
+        .await
+        .expect("in time")
+        .unwrap();
+    assert_eq!(text_of(&d), "new", "only the new incarnation's message");
+    c2.accept(&d).await.unwrap();
+    for n in &nodes {
+        n.shutdown.shutdown();
+    }
+}

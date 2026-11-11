@@ -406,10 +406,11 @@ async fn admin_api_basic_auth_and_read_auth() {
     shutdown.shutdown();
 }
 
-/// Quorum queue deletion is refused explicitly (501) rather than half-done.
+/// Deleting a standalone quorum queue: its consumer is detached, the queue
+/// is gone, and a re-declare starts empty.
 #[tokio::test]
-async fn deleting_a_quorum_queue_is_not_implemented() {
-    let (_addr, mgmt, shutdown) = start_admin(None, false).await;
+async fn deleting_a_quorum_queue() {
+    let (addr, mgmt, shutdown) = start_admin(None, false).await;
     let (s, _) = http(
         &mgmt,
         "PUT",
@@ -419,10 +420,157 @@ async fn deleting_a_quorum_queue_is_not_implemented() {
     )
     .await;
     assert_eq!(s, 201);
-    let (s, _) = http(&mgmt, "DELETE", "/queues/%2F/qq", Some(BEARER), None).await;
-    assert_eq!(s, 501);
-    let (s, body) = http(&mgmt, "GET", "/queues/%2F/qq?kind=quorum", None, None).await;
-    assert_eq!(s, 200, "{body}");
+    let conn = ConnectionBuilder::new(format!("amqp://{addr}"))
+        .connect()
+        .await
+        .expect("connect");
+    let session = conn.begin_session().await.expect("session");
+    let p = session.create_producer("/quorum/qq").await.expect("p");
+    for i in 0..3 {
+        p.send(Message::text(format!("m{i}"))).await.expect("send");
+    }
+    let mut consumer = session.create_consumer("/quorum/qq").await.expect("c");
+    for _ in 0..3 {
+        let d = consumer.recv().await.expect("delivery");
+        consumer.accept(&d).await.expect("accept");
+    }
+    p.send(Message::text("left-behind")).await.expect("send");
+    // Drain the in-flight copy so only the detach remains.
+    let d = consumer.recv().await.expect("delivery");
+    consumer.release(&d).await.expect("release");
+
+    let (s, body) = http(
+        &mgmt,
+        "DELETE",
+        "/queues/%2F/qq?kind=quorum",
+        Some(BEARER),
+        None,
+    )
+    .await;
+    assert_eq!(s, 204, "{body}");
+    let gone = loop {
+        match tokio::time::timeout(std::time::Duration::from_secs(5), consumer.recv()).await {
+            Ok(Ok(d)) => consumer.release(&d).await.expect("release"),
+            other => break other,
+        }
+    };
+    assert!(
+        matches!(gone, Ok(Err(_))),
+        "the consumer of a deleted quorum queue is detached: {gone:?}"
+    );
+    let (s, _) = http(&mgmt, "GET", "/queues/%2F/qq?kind=quorum", None, None).await;
+    assert_eq!(s, 404);
+    let (s, _) = http(
+        &mgmt,
+        "DELETE",
+        "/queues/%2F/qq?kind=quorum",
+        Some(BEARER),
+        None,
+    )
+    .await;
+    assert_eq!(s, 404);
+    // Re-declared: empty.
+    let (s, _) = http(
+        &mgmt,
+        "PUT",
+        "/queues/%2F/qq",
+        Some(BEARER),
+        Some(r#"{"kind":"quorum"}"#),
+    )
+    .await;
+    assert_eq!(s, 201);
+    let (_, body) = http(&mgmt, "GET", "/queues/%2F/qq?kind=quorum", None, None).await;
+    assert!(body.contains("\"ready\":0"), "{body}");
+    conn.close().await.expect("close");
+    shutdown.shutdown();
+}
+
+/// On disk: the deleted queue's messages never come back — not on
+/// re-declare, not after a restart — and its stored group is purged.
+#[cfg(feature = "store-redb")]
+#[tokio::test]
+async fn deleting_a_durable_quorum_queue_survives_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let start = |dir: std::path::PathBuf| async move {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mgmt = l.local_addr().unwrap();
+        drop(l);
+        let mut config = BrokerConfig::default();
+        config.data_dir = Some(dir);
+        config.management_listen = Some(mgmt.to_string());
+        config.management_token = Some(ramqp_broker::SecretString::new(TOKEN));
+        let mut bound = None;
+        for _ in 0..50 {
+            match Broker::new(config.clone()).bind("127.0.0.1:0").await {
+                Ok(b) => {
+                    bound = Some(b);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
+            }
+        }
+        let bound = bound.expect("bind (the previous store lock frees asynchronously)");
+        let addr = bound.local_addr();
+        let shutdown = bound.shutdown_handle();
+        tokio::spawn(bound.run());
+        (addr, mgmt, shutdown)
+    };
+    let (addr, mgmt, shutdown) = start(dir.path().to_path_buf()).await;
+    let conn = ConnectionBuilder::new(format!("amqp://{addr}"))
+        .connect()
+        .await
+        .expect("connect");
+    let session = conn.begin_session().await.expect("session");
+    let p = session.create_producer("/quorum/kept").await.expect("p");
+    for i in 0..5 {
+        p.send(Message::text(format!("old{i}")))
+            .await
+            .expect("send");
+    }
+    conn.close().await.expect("close");
+    let spill_dirs = || {
+        std::fs::read_dir(dir.path().join("spill"))
+            .map(|d| d.count())
+            .unwrap_or(0)
+    };
+    assert_eq!(spill_dirs(), 1, "the queue's group has its files");
+    let (s, body) = http(
+        &mgmt,
+        "DELETE",
+        "/queues/%2F/kept?kind=quorum",
+        Some(BEARER),
+        None,
+    )
+    .await;
+    assert_eq!(s, 204, "{body}");
+    assert_eq!(spill_dirs(), 0, "the deleted group's files are purged");
+    shutdown.shutdown();
+
+    // Restart: the deleted messages do not resurrect.
+    let (addr, mgmt, shutdown) = start(dir.path().to_path_buf()).await;
+    let mut ready = None;
+    for _ in 0..50 {
+        let conn = ConnectionBuilder::new(format!("amqp://{addr}"))
+            .connect()
+            .await
+            .expect("connect");
+        let session = conn.begin_session().await.expect("session");
+        let p = session.create_producer("/quorum/kept").await;
+        conn.close().await.ok();
+        if p.is_ok() {
+            let (s, body) = http(&mgmt, "GET", "/queues/%2F/kept?kind=quorum", None, None).await;
+            if s == 200 {
+                ready = Some(body);
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let body = ready.expect("re-declared after restart");
+    assert!(
+        body.contains("\"ready\":0"),
+        "deleted messages stay deleted: {body}"
+    );
     shutdown.shutdown();
 }
 

@@ -120,18 +120,43 @@ impl Broker {
             // metadata group: re-sync whenever it applies something.
             let mut changes = node.meta_changes();
             let weak = Arc::downgrade(&self.registry);
+            let node_for_watch = node.clone();
             tokio::spawn(async move {
+                // Quorum-queue deletes: re-run the teardown when the
+                // incarnations change, and periodically (a purge that failed
+                // — e.g. a busy disk — is retried; a node that was down
+                // catches up here).
+                let mut seen_incarnations = None;
+                let mut retry = tokio::time::interval(std::time::Duration::from_secs(60));
                 loop {
-                    match weak.upgrade() {
-                        Some(registry) => registry.sync_exchanges(),
-                        None => return,
-                    }
-                    if changes.changed().await.is_err() {
+                    let Some(registry) = weak.upgrade() else {
                         return;
+                    };
+                    registry.sync_exchanges();
+                    let incarnations = node_for_watch.incarnations();
+                    if seen_incarnations.as_ref() != Some(&incarnations) {
+                        registry.reconcile_quorum().await;
+                        node_for_watch.reconcile().await;
+                        seen_incarnations = Some(incarnations);
+                    }
+                    drop(registry);
+                    tokio::select! {
+                        changed = changes.changed() => {
+                            if changed.is_err() {
+                                return;
+                            }
+                        }
+                        _ = retry.tick() => {
+                            seen_incarnations = None;
+                        }
                     }
                 }
             });
-        } else if !self.registry.ensure_exchanges_loaded().await {
+        } else {
+            // Standalone: finish any quorum-queue delete a crash interrupted.
+            self.registry.gc_quorum_groups().await;
+        }
+        if self.registry.cluster().is_none() && !self.registry.ensure_exchanges_loaded().await {
             // Standalone with a store that is not openable yet (e.g. the
             // previous instance's lock lingers): exchange attaches/changes
             // are refused, and the load retried on each, until it is.
