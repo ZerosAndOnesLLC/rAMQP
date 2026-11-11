@@ -388,6 +388,10 @@ in the metadata group.
   an address convention (RabbitMQ-4.x-style `/queues/<name>`, `/exchanges/...`, or
   a simpler flat namespace) — decide early; document it. Encodes queue type
   (quorum|transient) at declaration.
+  **Decided (issue #37):** RabbitMQ-4.x v2 addressing — `/queues/<name>`
+  (plus `/quorum/` and `/durable/` for the replicated / on-disk kinds) and
+  `/exchanges/<name>[/<routing-key>]` for pub/sub, so 1.0 clients written
+  against RabbitMQ 4.x move unchanged.
 - **Queues / topics.** Ordered queues; optional pub/sub (topic) fan-out. Queue
   storage is contiguous/index-addressed for cache-friendliness (§3.2).
 - **Message store.** For **quorum** queues: the Raft state machine + snapshots

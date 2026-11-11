@@ -425,3 +425,75 @@ async fn follower_loss_is_transparent() {
         n.shutdown.shutdown();
     }
 }
+
+/// Issue #37 §1: exchange topology is replicated through the metadata
+/// group — declared and bound on one node, it routes on every node.
+#[tokio::test(flavor = "multi_thread")]
+async fn exchanges_route_cluster_wide() {
+    let nodes = start_cluster(3).await;
+    nodes[0]
+        .broker
+        .declare_exchange("", "events", ramqp_broker::ExchangeKind::Topic, None)
+        .await
+        .expect("declare");
+    nodes[0]
+        .broker
+        .bind_queue("", "events", "/quorum/ev-orders", "order.#")
+        .await
+        .expect("bind");
+    // Idempotent from any node: node 1 sees the replicated definitions.
+    assert_eq!(
+        nodes[1]
+            .broker
+            .declare_exchange("", "events", ramqp_broker::ExchangeKind::Topic, None)
+            .await,
+        Ok(false)
+    );
+
+    // Publish through node 2 (its view syncs from the metadata group).
+    let conn = ConnectionBuilder::new(format!("amqp://{}", nodes[2].amqp_addr))
+        .connect()
+        .await
+        .expect("connect");
+    let session = conn.begin_session().await.expect("session");
+    let producer = loop {
+        // Node 2 applies the metadata commit asynchronously: retry the
+        // attach briefly until the exchange is visible there.
+        if let Ok(p) = session
+            .create_producer("/exchanges/events/order.created")
+            .await
+            && let Ok(DeliveryState::Accepted(_)) = p.send(Message::text("probe")).await
+        {
+            break p;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    producer.send(Message::text("routed")).await.expect("send");
+    conn.close().await.expect("close");
+
+    // Consume through node 1.
+    let conn = ConnectionBuilder::new(format!("amqp://{}", nodes[1].amqp_addr))
+        .connect()
+        .await
+        .expect("connect");
+    let session = conn.begin_session().await.expect("session");
+    let mut consumer = session
+        .create_consumer("/quorum/ev-orders")
+        .await
+        .expect("consumer");
+    let mut got = Vec::new();
+    while got.len() < 2 {
+        let d = tokio::time::timeout(Duration::from_secs(10), consumer.recv())
+            .await
+            .expect("delivery in time")
+            .expect("delivery");
+        got.push(text_of(&d));
+        consumer.accept(&d).await.expect("accept");
+    }
+    assert_eq!(got.last().map(String::as_str), Some("routed"));
+    assert!(got.iter().all(|t| t == "probe" || t == "routed"));
+    conn.close().await.expect("close");
+    for n in &nodes {
+        n.shutdown.shutdown();
+    }
+}

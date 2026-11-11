@@ -684,6 +684,40 @@ impl ClusterNode {
         }
     }
 
+    /// Commit a topology change through the metadata group. Returns
+    /// whether it changed anything and the resulting definitions epoch.
+    pub(crate) async fn exchange_op(
+        &self,
+        op: crate::exchange::ExchangeOp,
+    ) -> Result<(bool, u64), crate::exchange::ExchangeError> {
+        use crate::exchange::ExchangeError;
+        match self.meta_write(MetaCommand::Exchange(op)).await {
+            Ok(MetaResponse::Exchange(result)) => result,
+            Ok(other) => Err(ExchangeError::Unavailable(format!(
+                "unexpected metadata response {other:?}"
+            ))),
+            Err(e) => Err(ExchangeError::Unavailable(e)),
+        }
+    }
+
+    /// This node's applied exchange definitions and their epoch.
+    pub(crate) fn exchange_state(&self) -> (u64, crate::exchange::Defs) {
+        self.meta_store.exchanges()
+    }
+
+    /// This node's applied exchange-definitions epoch.
+    pub(crate) fn exchanges_epoch(&self) -> u64 {
+        self.meta_store.exchanges_epoch()
+    }
+
+    /// Fires whenever the metadata group's state advances (applies, leader
+    /// changes) — the trigger for re-syncing derived local views.
+    pub(crate) fn meta_changes(
+        &self,
+    ) -> tokio::sync::watch::Receiver<openraft::RaftMetrics<NodeId, BasicNode>> {
+        self.meta.metrics()
+    }
+
     /// Commit a catalog write, forwarding to the metadata leader if needed.
     pub async fn meta_write(&self, cmd: MetaCommand) -> Result<MetaResponse, String> {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);

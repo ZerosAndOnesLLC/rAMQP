@@ -14,6 +14,7 @@ use crate::auth::{AllowAll, Authenticator};
 use crate::cluster::node::{ClusterNode, NodeSettings};
 use crate::config::BrokerConfig;
 use crate::connection;
+use crate::exchange::{ExchangeError, ExchangeKind, ExchangeOp};
 use crate::mgmt::{self, BrokerCounters};
 use crate::policy::{self, DeadLetterSender};
 use crate::registry::QueueRegistry;
@@ -92,7 +93,29 @@ impl Broker {
                 persist,
             })
             .await?;
-            self.registry.set_cluster(node);
+            self.registry.set_cluster(node.clone());
+            // Keep this node's exchange routing view in step with the
+            // metadata group: re-sync whenever it applies something.
+            let mut changes = node.meta_changes();
+            let weak = Arc::downgrade(&self.registry);
+            tokio::spawn(async move {
+                loop {
+                    match weak.upgrade() {
+                        Some(registry) => registry.sync_exchanges(),
+                        None => return,
+                    }
+                    if changes.changed().await.is_err() {
+                        return;
+                    }
+                }
+            });
+        } else if !self.registry.ensure_exchanges_loaded().await {
+            // Standalone with a store that is not openable yet (e.g. the
+            // previous instance's lock lingers): exchange attaches/changes
+            // are refused, and the load retried on each, until it is.
+            tracing::warn!(
+                "exchange definitions not loaded yet; exchange use refused until they are"
+            );
         }
         // The management endpoint (metrics + queue inspection), if enabled.
         if let Some(mgmt_addr) = &self.config.management_listen {
@@ -158,6 +181,76 @@ impl Broker {
             .await
             .map(|_| ())
             .ok_or_else(|| format!("could not declare {address:?} in vhost {vhost:?}"))
+    }
+
+    /// Declare an exchange in `vhost`. Idempotent: redeclaring with the
+    /// same kind and alternate succeeds (`Ok(false)`); different arguments
+    /// are a [`ExchangeError::Conflict`]. `alternate` is a queue address for
+    /// unroutable messages. Persisted (store / metadata group) when the
+    /// broker has one.
+    pub async fn declare_exchange(
+        &self,
+        vhost: &str,
+        name: &str,
+        kind: ExchangeKind,
+        alternate: Option<&str>,
+    ) -> Result<bool, ExchangeError> {
+        self.registry
+            .exchange_op(ExchangeOp::Declare {
+                vhost: vhost.to_owned(),
+                name: name.to_owned(),
+                kind,
+                alternate: alternate.map(str::to_owned),
+            })
+            .await
+    }
+
+    /// Delete an exchange and its bindings ([`ExchangeError::NotFound`] if
+    /// absent). Producers attached to it see their messages as unroutable.
+    pub async fn delete_exchange(&self, vhost: &str, name: &str) -> Result<bool, ExchangeError> {
+        self.registry
+            .exchange_op(ExchangeOp::Delete {
+                vhost: vhost.to_owned(),
+                name: name.to_owned(),
+            })
+            .await
+    }
+
+    /// Bind `destination` (a queue address in the same vhost) to an
+    /// exchange with `key`. Idempotent (`Ok(false)` if already bound).
+    pub async fn bind_queue(
+        &self,
+        vhost: &str,
+        exchange: &str,
+        destination: &str,
+        key: &str,
+    ) -> Result<bool, ExchangeError> {
+        self.registry
+            .exchange_op(ExchangeOp::Bind {
+                vhost: vhost.to_owned(),
+                exchange: exchange.to_owned(),
+                destination: destination.to_owned(),
+                key: key.to_owned(),
+            })
+            .await
+    }
+
+    /// Remove a binding ([`ExchangeError::NotFound`] if absent).
+    pub async fn unbind_queue(
+        &self,
+        vhost: &str,
+        exchange: &str,
+        destination: &str,
+        key: &str,
+    ) -> Result<bool, ExchangeError> {
+        self.registry
+            .exchange_op(ExchangeOp::Unbind {
+                vhost: vhost.to_owned(),
+                exchange: exchange.to_owned(),
+                destination: destination.to_owned(),
+                key: key.to_owned(),
+            })
+            .await
     }
 
     /// Serve a single already-established byte stream (in-process transports,

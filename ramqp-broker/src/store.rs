@@ -36,6 +36,9 @@ const RAFT_LOG: TableDefinition<(u64, u64), &[u8]> = TableDefinition::new("raft_
 /// inline, atomic with the pointer — or `"snap_path"` — a file path for
 /// large paged-queue blobs).
 const RAFT_META: TableDefinition<(u64, &str), &[u8]> = TableDefinition::new("raft_meta");
+/// Standalone topology definitions: key (`"exchanges"`) → JSON blob. A
+/// clustered node keeps these in the metadata Raft group instead.
+const DEFINITIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("definitions");
 
 /// How many operations one commit may absorb.
 const COMMIT_BATCH_MAX: usize = 1024;
@@ -131,6 +134,7 @@ impl Store {
             txn.open_table(RAFT_GROUPS).map_err(|e| e.to_string())?;
             txn.open_table(RAFT_LOG).map_err(|e| e.to_string())?;
             txn.open_table(RAFT_META).map_err(|e| e.to_string())?;
+            txn.open_table(DEFINITIONS).map_err(|e| e.to_string())?;
             txn.commit().map_err(|e| e.to_string())?;
         }
         let (writer, rx) = mpsc::channel(4096);
@@ -184,6 +188,28 @@ impl Store {
         };
         txn.commit().map_err(|e| e.to_string())?;
         Ok(id)
+    }
+
+    /// Read a definitions blob (`None` when never written).
+    pub fn definitions(&self, key: &str) -> Result<Option<Vec<u8>>, String> {
+        let txn = self.db.begin_read().map_err(|e| e.to_string())?;
+        let table = txn.open_table(DEFINITIONS).map_err(|e| e.to_string())?;
+        Ok(table
+            .get(key)
+            .map_err(|e| e.to_string())?
+            .map(|v| v.value().to_vec()))
+    }
+
+    /// Durably replace a definitions blob (its own fsynced write
+    /// transaction — topology changes are rare and must not wait behind the
+    /// message group-commit). Blocking: call from `spawn_blocking`.
+    pub fn put_definitions(&self, key: &str, blob: &[u8]) -> Result<(), String> {
+        let txn = self.db.begin_write().map_err(|e| e.to_string())?;
+        {
+            let mut table = txn.open_table(DEFINITIONS).map_err(|e| e.to_string())?;
+            table.insert(key, blob).map_err(|e| e.to_string())?;
+        }
+        txn.commit().map_err(|e| e.to_string())
     }
 
     /// Recovery scan: every stored `(msg_id, failures, enqueued_ms,

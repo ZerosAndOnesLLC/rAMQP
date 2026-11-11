@@ -52,6 +52,7 @@ mod connection;
 mod dispatch;
 #[cfg(feature = "store-redb")]
 mod durable;
+pub mod exchange;
 pub mod file_config;
 mod mgmt;
 mod policy;
@@ -70,3 +71,4 @@ pub use auth::{
 };
 pub use broker::{BoundBroker, Broker, ShutdownHandle};
 pub use config::{BrokerConfig, ClusterMemberConfig, OverflowBehavior, QueuePolicy};
+pub use exchange::{ExchangeError, ExchangeKind};

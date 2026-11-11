@@ -258,27 +258,60 @@ async fn main() -> std::io::Result<()> {
         tracing::info!(node_id = ?args.node_id, "cluster member starting");
     }
 
-    // Startup topology: declared in the background (a clustered quorum
-    // declare waits for the cluster to form), retried until it lands.
-    if !file.queues.is_empty() {
+    // Startup topology: exchanges, then queues, then bindings — declared in
+    // the background (a clustered declare waits for the cluster to form),
+    // each retried until it lands. All idempotent across restarts.
+    if !(file.queues.is_empty() && file.exchanges.is_empty() && file.bindings.is_empty()) {
         let broker = bound.broker().clone();
-        let queues = file.queues.clone();
+        let file = file.clone();
         tokio::spawn(async move {
-            for q in queues {
+            async fn retry<F, Fut, E>(what: String, mut op: F)
+            where
+                F: FnMut() -> Fut,
+                Fut: std::future::Future<Output = Result<(), E>>,
+                E: std::fmt::Display,
+            {
                 let mut delay = std::time::Duration::from_millis(200);
                 loop {
-                    match broker.declare_queue(&q.vhost, &q.address).await {
+                    match op().await {
                         Ok(()) => {
-                            tracing::info!(vhost = %q.vhost, address = %q.address, "queue declared");
-                            break;
+                            tracing::info!(%what, "declared");
+                            return;
                         }
                         Err(e) => {
-                            tracing::warn!(address = %q.address, error = %e, "queue declare failed; retrying");
+                            tracing::warn!(%what, error = %e, "declare failed; retrying");
                             tokio::time::sleep(delay).await;
                             delay = (delay * 2).min(std::time::Duration::from_secs(10));
                         }
                     }
                 }
+            }
+            for e in &file.exchanges {
+                retry(format!("exchange {}", e.name), || async {
+                    broker
+                        .declare_exchange(&e.vhost, &e.name, e.kind(), e.alternate.as_deref())
+                        .await
+                        .map(|_| ())
+                })
+                .await;
+            }
+            for q in &file.queues {
+                retry(format!("queue {}", q.address), || {
+                    broker.declare_queue(&q.vhost, &q.address)
+                })
+                .await;
+            }
+            for b in &file.bindings {
+                retry(
+                    format!("binding {} -> {} ({:?})", b.exchange, b.queue, b.key),
+                    || async {
+                        broker
+                            .bind_queue(&b.vhost, &b.exchange, &b.queue, &b.key)
+                            .await
+                            .map(|_| ())
+                    },
+                )
+                .await;
             }
         });
     }

@@ -33,6 +33,15 @@ protocol engine as the [`ramqp`](https://crates.io/crates/ramqp) client.
 - **Durable queues** — `/durable/<name>` (build with `--features store-redb`,
   run with `--data-dir <path>`): on-disk via redb, group-commit fsync (the
   accepted disposition is the durability confirm), full restart recovery.
+- **Exchanges** — RabbitMQ 4.x addressing, so AMQP 1.0 clients move
+  unchanged: publish to `/exchanges/<name>/<routing-key>` (or
+  `/exchanges/<name>` with the key in `properties.subject`). **fanout**,
+  **direct**, and **topic** (`*` / `#`) kinds; `amq.direct`, `amq.fanout`,
+  `amq.topic` exist in every vhost. A publish is confirmed once **every**
+  destination queue has confirmed it (rejected if any refuses); unroutable
+  messages are accepted and dropped, or go to the exchange's `alternate`
+  queue. Definitions persist (redb standalone, the metadata Raft group when
+  clustered) and binding changes apply to already-attached producers.
 - **Clustering with leader routing** — a metadata Raft group (replicated
   queue catalog + rendezvous placement) and an **inter-node fabric**: one
   multiplexed TCP connection per peer pair carrying every group's Raft
@@ -126,6 +135,16 @@ max_delivery_attempts = 5
 
 [[queues]]                      # declared at startup, idempotent
 address = "/quorum/orders.created"
+
+[[exchanges]]
+name = "events"
+type = "topic"                  # fanout | direct | topic
+alternate = "/queues/unroutable"   # optional: unroutable messages go here
+
+[[bindings]]
+exchange = "events"
+queue = "/quorum/orders.created"
+key = "order.#"
 ```
 
 Secrets stay out of the file: point `verifier_file` / `password_file` at a

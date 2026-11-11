@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Exchange routing** (issue #37 §1) with RabbitMQ 4.x AMQP 1.0 addressing:
+  producers publish to `/exchanges/<name>/<routing-key>` or `/exchanges/<name>`
+  (routing key from `properties.subject`). Kinds: fanout, direct, topic
+  (`*`/`#`); `amq.direct`/`amq.fanout`/`amq.topic` built in per vhost.
+  Bindings route to transient, quorum, or durable queues; a queue matched by
+  several bindings gets one copy. Unroutable messages are accepted and
+  dropped, or routed to an optional `alternate` queue. Unsettled publishes
+  are confirmed after every destination confirms (rejected if any refuses).
+  Transactional publishes stage one enqueue per destination. Definitions
+  persist in redb (standalone) or the metadata Raft group (clustered, synced
+  to every node's routing view), and changes apply to attached producers.
+  `Broker::declare_exchange` / `delete_exchange` / `bind_queue` /
+  `unbind_queue`; `[[exchanges]]` and `[[bindings]]` config-file sections.
 - **`ramqp-brokerd` config file** (`--config` / `RAMQP_CONFIG`, TOML; issue
   #37 §2): listeners, data dir, management listener, limits, cluster
   membership, **users** (RFC 5803 SCRAM verifiers from a file or inline, or
@@ -28,6 +41,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Broker::declare_queue` and `BoundBroker::broker`.
 
 ### Changed
+- The metadata group's state gains exchange definitions; snapshots written
+  by 0.9.x still restore. **Upgrade every cluster node before declaring
+  exchanges** — an older node cannot apply the new metadata command.
 - **Breaking (daemon):** `ramqp-brokerd` refuses to start on a non-loopback
   listener with no users configured unless `--allow-anonymous`
   (`RAMQP_ALLOW_ANONYMOUS=1`, `allow_anonymous = true`) is given. It used to

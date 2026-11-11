@@ -48,6 +48,10 @@ pub enum MetaCommand {
         /// The queue name.
         name: String,
     },
+    /// A topology change (exchange declare/delete, bind/unbind). Appended
+    /// last so the existing variants keep their wire tags. Every node must
+    /// run a version that knows this variant before exchanges are used.
+    Exchange(crate::exchange::ExchangeOp),
 }
 
 /// The applied result of a [`MetaCommand`].
@@ -63,6 +67,9 @@ pub enum MetaResponse {
     Deleted,
     /// No queue with that name exists (delete was a no-op).
     NotFound,
+    /// The outcome of [`MetaCommand::Exchange`]: whether it changed the
+    /// definitions, and the definitions epoch after applying it.
+    Exchange(Result<(bool, u64), crate::exchange::ExchangeError>),
 }
 
 /// Why a forwarded catalog write failed (rides the fabric as a typed error).
@@ -104,5 +111,7 @@ pub(crate) fn apply(
                 MetaResponse::NotFound
             }
         }
+        // Applied by `MetaState::apply`, which owns the exchange state.
+        MetaCommand::Exchange(_) => MetaResponse::NotFound,
     }
 }

@@ -21,10 +21,15 @@ use crate::cluster::network::UnreachableNetwork;
 use crate::cluster::node::ClusterNode;
 use crate::cluster::queue_group::QueueRaft;
 use crate::config::{BrokerConfig, QueuePolicy};
+use crate::exchange::{ExchangeError, ExchangeOp, ExchangeRegistry};
 use crate::policy::{DeadLetterSender, EffectivePolicy};
 use crate::proxy;
 use crate::queue::{self, QueueHandle};
 use crate::quorum;
+
+/// The store key for standalone exchange definitions.
+#[cfg(feature = "store-redb")]
+const EXCHANGES_KEY: &str = "exchanges";
 
 /// How a resolved address wants its queue backed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,6 +91,16 @@ pub(crate) struct QueueRegistry {
     policies: Vec<(String, QueuePolicy)>,
     /// The dead-letter router, wired in right after construction.
     dlx: OnceLock<DeadLetterSender>,
+    /// Exchange definitions (the routing view).
+    exchanges: ExchangeRegistry,
+    /// Serializes standalone topology changes (read-modify-persist-swap).
+    exchange_write: tokio::sync::Mutex<()>,
+    /// Whether the routing view reflects the persisted definitions. False
+    /// only for a standalone broker with a store that has not been read yet
+    /// (e.g. the previous instance still held its lock at bind); until then
+    /// exchange attaches and changes are refused rather than served from an
+    /// empty view.
+    exchanges_loaded: std::sync::atomic::AtomicBool,
 }
 
 impl QueueRegistry {
@@ -104,7 +119,134 @@ impl QueueRegistry {
             resident_bytes_max: config.resident_bytes_max,
             policies: config.policies.clone(),
             dlx: OnceLock::new(),
+            exchanges: ExchangeRegistry::default(),
+            exchange_write: tokio::sync::Mutex::new(()),
+            exchanges_loaded: std::sync::atomic::AtomicBool::new(
+                !cfg!(feature = "store-redb") || config.data_dir.is_none(),
+            ),
         }
+    }
+
+    /// The exchange routing view.
+    pub fn exchanges(&self) -> &ExchangeRegistry {
+        &self.exchanges
+    }
+
+    /// Apply a topology change: through the metadata group when clustered,
+    /// else locally (persisted to the store when one is configured). Returns
+    /// whether it changed anything; on return this node's routing view
+    /// reflects it.
+    pub async fn exchange_op(&self, op: ExchangeOp) -> Result<bool, ExchangeError> {
+        crate::exchange::validate(&op)?;
+        if let Some(node) = self.cluster.get() {
+            let (changed, epoch) = node.exchange_op(op).await?;
+            // The commit may not have applied on this node yet: wait for it
+            // so the caller's next attach sees the change.
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            while node.exchanges_epoch() < epoch && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            self.sync_exchanges();
+            return Ok(changed);
+        }
+        let _serial = self.exchange_write.lock().await;
+        if !self.load_exchanges_locked().await {
+            return Err(ExchangeError::Unavailable(
+                "persisted exchange definitions not loaded yet (store unavailable); retry"
+                    .to_owned(),
+            ));
+        }
+        let mut next = (*self.exchanges.snapshot()).clone();
+        let changed = crate::exchange::apply_op(&mut next, &op)?;
+        if changed {
+            self.persist_exchanges(&next).await?;
+            self.exchanges.replace(next);
+        }
+        Ok(changed)
+    }
+
+    /// Whether the routing view is authoritative, loading the persisted
+    /// definitions first if that has not happened yet (standalone with a
+    /// store). `false` = not loadable right now; the caller refuses.
+    pub async fn ensure_exchanges_loaded(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        if self.exchanges_loaded.load(Ordering::Acquire) || self.cluster.get().is_some() {
+            return true;
+        }
+        let _serial = self.exchange_write.lock().await;
+        self.load_exchanges_locked().await
+    }
+
+    /// [`Self::ensure_exchanges_loaded`] with `exchange_write` held.
+    async fn load_exchanges_locked(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        if self.exchanges_loaded.load(Ordering::Acquire) || self.cluster.get().is_some() {
+            return true;
+        }
+        match self.read_persisted_exchanges().await {
+            Ok(defs) => {
+                if let Some(defs) = defs {
+                    self.exchanges.replace(defs);
+                }
+                self.exchanges_loaded.store(true, Ordering::Release);
+                true
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "exchange definitions not loadable yet");
+                false
+            }
+        }
+    }
+
+    /// Clustered: refresh the routing view from the applied metadata state.
+    pub fn sync_exchanges(&self) {
+        if let Some(node) = self.cluster.get() {
+            let epoch = node.exchanges_epoch();
+            self.exchanges
+                .replace_if_newer(epoch, || node.exchange_state().1);
+        }
+    }
+
+    /// Standalone: persist the definitions (no-op without a store).
+    #[cfg(feature = "store-redb")]
+    async fn persist_exchanges(&self, defs: &crate::exchange::Defs) -> Result<(), ExchangeError> {
+        if self.data_dir.is_none() {
+            return Ok(());
+        }
+        let store = self
+            .store()
+            .await
+            .ok_or_else(|| ExchangeError::Unavailable("durable store not openable".to_owned()))?;
+        let blob =
+            serde_json::to_vec(defs).map_err(|e| ExchangeError::Unavailable(e.to_string()))?;
+        tokio::task::spawn_blocking(move || store.put_definitions(EXCHANGES_KEY, &blob))
+            .await
+            .map_err(|e| ExchangeError::Unavailable(e.to_string()))?
+            .map_err(ExchangeError::Unavailable)
+    }
+
+    #[cfg(not(feature = "store-redb"))]
+    async fn persist_exchanges(&self, _defs: &crate::exchange::Defs) -> Result<(), ExchangeError> {
+        Ok(())
+    }
+
+    /// Read the persisted standalone definitions (`None` = none stored).
+    #[cfg(feature = "store-redb")]
+    async fn read_persisted_exchanges(&self) -> Result<Option<crate::exchange::Defs>, String> {
+        let store = self.store().await.ok_or_else(|| {
+            "durable store not openable (previous instance still holds the lock?)".to_owned()
+        })?;
+        match store.definitions(EXCHANGES_KEY)? {
+            Some(blob) => serde_json::from_slice(&blob)
+                .map(Some)
+                .map_err(|e| format!("corrupt exchange definitions: {e}")),
+            None => Ok(None),
+        }
+    }
+
+    #[cfg(not(feature = "store-redb"))]
+    async fn read_persisted_exchanges(&self) -> Result<Option<crate::exchange::Defs>, String> {
+        Ok(None)
     }
 
     /// Wire the dead-letter router (once, right after construction).
@@ -201,6 +343,12 @@ impl QueueRegistry {
         ["/queues/", "/quorum/", "/durable/"]
             .iter()
             .any(|p| address.strip_prefix(p).is_some_and(|n| !n.is_empty()))
+    }
+
+    /// Whether a vhost name is usable as a namespace (no `/`, no control
+    /// characters).
+    pub fn valid_vhost(vhost: &str) -> bool {
+        !vhost.contains('/') && !vhost.chars().any(char::is_control)
     }
 
     /// Resolve an address in the default namespace — broker-INTERNAL callers

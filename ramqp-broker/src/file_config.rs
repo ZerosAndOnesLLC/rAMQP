@@ -42,6 +42,16 @@
 //!
 //! [[queues]]
 //! address = "/quorum/orders.created"
+//!
+//! [[exchanges]]
+//! name = "events"
+//! type = "topic"                 # fanout | direct | topic
+//! alternate = "/queues/unroutable"   # optional
+//!
+//! [[bindings]]
+//! exchange = "events"
+//! queue = "/quorum/orders.created"
+//! key = "order.#"
 //! ```
 //!
 //! Secrets never appear inline: users reference a **verifier file** (RFC
@@ -95,6 +105,12 @@ pub struct FileConfig {
     /// Queues declared at startup (idempotent across restarts).
     #[serde(default)]
     pub queues: Vec<QueueEntry>,
+    /// Exchanges declared at startup.
+    #[serde(default)]
+    pub exchanges: Vec<ExchangeEntry>,
+    /// Exchange → queue bindings created at startup.
+    #[serde(default)]
+    pub bindings: Vec<BindingEntry>,
     /// The directory relative paths resolve against (the file's own).
     #[serde(skip)]
     base_dir: PathBuf,
@@ -208,6 +224,47 @@ pub struct QueueEntry {
     pub address: String,
 }
 
+/// `[[exchanges]]`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct ExchangeEntry {
+    /// Vhost (empty = default).
+    #[serde(default)]
+    pub vhost: String,
+    /// Exchange name (addressed as `/exchanges/<name>[/<key>]`).
+    pub name: String,
+    /// `fanout`, `direct`, or `topic`.
+    #[serde(rename = "type")]
+    pub kind: String,
+    /// Queue address for unroutable messages.
+    pub alternate: Option<String>,
+}
+
+/// `[[bindings]]`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct BindingEntry {
+    /// Vhost (empty = default).
+    #[serde(default)]
+    pub vhost: String,
+    /// The exchange name.
+    pub exchange: String,
+    /// The destination queue address.
+    pub queue: String,
+    /// Binding key (topic patterns allowed; ignored by fanout).
+    #[serde(default)]
+    pub key: String,
+}
+
+impl ExchangeEntry {
+    /// The parsed kind (validated at load).
+    pub fn kind(&self) -> crate::exchange::ExchangeKind {
+        crate::exchange::ExchangeKind::parse(&self.kind).expect("validated at load")
+    }
+}
+
 impl FileConfig {
     /// Read and parse a config file.
     pub fn load(path: &Path) -> Result<FileConfig, String> {
@@ -293,6 +350,30 @@ impl FileConfig {
                     q.address
                 ));
             }
+        }
+        for e in &self.exchanges {
+            let kind = crate::exchange::ExchangeKind::parse(&e.kind).ok_or_else(|| {
+                format!(
+                    "exchange {:?}: unknown type {:?} (expected fanout, direct or topic)",
+                    e.name, e.kind
+                )
+            })?;
+            crate::exchange::validate(&crate::exchange::ExchangeOp::Declare {
+                vhost: e.vhost.clone(),
+                name: e.name.clone(),
+                kind,
+                alternate: e.alternate.clone(),
+            })
+            .map_err(|err| format!("[[exchanges]] {:?}: {err}", e.name))?;
+        }
+        for b in &self.bindings {
+            crate::exchange::validate(&crate::exchange::ExchangeOp::Bind {
+                vhost: b.vhost.clone(),
+                exchange: b.exchange.clone(),
+                destination: b.queue.clone(),
+                key: b.key.clone(),
+            })
+            .map_err(|err| format!("[[bindings]] {:?} -> {:?}: {err}", b.exchange, b.queue))?;
         }
         if let Some(c) = &self.cluster {
             for s in &c.seeds {
@@ -507,6 +588,14 @@ mod tests {
             dead_letter = "/queues/dead"
             [[queues]]
             address = "/quorum/orders.created"
+            [[exchanges]]
+            name = "events"
+            type = "topic"
+            alternate = "/queues/unroutable"
+            [[bindings]]
+            exchange = "events"
+            queue = "/quorum/orders.created"
+            key = "order.#"
         "#;
         let cfg = FileConfig::from_toml(text, dir.path()).unwrap();
         let mut bc = BrokerConfig::default();
@@ -528,6 +617,11 @@ mod tests {
             Some(std::time::Duration::from_millis(1500))
         );
         assert_eq!(cfg.queues[0].address, "/quorum/orders.created");
+        assert_eq!(
+            cfg.exchanges[0].kind(),
+            crate::exchange::ExchangeKind::Topic
+        );
+        assert_eq!(cfg.bindings[0].key, "order.#");
 
         let auth = cfg.authenticator().unwrap().unwrap();
         assert!(auth.verify(Credentials::Plain {
@@ -559,6 +653,13 @@ mod tests {
                 .contains("unknown operation")
         );
         assert!(bad("[[policies]]\noverflow = \"drop\"").contains("unknown overflow"));
+        assert!(bad("[[exchanges]]\nname = \"e\"\ntype = \"headers\"").contains("unknown type"));
+        assert!(
+            bad("[[bindings]]\nexchange = \"e\"\nqueue = \"/exchanges/x\"")
+                .contains("queue address")
+                || bad("[[bindings]]\nexchange = \"e\"\nqueue = \"/exchanges/x\"")
+                    .contains("must be")
+        );
         assert!(
             bad("[cluster]\nnode_id = 1\nlisten = \"x\"\nseeds = [\"oops\"]").contains("bad seed")
         );
