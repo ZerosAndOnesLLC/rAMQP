@@ -210,6 +210,19 @@ pub(crate) enum ConnCmd {
         /// The message bytes.
         body: Bytes,
     },
+    /// Settle an inbound (producer) delivery as `released`: an exchange
+    /// publish that matched no binding (RabbitMQ 4.x semantics — the
+    /// producer can tell "routed nowhere" from "delivered").
+    ReleaseIncoming {
+        /// The session channel (ours).
+        channel: u16,
+        /// The producer link handle.
+        handle: u32,
+        /// The binding generation this settlement was issued for.
+        binding_gen: u64,
+        /// The peer's delivery id.
+        delivery_id: u32,
+    },
     /// Settle an inbound (producer) delivery: accept, or reject on overflow.
     SettleIncoming {
         /// The session channel (ours).
@@ -515,7 +528,7 @@ async fn dispatch(
             handle: sub.handle,
             binding_gen: sub.binding_gen,
             msg_id: msg.id,
-            body: msg.body.clone(),
+            body: crate::redelivery::with_delivery_count(&msg.body, msg.failures),
         };
         let sub_id = sub.id;
         if sub.conn.send(cmd).is_ok() {

@@ -280,6 +280,33 @@ pub struct QueueEntry {
     pub vhost: String,
     /// The queue address (`/queues/x`, `/quorum/x`, `/durable/x`).
     pub address: String,
+    /// The queue's own policy (overrides prefix `[[policies]]`): message
+    /// TTL in milliseconds.
+    pub message_ttl_ms: Option<u64>,
+    /// Max messages held.
+    pub max_length: Option<u64>,
+    /// Max body bytes held.
+    pub max_length_bytes: Option<u64>,
+    /// `reject-publish` (default) or `drop-head`.
+    pub overflow: Option<String>,
+    /// Dead-letter target address.
+    pub dead_letter: Option<String>,
+    /// Delivery attempts before dead-lettering.
+    pub max_delivery_attempts: Option<u32>,
+}
+
+impl QueueEntry {
+    /// The queue's own policy fields.
+    fn policy(&self) -> crate::defs::PolicySpec {
+        crate::defs::PolicySpec {
+            message_ttl_ms: self.message_ttl_ms,
+            max_length: self.max_length,
+            max_length_bytes: self.max_length_bytes,
+            overflow: self.overflow.clone(),
+            dead_letter: self.dead_letter.clone(),
+            max_delivery_attempts: self.max_delivery_attempts,
+        }
+    }
 }
 
 /// `[[exchanges]]`.
@@ -408,6 +435,9 @@ impl FileConfig {
                     q.address
                 ));
             }
+            q.policy()
+                .validate()
+                .map_err(|e| format!("[[queues]] {:?}: {e}", q.address))?;
         }
         for e in &self.exchanges {
             let kind = crate::exchange::ExchangeKind::parse(&e.kind).ok_or_else(|| {
@@ -524,6 +554,17 @@ impl FileConfig {
             config
                 .policies
                 .push((policy_key(&p.vhost, &p.prefix), p.to_policy()));
+        }
+        for q in &self.queues {
+            let spec = q.policy();
+            if spec.is_empty() {
+                continue;
+            }
+            let (_, bare) = crate::registry::QueueRegistry::parse_address(&q.address)
+                .ok_or_else(|| format!("[[queues]] address {:?} is not a queue", q.address))?;
+            config
+                .queue_policies
+                .push((policy_key(&q.vhost, bare), spec.to_policy()));
         }
         Ok(())
     }

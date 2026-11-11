@@ -391,6 +391,10 @@ async fn dispatch(
             ready.remove(&msg_id);
             continue;
         };
+        let body = crate::redelivery::with_delivery_count(
+            &body,
+            failures.get(&msg_id).copied().unwrap_or(0),
+        );
         ready.remove(&msg_id);
         *rr = (idx + 1) % subs.len();
 

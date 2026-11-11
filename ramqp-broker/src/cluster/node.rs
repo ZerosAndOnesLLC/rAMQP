@@ -79,8 +79,11 @@ const CAP_EXCHANGES: u64 = 1;
 /// Capability bit: applies `MetaCommand::DeleteQueue` with incarnations
 /// (and understands `RequestKind::StartGroupAt`).
 const CAP_QUEUE_DELETE: u64 = 2;
+/// Capability bit: applies `MetaCommand::Def` (runtime definitions:
+/// per-queue policies, users, permissions).
+const CAP_DEFS: u64 = 4;
 /// What this node supports (answered to `RequestKind::Capabilities`).
-const CAPABILITIES: u64 = CAP_EXCHANGES | CAP_QUEUE_DELETE;
+const CAPABILITIES: u64 = CAP_EXCHANGES | CAP_QUEUE_DELETE | CAP_DEFS;
 
 /// One local member of a per-queue Raft group.
 struct GroupMember {
@@ -115,7 +118,15 @@ pub struct ClusterNode {
     exchanges_capable: std::sync::atomic::AtomicBool,
     /// Every voter has confirmed it supports quorum-queue deletion.
     delete_capable: std::sync::atomic::AtomicBool,
+    /// Every voter has confirmed it supports runtime definitions.
+    defs_capable: std::sync::atomic::AtomicBool,
+    /// Resolves a queue's effective policy (installed by the registry, so
+    /// per-queue definitions apply to clustered queues too).
+    policy_resolver: std::sync::OnceLock<PolicyResolver>,
 }
+
+/// See [`ClusterNode::set_policy_resolver`].
+pub(crate) type PolicyResolver = Arc<dyn Fn(&str) -> crate::policy::EffectivePolicy + Send + Sync>;
 
 impl std::fmt::Debug for ClusterNode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -243,6 +254,8 @@ impl ClusterNode {
             stopping: std::sync::atomic::AtomicBool::new(false),
             exchanges_capable: std::sync::atomic::AtomicBool::new(false),
             delete_capable: std::sync::atomic::AtomicBool::new(false),
+            defs_capable: std::sync::atomic::AtomicBool::new(false),
+            policy_resolver: std::sync::OnceLock::new(),
         });
 
         tokio::spawn(serve_fabric(
@@ -728,13 +741,16 @@ impl ClusterNode {
                 {
                     return Ok(handle.clone());
                 }
-                let policy = crate::policy::EffectivePolicy::resolve(
-                    &self.settings.policies,
-                    name,
-                    self.settings.max_queue_depth,
-                    self.settings.max_queue_bytes,
-                    self.settings.dlx.clone(),
-                );
+                let policy = match self.policy_resolver.get() {
+                    Some(resolve) => resolve(name),
+                    None => crate::policy::EffectivePolicy::resolve(
+                        &self.settings.policies,
+                        name,
+                        self.settings.max_queue_depth,
+                        self.settings.max_queue_bytes,
+                        self.settings.dlx.clone(),
+                    ),
+                };
                 // Dead letters route through THIS node's registry: a
                 // node-local target (transient/durable) lands on whichever
                 // node happens to lead when the message dies, scattering the
@@ -955,6 +971,41 @@ impl ClusterNode {
     /// reconcile watcher).
     pub(crate) fn incarnations(&self) -> BTreeMap<String, u64> {
         self.meta_store.incarnations()
+    }
+
+    /// Write (or remove) a runtime definition through the metadata group,
+    /// then wait until this node has applied it. `Ok(changed)`.
+    pub(crate) async fn def_write(
+        &self,
+        key: &str,
+        value: Option<Vec<u8>>,
+    ) -> Result<bool, String> {
+        self.ensure_capable(&self.defs_capable, CAP_DEFS, "runtime definitions")
+            .await?;
+        let response = self
+            .meta_write(MetaCommand::Def {
+                key: key.to_owned(),
+                value,
+            })
+            .await?;
+        let MetaResponse::Def(changed, epoch) = response else {
+            return Err(format!("unexpected definitions response: {response:?}"));
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while self.meta_store.defs_epoch() < epoch && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        Ok(changed)
+    }
+
+    /// The applied runtime definitions and their epoch.
+    pub(crate) fn defs(&self) -> (u64, BTreeMap<String, Vec<u8>>) {
+        self.meta_store.defs()
+    }
+
+    /// Install the registry's policy resolver (first caller wins).
+    pub(crate) fn set_policy_resolver(&self, resolver: PolicyResolver) {
+        let _ = self.policy_resolver.set(resolver);
     }
 
     /// A queue's current incarnation in the applied catalog.

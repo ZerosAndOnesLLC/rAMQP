@@ -55,6 +55,7 @@ mod broker;
 pub(crate) mod cluster;
 pub mod config;
 mod connection;
+mod defs;
 mod dispatch;
 #[cfg(feature = "store-redb")]
 mod durable;
@@ -65,7 +66,9 @@ mod policy;
 mod proxy;
 mod queue;
 mod quorum;
+mod redelivery;
 mod registry;
+pub mod runtime_users;
 mod serde_bin;
 #[cfg(feature = "store-redb")]
 mod store;

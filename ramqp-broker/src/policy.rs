@@ -130,6 +130,22 @@ pub(crate) struct EffectivePolicy {
     pub dlx: Option<DeadLetterSender>,
 }
 
+/// In a policy's `dead_letter`, replaced by the dead-lettering queue's name.
+pub(crate) const QUEUE_PLACEHOLDER: &str = "{queue}";
+
+/// Whether `queue` is a name the template `dead_letter` produces (so it is a
+/// dead-letter companion itself): the target's queue name with `{queue}`
+/// matching a non-empty run.
+fn is_template_target(template: &str, queue: &str) -> bool {
+    let Some((_, name)) = crate::registry::QueueRegistry::parse_address(template) else {
+        return false;
+    };
+    let Some((pre, post)) = name.split_once(QUEUE_PLACEHOLDER) else {
+        return false;
+    };
+    queue.len() > pre.len() + post.len() && queue.starts_with(pre) && queue.ends_with(post)
+}
+
 impl EffectivePolicy {
     /// The no-policy default: only the broker-wide depth bound (bytes
     /// unbounded — unit-test convenience).
@@ -173,7 +189,22 @@ impl EffectivePolicy {
                 // capacity) a router↔actor livelock with zero client
                 // traffic. Longer operator-configured cycles (a→b→a) remain
                 // the operator's responsibility.
-                let dead_letter = p.dead_letter.clone().filter(|target| {
+                // `{queue}` in a prefix policy's target expands to this
+                // queue's name (one dead-letter companion per queue). The
+                // companions themselves match the pattern and are not
+                // dead-lettered by it — otherwise `jobs.dlq` would feed
+                // `jobs.dlq.dlq`, and so on.
+                let dead_letter = match p.dead_letter.as_deref() {
+                    Some(template) if template.contains(QUEUE_PLACEHOLDER) => {
+                        if is_template_target(template, queue) {
+                            None
+                        } else {
+                            Some(template.replace(QUEUE_PLACEHOLDER, queue))
+                        }
+                    }
+                    other => other.map(str::to_owned),
+                };
+                let dead_letter = dead_letter.filter(|target| {
                     let is_self = crate::registry::QueueRegistry::parse_address(target)
                         .is_some_and(|(_, target_name)| target_name == queue);
                     if is_self {
@@ -283,6 +314,30 @@ pub(crate) fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dead_letter_template_expands_per_queue_and_skips_companions() {
+        let p = QueuePolicy {
+            dead_letter: Some("/quorum/{queue}.dlq".to_owned()),
+            max_delivery_attempts: Some(3),
+            ..Default::default()
+        };
+        let policies = vec![(String::new(), p)];
+        let jobs = EffectivePolicy::resolve(&policies, "jobs", 100, 0, None);
+        assert_eq!(jobs.dead_letter.as_deref(), Some("/quorum/jobs.dlq"));
+        let tenant = EffectivePolicy::resolve(&policies, "t/jobs", 100, 0, None);
+        assert_eq!(tenant.dead_letter.as_deref(), Some("/quorum/t/jobs.dlq"));
+        let dlq = EffectivePolicy::resolve(&policies, "jobs.dlq", 100, 0, None);
+        assert_eq!(
+            dlq.dead_letter, None,
+            "a companion is not dead-lettered again"
+        );
+        assert_eq!(
+            dlq.max_attempts,
+            Some(3),
+            "the rest of the policy still applies"
+        );
+    }
 
     /// MED-3 (issue #19): the catch-all policy prefix matches the DLX queue
     /// itself — its dead-letter target must be disabled there or expiring

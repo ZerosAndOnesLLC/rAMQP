@@ -500,7 +500,7 @@ pub fn derive_scram_verifier(
 /// permission matches the identity, vhost, address, and operation. The
 /// transaction coordinator (`$coordinator`) is allowed to anyone holding a
 /// `send` permission in the vhost.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct StaticUsers {
     /// username → verifiers (one per mechanism).
     users: HashMap<String, Vec<(ScramMechanism, ScramVerifier)>>,
@@ -618,6 +618,22 @@ impl StaticUsers {
     /// Number of configured users.
     pub fn user_count(&self) -> usize {
         self.users.len()
+    }
+
+    /// Every user name, with whether it is an administrator.
+    pub fn user_names(&self) -> Vec<(String, bool)> {
+        let mut names: Vec<(String, bool)> = self
+            .users
+            .keys()
+            .map(|n| (n.clone(), self.admins.contains(n)))
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Whether `username` is a configured user.
+    pub fn has_user(&self, username: &str) -> bool {
+        self.users.contains_key(username)
     }
 
     /// Whether `username` is an administrator.

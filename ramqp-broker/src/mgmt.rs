@@ -15,11 +15,20 @@
 //! Writes (always authenticated; idempotent — `201` created, `204` already
 //! so, `409` exists with different arguments):
 //! - `PUT /queues/<vhost>/<name>` body `{"kind": "quorum"}` (default
-//!   `transient`); `DELETE /queues/<vhost>/<name>[?kind=…]`.
+//!   `transient`), optionally with the queue's own policy fields
+//!   (`dead_letter`, `max_delivery_attempts`, ...);
+//!   `DELETE /queues/<vhost>/<name>[?kind=…]`.
 //! - `PUT /exchanges/<vhost>/<name>` body `{"type": "topic", "alternate":
 //!   "/queues/x"}`; `DELETE /exchanges/<vhost>/<name>`.
 //! - `PUT` / `DELETE /bindings/<vhost>/<exchange>` body `{"queue":
 //!   "/queues/x", "key": "order.*"}`.
+//! - `PUT /users/<name>` body `{"password": "..."}` or `{"verifier":
+//!   "SCRAM-SHA-256$..."}` (+ optional `"admin"`); `DELETE /users/<name>`.
+//! - `PUT` / `DELETE /permissions/<vhost>/<user>` body `[{"address":
+//!   "/queues/x", "operations": ["receive"]}]`.
+//!
+//! `GET /users` and `GET /permissions/<vhost>/<user>` always need
+//! credentials (see [`users`]).
 //!
 //! Path segments are percent-decoded; the default vhost is `%2F` (as in
 //! RabbitMQ's API). Credentials: `Authorization: Bearer <token>`
@@ -36,6 +45,8 @@ use serde_json::{Value as Json, json};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
+
+mod users;
 
 use crate::auth::Authenticator;
 use crate::config::SecretString;
@@ -423,7 +434,10 @@ async fn route(
         "PUT" | "DELETE" => true,
         _ => return Response::error(405, "method not allowed"),
     };
-    if (write || auth.auth_reads) && !authenticated_async(&req, auth).await {
+    // Who exists and who may do what is never public, whatever auth_reads
+    // says.
+    let private = req.path.starts_with("/users") || req.path.starts_with("/permissions");
+    if (write || auth.auth_reads || private) && !authenticated_async(&req, auth).await {
         // Slow every failed attempt down (with the connection cap this
         // bounds guessing to a few hundred tries per second).
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
@@ -454,6 +468,18 @@ async fn route(
         ("PUT", ["queues", vhost, name]) => put_queue(registry, &req, vhost_of(vhost), name).await,
         ("DELETE", ["queues", vhost, name]) => {
             delete_queue(registry, &req, vhost_of(vhost), name).await
+        }
+        ("GET", ["users"]) => users::list(registry),
+        ("PUT", ["users", name]) => users::put(registry, &req, name).await,
+        ("DELETE", ["users", name]) => users::delete(registry, name).await,
+        ("GET", ["permissions", vhost, user]) => {
+            users::get_permissions(registry, vhost_of(vhost), user)
+        }
+        ("PUT", ["permissions", vhost, user]) => {
+            users::put_permissions(registry, &req, vhost_of(vhost), user).await
+        }
+        ("DELETE", ["permissions", vhost, user]) => {
+            users::delete_permissions(registry, vhost_of(vhost), user).await
         }
         ("GET", ["exchanges"]) => list_exchanges(registry, None).await,
         ("GET", ["exchanges", vhost, name]) => {
@@ -612,6 +638,7 @@ async fn get_queue(registry: &QueueRegistry, req: &Request, vhost: &str, name: &
             "unacked": stats.unacked,
             "messages": stats.ready + stats.unacked,
             "consumers": stats.consumers,
+            "policy": registry.own_policy(&qualified).map(|p| p.to_json()),
         }),
     )
 }
@@ -637,8 +664,32 @@ async fn put_queue(
     let Some(qualified) = QueueRegistry::qualify(vhost, name) else {
         return Response::error(400, "invalid vhost or queue name");
     };
+    // The queue's own policy (dead-letter target, retry budget, limits):
+    // part of the declaration, like `kind`.
+    let policy = match crate::defs::PolicySpec::from_json(&body) {
+        Ok(p) => p,
+        Err(e) => return Response::error(400, e),
+    };
+    if policy.is_some() && registry.has_config_policy(&qualified) {
+        return Response::error(
+            409,
+            format!("queue {name:?} has its policy set in the configuration file"),
+        );
+    }
     match registry.find_queue(None, &qualified).await {
-        Some((existing, _)) if existing == kind => return Response::empty(204),
+        Some((existing, _)) if existing == kind => {
+            let current = registry.own_policy(&qualified);
+            return if registry.has_config_policy(&qualified) || current == policy {
+                Response::empty(204)
+            } else {
+                Response::error(
+                    409,
+                    format!(
+                        "queue {name:?} exists with a different policy (delete it to change it)"
+                    ),
+                )
+            };
+        }
         Some((existing, _)) => {
             return Response::error(
                 409,
@@ -648,17 +699,33 @@ async fn put_queue(
         None => {}
     }
     let address = format!("{}{name}", kind_prefix(kind));
-    let (reg, vh, addr) = (registry.clone(), vhost.to_owned(), address.clone());
-    let declared = tokio::spawn(async move { reg.resolve_in(&vh, &addr).await.is_some() })
+    // The policy is written first: the queue applies it when it starts.
+    let key = crate::defs::queue_policy_key(&qualified);
+    let value = match &policy {
+        Some(p) => match crate::serde_bin::to_vec(p) {
+            Ok(v) => Some(v),
+            Err(e) => return Response::error(500, e.to_string()),
+        },
+        None => None,
+    };
+    if let Err(e) = registry.def_write(&key, value).await {
+        return Response::error(503, format!("could not store the queue policy: {e}"));
+    }
+    // Explicit kind: `/queues/<name>` here means a transient queue.
+    let (reg, vh, bare) = (registry.clone(), vhost.to_owned(), name.to_owned());
+    let declared = tokio::spawn(async move { reg.declare_in(&vh, kind, &bare).await.is_some() })
         .await
         .unwrap_or(false);
-    match declared.then_some(()) {
-        Some(_) => Response::empty(201),
-        None => Response::error(
+    if !declared {
+        if policy.is_some() {
+            let _ = registry.def_write(&key, None).await;
+        }
+        return Response::error(
             503,
             format!("could not declare {address} (limits, store, or cluster unavailable)"),
-        ),
+        );
     }
+    Response::empty(201)
 }
 
 async fn delete_queue(

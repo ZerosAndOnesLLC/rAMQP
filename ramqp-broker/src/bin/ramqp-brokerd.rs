@@ -30,7 +30,7 @@
 use std::sync::Arc;
 
 use ramqp_broker::file_config::{FileConfig, parse_seed};
-use ramqp_broker::{Authenticator, Broker, BrokerConfig, ClusterMemberConfig};
+use ramqp_broker::{Broker, BrokerConfig, ClusterMemberConfig};
 
 // Use jemalloc as the global allocator. glibc's malloc fragments its per-thread
 // arenas under the broker's high connection open/close churn, growing RSS
@@ -290,7 +290,9 @@ async fn main() -> std::io::Result<()> {
     let mut broker = Broker::new(config);
     let user_count = users.as_ref().map_or(0, |u| u.user_count());
     if let Some(users) = users {
-        broker = broker.with_authenticator(Arc::new(users) as Arc<dyn Authenticator>);
+        // The configuration's users, plus users and permissions created
+        // through the management API (persisted, replicated when clustered).
+        broker = broker.with_runtime_users(users);
     }
     let bound = broker.bind(&listen).await?;
 

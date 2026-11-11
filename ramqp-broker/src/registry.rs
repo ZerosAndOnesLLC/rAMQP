@@ -32,6 +32,33 @@ use crate::quorum;
 const EXCHANGE_ROW: &str = "exchange:";
 
 /// Why a queue deletion did not happen.
+/// See [`QueueRegistry::set_defs_hook`].
+pub type DefsHook = Arc<dyn Fn(&crate::defs::Defs) + Send + Sync>;
+
+/// A [`DefsHook`] slot (`Debug` for the registry).
+struct HookSlot(DefsHook);
+
+impl std::fmt::Debug for HookSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DefsHook")
+    }
+}
+
+/// Why a client address does not resolve to a queue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolveError {
+    /// Not a usable queue name (reserved or invalid characters).
+    Invalid,
+    /// Queues of several kinds share the name (state from a version that
+    /// allowed it): address one explicitly (`/quorum/<name>`,
+    /// `/durable/<name>`).
+    Ambiguous(Vec<QueueKind>),
+    /// The name already holds a queue of this other kind.
+    OtherKind(QueueKind),
+    /// Exists or could be declared, but not now (limits, store, cluster).
+    Unavailable,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum QueueDeleteError {
     /// No such queue.
@@ -101,6 +128,21 @@ pub(crate) struct QueueRegistry {
     resident_bytes_max: usize,
     /// Queue policies (prefix-matched at declaration).
     policies: Vec<(String, QueuePolicy)>,
+    /// Per-queue policies from the configuration (by qualified name).
+    config_queue_policies: HashMap<String, QueuePolicy>,
+    /// Runtime definitions (management-API policies, users, permissions).
+    defs: std::sync::RwLock<Arc<crate::defs::Defs>>,
+    /// Whether `defs` reflects the persisted definitions. False only for a
+    /// standalone broker with a store not read yet: queues are not declared
+    /// until it is (a queue started before would miss its own policy).
+    defs_loaded: std::sync::atomic::AtomicBool,
+    /// Serializes standalone definition writes.
+    defs_write: tokio::sync::Mutex<()>,
+    /// Called with the new definitions after every change (rebuilds the
+    /// runtime authenticator).
+    defs_hook: OnceLock<HookSlot>,
+    /// The runtime-users authenticator, when the broker uses one.
+    runtime_users: OnceLock<Arc<crate::runtime_users::RuntimeUsers>>,
     /// The dead-letter router, wired in right after construction.
     dlx: OnceLock<DeadLetterSender>,
     /// Exchange definitions (the routing view).
@@ -135,6 +177,14 @@ impl QueueRegistry {
             data_dir: config.data_dir.clone(),
             resident_bytes_max: config.resident_bytes_max,
             policies: config.policies.clone(),
+            config_queue_policies: config.queue_policies.iter().cloned().collect(),
+            defs: std::sync::RwLock::new(Arc::new(crate::defs::Defs::default())),
+            defs_loaded: std::sync::atomic::AtomicBool::new(
+                !cfg!(feature = "store-redb") || config.data_dir.is_none(),
+            ),
+            defs_write: tokio::sync::Mutex::new(()),
+            defs_hook: OnceLock::new(),
+            runtime_users: OnceLock::new(),
             dlx: OnceLock::new(),
             exchanges: ExchangeRegistry::default(),
             exchange_write: tokio::sync::Mutex::new(()),
@@ -143,6 +193,156 @@ impl QueueRegistry {
                 !cfg!(feature = "store-redb") || config.data_dir.is_none(),
             ),
         }
+    }
+
+    /// Clustered queues resolve their policy through this registry (so
+    /// per-queue definitions apply to them).
+    pub fn install_policy_resolver(self: &Arc<Self>) {
+        if let Some(node) = self.cluster.get() {
+            let weak = Arc::downgrade(self);
+            let fallback = (self.policies.clone(), self.max_depth, self.max_bytes);
+            node.set_policy_resolver(Arc::new(move |name: &str| match weak.upgrade() {
+                Some(registry) => registry.policy_for(name),
+                None => EffectivePolicy::resolve(&fallback.0, name, fallback.1, fallback.2, None),
+            }));
+        }
+    }
+
+    /// Use `users` for runtime user management: it is rebuilt from the
+    /// definitions on every change.
+    pub fn set_runtime_users(&self, users: Arc<crate::runtime_users::RuntimeUsers>) {
+        let hook_users = users.clone();
+        let _ = self.runtime_users.set(users);
+        self.set_defs_hook(Arc::new(move |defs| hook_users.apply(defs)));
+    }
+
+    /// The runtime-users authenticator, when the broker uses one.
+    pub fn runtime_users(&self) -> Option<&Arc<crate::runtime_users::RuntimeUsers>> {
+        self.runtime_users.get()
+    }
+
+    /// Whether the configuration sets this queue's own policy.
+    pub fn has_config_policy(&self, qualified: &str) -> bool {
+        self.config_queue_policies.contains_key(qualified)
+    }
+
+    /// The queue's own policy set through the management API, if any.
+    pub fn own_policy(&self, qualified: &str) -> Option<crate::defs::PolicySpec> {
+        self.defs().get(&crate::defs::queue_policy_key(qualified))
+    }
+
+    /// The current runtime definitions.
+    pub fn defs(&self) -> Arc<crate::defs::Defs> {
+        self.defs.read().expect("defs lock").clone()
+    }
+
+    /// Run `hook` with the definitions after every change (and once now).
+    pub fn set_defs_hook(&self, hook: DefsHook) {
+        hook(&self.defs());
+        let _ = self.defs_hook.set(HookSlot(hook));
+    }
+
+    fn replace_defs(&self, next: crate::defs::Defs) {
+        let next = Arc::new(next);
+        {
+            let mut cur = self.defs.write().expect("defs lock");
+            if **cur == *next {
+                return;
+            }
+            *cur = next.clone();
+        }
+        if let Some(HookSlot(hook)) = self.defs_hook.get() {
+            hook(&next);
+        }
+    }
+
+    /// Set (`Some`) or remove (`None`) one runtime definition: through the
+    /// metadata group when clustered, else persisted to the store (when
+    /// there is one). On return this node's view reflects it. `Ok(changed)`.
+    pub async fn def_write(&self, key: &str, value: Option<Vec<u8>>) -> Result<bool, String> {
+        if let Some(node) = self.cluster.get() {
+            let changed = node.def_write(key, value).await?;
+            self.sync_defs();
+            return Ok(changed);
+        }
+        if !self.ensure_defs_loaded().await {
+            return Err("persisted definitions not loaded yet (store unavailable); retry".into());
+        }
+        let _serial = self.defs_write.lock().await;
+        let current = self.defs();
+        let mut next = (*current).clone();
+        let changed = match &value {
+            Some(v) => next.map.get(key) != Some(v),
+            None => next.map.contains_key(key),
+        };
+        if !changed {
+            return Ok(false);
+        }
+        #[cfg(feature = "store-redb")]
+        if self.data_dir.is_some() {
+            let store = self
+                .store()
+                .await
+                .ok_or("durable store not openable; retry")?;
+            let row = format!("{}{key}", crate::defs::STORE_PREFIX);
+            let (puts, deletes) = match &value {
+                Some(v) => (vec![(row, v.clone())], Vec::new()),
+                None => (Vec::new(), vec![row]),
+            };
+            tokio::task::spawn_blocking(move || store.write_definitions(&puts, &deletes))
+                .await
+                .map_err(|e| e.to_string())??;
+        }
+        match value {
+            Some(v) => next.map.insert(key.to_owned(), v),
+            None => next.map.remove(key),
+        };
+        next.epoch += 1;
+        self.replace_defs(next);
+        Ok(true)
+    }
+
+    /// Whether the definitions are loaded, loading them now if not
+    /// (standalone with a store). Clustered: always (they replicate).
+    pub async fn ensure_defs_loaded(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        if self.defs_loaded.load(Ordering::Acquire) || self.cluster.get().is_some() {
+            return true;
+        }
+        self.load_defs().await.is_ok()
+    }
+
+    /// Clustered: take the metadata group's definitions if they are newer.
+    pub fn sync_defs(&self) {
+        if let Some(node) = self.cluster.get() {
+            let (epoch, map) = node.defs();
+            if epoch != self.defs().epoch {
+                self.replace_defs(crate::defs::Defs { epoch, map });
+            }
+        }
+    }
+
+    /// Standalone with a store: load the persisted definitions.
+    pub async fn load_defs(&self) -> Result<(), String> {
+        #[cfg(feature = "store-redb")]
+        if self.cluster.get().is_none() && self.data_dir.is_some() {
+            let store = self.store().await.ok_or("durable store not openable")?;
+            let rows =
+                tokio::task::spawn_blocking(move || store.definitions(crate::defs::STORE_PREFIX))
+                    .await
+                    .map_err(|e| e.to_string())??;
+            let map = rows
+                .into_iter()
+                .map(|(k, v)| (k[crate::defs::STORE_PREFIX.len()..].to_owned(), v))
+                .collect();
+            let _serial = self.defs_write.lock().await;
+            if !self.defs_loaded.load(std::sync::atomic::Ordering::Acquire) {
+                self.replace_defs(crate::defs::Defs { epoch: 1, map });
+                self.defs_loaded
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+        Ok(())
     }
 
     /// The exchange routing view.
@@ -322,10 +522,21 @@ impl QueueRegistry {
         let _ = self.dlx.set(dlx);
     }
 
-    /// The resolved policy for a queue.
-    fn policy_for(&self, name: &str) -> EffectivePolicy {
+    /// The resolved policy for a queue: its own policy (configuration,
+    /// then management API) if it has one, else the first matching prefix
+    /// policy.
+    pub(crate) fn policy_for(&self, name: &str) -> EffectivePolicy {
+        let own = self.config_queue_policies.get(name).cloned().or_else(|| {
+            self.defs()
+                .get::<crate::defs::PolicySpec>(&crate::defs::queue_policy_key(name))
+                .map(|spec| spec.to_policy())
+        });
+        let policies = match own {
+            Some(p) => std::borrow::Cow::Owned(vec![(name.to_owned(), p)]),
+            None => std::borrow::Cow::Borrowed(&self.policies),
+        };
         EffectivePolicy::resolve(
-            &self.policies,
+            &policies,
             name,
             self.max_depth,
             self.max_bytes,
@@ -387,10 +598,26 @@ impl QueueRegistry {
         self.cluster.get()
     }
 
-    /// Normalize an AMQP address to `(kind, queue name)`. Accepts the
-    /// RabbitMQ-4.x style `/queues/<name>`, `/quorum/<name>` for replicated
-    /// queues, `/durable/<name>` for on-disk local queues, and bare names
-    /// (with or without a leading `/`) as transient.
+    /// Normalize an AMQP address to `(kind, queue name)` where `kind` is
+    /// `None` for "whichever queue is declared under this name": the
+    /// RabbitMQ 4.x form `/queues/<name>` and bare names (with or without a
+    /// leading `/`). `/quorum/<name>` and `/durable/<name>` name a kind
+    /// explicitly (and declare it on first use).
+    pub fn parse_target(address: &str) -> Option<(Option<QueueKind>, &str)> {
+        if let Some(name) = address.strip_prefix("/quorum/") {
+            return (!name.is_empty()).then_some((Some(QueueKind::Quorum), name));
+        }
+        if let Some(name) = address.strip_prefix("/durable/") {
+            return (!name.is_empty()).then_some((Some(QueueKind::Durable), name));
+        }
+        let name = address
+            .strip_prefix("/queues/")
+            .unwrap_or_else(|| address.trim_start_matches('/'));
+        (!name.is_empty()).then_some((None, name))
+    }
+
+    /// [`Self::parse_target`] with "any kind" read as transient: the kind
+    /// an address DECLARES when nothing exists under its name.
     pub fn parse_address(address: &str) -> Option<(QueueKind, &str)> {
         if let Some(name) = address.strip_prefix("/quorum/") {
             return (!name.is_empty()).then_some((QueueKind::Quorum, name));
@@ -425,8 +652,8 @@ impl QueueRegistry {
     /// addresses `/queues/<vhost>/dead`, which lands on that vhost's key
     /// (the documented dead-letter composition).
     pub async fn resolve(&self, address: &str) -> Option<QueueHandle> {
-        let (kind, name) = Self::parse_address(address)?;
-        self.resolve_name(kind, name, "").await
+        let (kind, name) = Self::parse_target(address)?;
+        self.resolve_target(kind, name, "").await.ok()
     }
 
     /// Resolve a CLIENT address within a vhost, declaring the queue if it
@@ -437,7 +664,42 @@ impl QueueRegistry {
     /// another tenant's storage key, below the authz layer. Control
     /// characters are refused for log/metrics hygiene.
     pub async fn resolve_in(&self, vhost: &str, address: &str) -> Option<QueueHandle> {
-        let (kind, bare) = Self::parse_address(address)?;
+        self.resolve_client(vhost, address).await.ok()
+    }
+
+    /// [`Self::resolve_in`], saying why an address does not resolve.
+    /// `/queues/<name>` (and a bare name) finds the queue declared under
+    /// `<name>` whatever its kind — the RabbitMQ 4.x meaning — and declares
+    /// a transient one only if there is none; two kinds under one name are
+    /// [`ResolveError::Ambiguous`] rather than a guess.
+    pub async fn resolve_client(
+        &self,
+        vhost: &str,
+        address: &str,
+    ) -> Result<QueueHandle, ResolveError> {
+        let (kind, bare) = Self::parse_target(address).ok_or(ResolveError::Invalid)?;
+        let name = self.client_name(vhost, bare, address)?;
+        self.resolve_target(kind, &name, vhost).await
+    }
+
+    /// Declare (or find) a queue of exactly `kind` — the explicit form the
+    /// config file and the management API use (`/queues/<name>` there means
+    /// a transient queue, never "whatever exists").
+    pub async fn declare_in(
+        &self,
+        vhost: &str,
+        kind: QueueKind,
+        bare: &str,
+    ) -> Option<QueueHandle> {
+        let name = self.client_name(vhost, bare, bare).ok()?;
+        if !self.ensure_defs_loaded().await {
+            return None;
+        }
+        self.resolve_name(kind, &name, vhost).await
+    }
+
+    /// Validate a client-supplied queue name and qualify it with its vhost.
+    fn client_name(&self, vhost: &str, bare: &str, address: &str) -> Result<String, ResolveError> {
         let valid = |s: &str| !s.contains('/') && !s.chars().any(char::is_control);
         // `$`-prefixed names are reserved for broker pseudo-addresses (the
         // transaction coordinator authorizes as `$coordinator`).
@@ -447,16 +709,72 @@ impl QueueRegistry {
                 address,
                 "address refused: reserved separator or control character"
             );
-            return None;
+            return Err(ResolveError::Invalid);
         }
-        let qualified;
-        let name: &str = if vhost.is_empty() {
-            bare
+        Ok(if vhost.is_empty() {
+            bare.to_owned()
         } else {
-            qualified = format!("{vhost}/{bare}");
-            &qualified
+            format!("{vhost}/{bare}")
+        })
+    }
+
+    /// Resolve an explicit kind, or (`None`) the one declared kind under
+    /// `name` — transient if none is.
+    async fn resolve_target(
+        &self,
+        kind: Option<QueueKind>,
+        name: &str,
+        vhost: &str,
+    ) -> Result<QueueHandle, ResolveError> {
+        if !self.ensure_defs_loaded().await {
+            return Err(ResolveError::Unavailable);
+        }
+        let declared = self.declared_kinds(name).await;
+        let kind = match kind {
+            // A name holds one kind: an explicit address may reach (or
+            // declare) its kind, but never add a second kind beside another
+            // — `/queues/<name>` could no longer tell them apart.
+            Some(k) => match declared.iter().find(|d| **d != k) {
+                Some(other) if !declared.contains(&k) => {
+                    return Err(ResolveError::OtherKind(*other));
+                }
+                _ => k,
+            },
+            None => match declared.as_slice() {
+                [] => QueueKind::Transient,
+                [k] => *k,
+                many => return Err(ResolveError::Ambiguous(many.to_vec())),
+            },
         };
-        self.resolve_name(kind, name, vhost).await
+        self.resolve_name(kind, name, vhost)
+            .await
+            .ok_or(ResolveError::Unavailable)
+    }
+
+    /// Every kind with a queue declared under this qualified name: live
+    /// actors, quorum queues in the replicated catalog, and durable queues
+    /// on disk (including ones not attached since a restart).
+    pub async fn declared_kinds(&self, qualified: &str) -> Vec<QueueKind> {
+        let mut kinds = self.kinds_of(qualified);
+        if !kinds.contains(&QueueKind::Quorum)
+            && self.cluster.get().is_some_and(|n| n.has_queue(qualified))
+        {
+            kinds.push(QueueKind::Quorum);
+        }
+        #[cfg(feature = "store-redb")]
+        if !kinds.contains(&QueueKind::Durable)
+            && self.data_dir.is_some()
+            && let Some(store) = self.store().await
+            && store.has_queue(qualified).unwrap_or(false)
+        {
+            kinds.push(QueueKind::Durable);
+        }
+        kinds.sort_by_key(|k| match k {
+            QueueKind::Quorum => 0,
+            QueueKind::Durable => 1,
+            QueueKind::Transient => 2,
+        });
+        kinds
     }
 
     /// The registry key for a kind + namespace-qualified name.
@@ -584,23 +902,7 @@ impl QueueRegistry {
                         map.remove(&key);
                     }
                 }
-                // Drop the bindings that target it, or the next exchange
-                // publish would re-declare it (and it would fill unconsumed).
-                let (vhost, bare) = qualified.split_once('/').unwrap_or(("", qualified));
-                let prefix = match kind {
-                    QueueKind::Transient => "/queues/",
-                    QueueKind::Quorum => "/quorum/",
-                    QueueKind::Durable => "/durable/",
-                };
-                if let Err(e) = self
-                    .exchange_op(ExchangeOp::UnbindDestination {
-                        vhost: vhost.to_owned(),
-                        destination: format!("{prefix}{bare}"),
-                    })
-                    .await
-                {
-                    tracing::warn!(queue = %qualified, error = %e, "could not remove the deleted queue's bindings");
-                }
+                self.unbind_deleted(kind, qualified).await;
                 Ok(())
             }
             Ok(false) => Err(QueueDeleteError::Failed),
@@ -635,7 +937,6 @@ impl QueueRegistry {
     /// starts empty; then the actor stops and the old group's state is
     /// purged.
     async fn delete_quorum(&self, qualified: &str) -> Result<(), QueueDeleteError> {
-        let (vhost, bare) = qualified.split_once('/').unwrap_or(("", qualified));
         if let Some(node) = self.cluster.get().cloned() {
             match node.delete_quorum(qualified).await {
                 Ok(true) => {}
@@ -663,16 +964,44 @@ impl QueueRegistry {
             self.purge_standalone_group(&crate::cluster::group_id(qualified, current))
                 .await;
         }
-        if let Err(e) = self
-            .exchange_op(ExchangeOp::UnbindDestination {
-                vhost: vhost.to_owned(),
-                destination: format!("/quorum/{bare}"),
-            })
-            .await
-        {
-            tracing::warn!(queue = %qualified, error = %e, "could not remove the deleted queue's bindings");
-        }
+        self.unbind_deleted(QueueKind::Quorum, qualified).await;
         Ok(())
+    }
+
+    /// Drop the bindings that target a deleted queue, or the next exchange
+    /// publish would re-declare it (and it would fill unconsumed): those
+    /// naming its kind explicitly, and `/queues/<name>` ones too unless
+    /// another kind still exists under the name (they now route there).
+    async fn unbind_deleted(&self, kind: QueueKind, qualified: &str) {
+        let (vhost, bare) = qualified.split_once('/').unwrap_or(("", qualified));
+        // Its own policy goes with it (a re-declare states its own).
+        if self.declared_kinds(qualified).await.is_empty()
+            && let Err(e) = self
+                .def_write(&crate::defs::queue_policy_key(qualified), None)
+                .await
+        {
+            tracing::warn!(queue = %qualified, error = %e, "could not remove the deleted queue's policy");
+        }
+        let mut destinations = Vec::new();
+        match kind {
+            QueueKind::Quorum => destinations.push(format!("/quorum/{bare}")),
+            QueueKind::Durable => destinations.push(format!("/durable/{bare}")),
+            QueueKind::Transient => {}
+        }
+        if self.declared_kinds(qualified).await.is_empty() {
+            destinations.push(format!("/queues/{bare}"));
+        }
+        for destination in destinations {
+            if let Err(e) = self
+                .exchange_op(ExchangeOp::UnbindDestination {
+                    vhost: vhost.to_owned(),
+                    destination,
+                })
+                .await
+            {
+                tracing::warn!(queue = %qualified, error = %e, "could not remove the deleted queue's bindings");
+            }
+        }
     }
 
     /// Record a standalone quorum queue's next incarnation.
@@ -1135,7 +1464,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_is_idempotent_and_kind_scoped() {
+    async fn resolve_is_idempotent_and_one_kind_per_name() {
         let r = QueueRegistry::new(&BrokerConfig {
             max_queue_depth: 10,
             max_queues: 0,
@@ -1144,14 +1473,15 @@ mod tests {
         let a = r.resolve("/queues/q1").await.unwrap();
         let b = r.resolve("q1").await.unwrap();
         assert!(a.tx.same_channel(&b.tx), "same transient queue");
+        // q1 is transient: it cannot also become a quorum queue.
+        assert!(r.resolve("/quorum/q1").await.is_none());
 
-        let quorum = r.resolve("/quorum/q1").await.unwrap();
-        assert!(
-            !a.tx.same_channel(&quorum.tx),
-            "quorum q1 is a distinct queue from transient q1"
-        );
-        let quorum2 = r.resolve("/quorum/q1").await.unwrap();
+        // A quorum queue is reached by its explicit address and by /queues/.
+        let quorum = r.resolve("/quorum/q2").await.unwrap();
+        let quorum2 = r.resolve("/quorum/q2").await.unwrap();
+        let via_queues = r.resolve("/queues/q2").await.unwrap();
         assert!(quorum.tx.same_channel(&quorum2.tx));
+        assert!(quorum.tx.same_channel(&via_queues.tx), "/queues/ finds it");
     }
 
     /// HIGH-6 (issue #19): client addresses may not cross the

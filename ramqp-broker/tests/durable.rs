@@ -207,7 +207,7 @@ async fn durable_messages_survive_a_broker_restart() {
 
 /// `/durable/x`, `/queues/x`, and `/quorum/x` are three distinct queues.
 #[tokio::test]
-async fn durable_transient_and_quorum_coexist() {
+async fn durable_queue_is_reached_at_queues_and_holds_its_name() {
     let dir = tempfile::tempdir().expect("tempdir");
     let (addr, shutdown) = start(config_with(dir.path())).await;
     let conn = ConnectionBuilder::new(format!("amqp://{addr}"))
@@ -219,12 +219,20 @@ async fn durable_transient_and_quorum_coexist() {
     let dp = session.create_producer("/durable/same").await.expect("dp");
     let tp = session.create_producer("/queues/same").await.expect("tp");
     dp.send(Message::text("durable")).await.expect("send d");
-    tp.send(Message::text("transient")).await.expect("send t");
-
+    tp.send(Message::text("via-queues")).await.expect("send t");
+    // One queue: both messages are in the durable queue.
     let mut dc = session.create_consumer("/durable/same").await.expect("dc");
-    let mut tc = session.create_consumer("/queues/same").await.expect("tc");
     assert_eq!(text_of(&dc.recv().await.expect("d recv")), "durable");
-    assert_eq!(text_of(&tc.recv().await.expect("t recv")), "transient");
+    assert_eq!(text_of(&dc.recv().await.expect("d recv")), "via-queues");
+    // ... which a quorum queue of the same name cannot join.
+    let q = session
+        .create_producer("/quorum/same")
+        .await
+        .expect("attach");
+    assert!(
+        q.send(Message::text("x")).await.is_err(),
+        "second kind refused"
+    );
 
     conn.close().await.expect("close");
     shutdown.shutdown();

@@ -5,6 +5,51 @@ All notable changes to ramqp will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+RabbitMQ 4.x parity (issue #45).
+
+### Changed
+- **`/queues/<name>` reaches the queue declared under `<name>`, whatever
+  its kind.** It used to always mean a transient queue, so a client
+  addressing a durable or quorum queue the RabbitMQ 4.x way silently got a
+  separate in-memory queue (and lost messages on restart). A transient
+  queue is auto-declared only when nothing is declared. `/quorum/` and
+  `/durable/` still declare their kind on first use, and the config file
+  and `PUT /queues/...` still declare exactly the kind they name.
+- **A queue name holds one kind.** Attaching `/quorum/<name>` or
+  `/durable/<name>` when the name already holds another kind is refused
+  (`amqp:not-allowed`), as the admin API already did (`409`); queues of two
+  kinds left by an older version make `/queues/<name>` refuse to guess.
+- **Unroutable exchange publishes settle `released`** (was `accepted`), as
+  RabbitMQ 4.x does. With an `alternate` queue they are still `accepted`.
+
+### Fixed
+- **`header.delivery-count` on redelivery** (AMQP 1.0 §3.2.1, §3.4.5): a
+  redelivery after `modified{delivery-failed}` carries the number of failed
+  attempts, on transient, durable and quorum queues. Consumers budgeting
+  retries on it saw every redelivery as the first attempt. A plain
+  `released` does not count.
+
+### Added
+- **Per-queue policies**: `PUT /queues/...` and `[[queues]]` accept the
+  policy fields (`dead_letter`, `max_delivery_attempts`, `message_ttl_ms`,
+  `max_length`, `max_length_bytes`, `overflow`), overriding prefix policies
+  for that queue; a re-declare with a different policy is `409`.
+- **`{queue}` in a policy's `dead_letter`** expands to each queue's name
+  (`/quorum/{queue}.dlq`); the companions are not dead-lettered again.
+- **Runtime users and permissions** (`GET`/`PUT`/`DELETE /users/<name>`,
+  `GET`/`PUT`/`DELETE /permissions/<vhost>/<user>`), admin-only and never
+  public. Passwords become SCRAM verifiers on arrival and are never stored;
+  deleting a user closes its connections; configuration users stay
+  read-only. `Broker::with_runtime_users` enables them when embedding; the
+  daemon uses it whenever `[[users]]` are configured.
+- Runtime definitions (users, permissions, per-queue policies) persist in
+  the store standalone and replicate through a new metadata command when
+  clustered, gated on every node supporting it. Metadata snapshots keep the
+  0.11.0 encoding until one is written. Standalone, queues are declared only
+  once the persisted definitions are loaded.
+
 ## [ramqp-broker 0.11.0] - 2026-11-11
 
 Broker-only release: quorum-queue deletion. `ramqp` (0.8.3) and

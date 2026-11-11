@@ -212,14 +212,18 @@ async fn fe2o3_publishes_through_exchanges() {
         .value("by-subject")
         .build();
     keyless.send(msg).await.expect("accepted");
-    // Unroutable: accepted and dropped.
+    // Unroutable: settled `released` (RabbitMQ 4.x).
     let mut nowhere = Sender::attach(&mut session, "n", "/exchanges/events/billing.x")
         .await
         .unwrap();
-    nowhere
-        .send("dropped")
-        .await
-        .expect("unroutable is accepted");
+    let outcome = nowhere.send("dropped").await;
+    assert!(
+        matches!(
+            outcome,
+            Ok(fe2o3_amqp::types::messaging::Outcome::Released(_))
+        ),
+        "unroutable is released: {outcome:?}"
+    );
     // An unknown exchange is refused at attach. Checked on its own session:
     // fe2o3-amqp 0.18 mishandles the next attach right after a refused one
     // on the SAME session (it detaches the refused link twice and fails the

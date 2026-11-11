@@ -102,9 +102,15 @@ pub struct BrokerConfig {
     pub tls: Option<TlsServerConfig>,
     /// Queue policies: `(name prefix, policy)` pairs, first match wins (an
     /// empty prefix matches every queue). Matched against the normalized
-    /// queue name (no `/queues/` etc. prefix) at declaration. The management
-    /// API (Phase 9) will supersede this interim surface.
+    /// queue name (no `/queues/` etc. prefix) at declaration. A
+    /// `dead_letter` of `.../{queue}...` expands to each queue's own name
+    /// (e.g. `/quorum/{queue}.dlq`); the queues it names are not themselves
+    /// dead-lettered by that policy.
     pub policies: Vec<(String, QueuePolicy)>,
+    /// Per-queue policies: `(namespace-qualified queue name, policy)`.
+    /// Override [`Self::policies`] (and any policy set through the
+    /// management API) for exactly that queue.
+    pub queue_policies: Vec<(String, QueuePolicy)>,
 }
 
 /// Server-side TLS material, read from PEM files and **re-read when they
@@ -296,6 +302,7 @@ impl Default for BrokerConfig {
             tls_listen: None,
             tls: None,
             policies: Vec::new(),
+            queue_policies: Vec::new(),
         }
     }
 }
