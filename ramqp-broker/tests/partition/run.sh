@@ -86,6 +86,7 @@ for i in 1 2 3; do
         RAMQP_LISTEN="$SUBNET.$i:5672" \
         RAMQP_CLUSTER_LISTEN="$SUBNET.$i:7472" \
         RAMQP_SEEDS="$SEEDS" \
+        RAMQP_ALLOW_ANONYMOUS=1 \
         "$BRK" >"$LOGDIR/node$i.log" 2>&1 &
     PIDS+=($!)
 done

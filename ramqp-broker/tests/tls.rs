@@ -314,28 +314,47 @@ async fn management_endpoint_over_tls() {
 #[tokio::test(flavor = "multi_thread")]
 async fn cluster_fabric_over_mutual_tls() {
     let pki = Pki::new("cluster-ca");
-    let mut fabric_addrs = Vec::new();
-    for _ in 0..3 {
-        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        fabric_addrs.push(l.local_addr().unwrap().to_string());
-    }
-    let seeds: Vec<(u64, String)> = (1..=3u64).zip(fabric_addrs).collect();
+    // Fabric ports are reserved then released for the nodes to re-bind; a
+    // lost race (another process took one) retries on fresh ports.
     let mut nodes = Vec::new();
-    for (id, fabric) in &seeds {
-        let (cert, key) = pki.leaf_files(&format!("node{id}"));
-        let mut tls = TlsServerConfig::new(cert, key);
-        tls.client_ca_file = Some(pki.ca_file());
-        let mut member = ClusterMemberConfig::new(*id, fabric.clone(), seeds.clone());
-        member.tls = Some(tls);
-        let mut config = BrokerConfig::default();
-        config.cluster = Some(member);
-        let broker = Broker::new(config);
-        let bound = broker.clone().bind("127.0.0.1:0").await.expect("bind");
-        let addr = bound.local_addr();
-        let shutdown = bound.shutdown_handle();
-        tokio::spawn(bound.run());
-        nodes.push((broker, addr, shutdown));
+    let mut seeds: Vec<(u64, String)> = Vec::new();
+    'attempt: for _ in 0..5 {
+        let mut fabric_addrs = Vec::new();
+        for _ in 0..3 {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            fabric_addrs.push(l.local_addr().unwrap().to_string());
+        }
+        seeds = (1..=3u64).zip(fabric_addrs).collect();
+        nodes.clear();
+        for (id, fabric) in &seeds {
+            let (cert, key) = pki.leaf_files(&format!("node{id}"));
+            let mut tls = TlsServerConfig::new(cert, key);
+            tls.client_ca_file = Some(pki.ca_file());
+            let mut member = ClusterMemberConfig::new(*id, fabric.clone(), seeds.clone());
+            member.tls = Some(tls);
+            let mut config = BrokerConfig::default();
+            config.cluster = Some(member);
+            let broker = Broker::new(config);
+            let bound = match broker.clone().bind("127.0.0.1:0").await {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!("cluster start: bind lost a port race ({e}); retrying");
+                    for (_, _, sd) in &nodes {
+                        let sd: &ramqp_broker::ShutdownHandle = sd;
+                        sd.shutdown();
+                    }
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    continue 'attempt;
+                }
+            };
+            let addr = bound.local_addr();
+            let shutdown = bound.shutdown_handle();
+            tokio::spawn(bound.run());
+            nodes.push((broker, addr, shutdown));
+        }
+        break;
     }
+    assert_eq!(nodes.len(), 3, "cluster bound");
     for (broker, _, _) in &nodes {
         assert!(
             broker.cluster_formed(Duration::from_secs(20)).await,

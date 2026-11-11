@@ -13,8 +13,8 @@ broker — with no external AMQP dependencies anywhere.
 | Crate | What it is | Status |
 |---|---|---|
 | [`ramqp`](https://crates.io/crates/ramqp) | The async **client** — connects to RabbitMQ 4.x, ActiveMQ Artemis, and other AMQP 1.0 brokers | Published (0.8.3 — see [Upgrading to 0.8](#upgrading-to-08)) |
-| [`ramqp-core`](https://crates.io/crates/ramqp-core) | The role-agnostic **engine**: clean-room codec + type system, framing, session/link state machines, SASL (both directions) | Published (0.2.6) |
-| [`ramqp-broker`](https://crates.io/crates/ramqp-broker) | The **broker**: store-and-forward AMQP 1.0 server with transient, durable, and Raft-replicated quorum queues | Published (0.9.2, pre-1.0) — see [The broker](#the-broker-ramqp-broker) |
+| [`ramqp-core`](https://crates.io/crates/ramqp-core) | The role-agnostic **engine**: clean-room codec + type system, framing, session/link state machines, SASL (both directions) | Published (0.2.7) |
+| [`ramqp-broker`](https://crates.io/crates/ramqp-broker) | The **broker**: store-and-forward AMQP 1.0 server with transient, durable, and Raft-replicated quorum queues | Published (0.10.0, pre-1.0) — see [The broker](#the-broker-ramqp-broker) |
 
 Everything is `#![forbid(unsafe_code)]`, async-first, and MIT.
 
@@ -106,7 +106,7 @@ What's new is *optional*, for your `Cargo.toml` only if you want it:
 ```toml
 ramqp = "0.8"          # the client, exactly as before
 ramqp-core = "0.2"     # just the engine (codec/types/state machines), no client
-ramqp-broker = "0.9"   # embed the broker (working, pre-1.0; config API still settling)
+ramqp-broker = "0.10"  # embed the broker (working, pre-1.0; config API still settling)
 ```
 
 A client-only build never compiles broker code, and vice versa — isolation is
@@ -139,7 +139,14 @@ Working today:
   over a real TCP inter-node transport with static-seed bootstrap. Three-node
   clusters form, replicate, and survive leader failure with re-election —
   with zero committed-message loss (tested).
-- The `ramqp-brokerd` daemon.
+- **Exchanges** with RabbitMQ 4.x addressing (`/exchanges/<name>/<key>`):
+  fanout, direct, topic; confirmed once every bound queue confirms.
+- The `ramqp-brokerd` daemon with a TOML **config file**: SCRAM-verifier
+  users, per-address permissions, policies, and pre-declared topology; an
+  **admin API** (declare/delete queues, exchanges, bindings; per-queue stats
+  for autoscalers); **TLS** with certificate hot reload and fabric mTLS; and
+  a **FIPS 140-3 build** (`--features fips`, AWS-LC). Details:
+  [`ramqp-broker/README.md`](ramqp-broker/README.md).
 
 ```sh
 cargo run -p ramqp-broker --bin ramqp-brokerd -- --listen 0.0.0.0:5672

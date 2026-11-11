@@ -5,7 +5,13 @@ All notable changes to ramqp will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [ramqp-broker 0.10.0] - 2026-11-11
+
+`ramqp-broker` **0.10.0** + `ramqp-core` **0.2.7** (issue #37: replace
+RabbitMQ 4.x on FIPS-mode Kubernetes). `ramqp` stays at 0.8.3 — no client
+code changed; it picks up `ramqp-core` 0.2.7 through its `^0.2` range (the
+session-window fix below). Breaking daemon/feature changes are listed under
+**Changed**.
 
 ### Added
 - **Server TLS** (issue #37 §4; features `tls` — rustls/ring — or `fips`): an
