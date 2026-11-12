@@ -5,9 +5,10 @@ All notable changes to ramqp will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [ramqp-broker 0.12.1] - 2026-11-12
 
-Broker fixes for issue #50. `ramqp` and `ramqp-core` are unchanged.
+Broker-only release: fixes for issue #50. `ramqp` (0.8.4) and `ramqp-core`
+(0.2.8) are unchanged.
 
 ### Fixed
 - **Accepts sent right before a consumer leaves are no longer lost** (#50).
