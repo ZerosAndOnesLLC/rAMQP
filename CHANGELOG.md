@@ -5,9 +5,13 @@ All notable changes to ramqp will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.8.4] - 2026-11-11
 
-RabbitMQ 4.x parity (issue #45), and its follow-ups (issue #47).
+`ramqp` 0.8.4, `ramqp-core` 0.2.8 and `ramqp-broker` 0.12.0: RabbitMQ 4.x
+parity (issue #45), and its follow-ups (issue #47). The client changes are
+fixes plus additive API (`ErrorKind` is `#[non_exhaustive]`), so `ramqp =
+"0.8"` picks them up; see the client upgrade note below for the one
+behaviour change.
 
 **Upgrade note (access control):** `/queues/<name>` now reaches durable and
 quorum queues, and authorization matches the address as written — so an

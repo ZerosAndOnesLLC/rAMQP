@@ -1,6 +1,6 @@
 [package]
 name = "ramqp-broker"
-version = "0.11.0"
+version = "0.12.0"
 edition = "2024"
 description = "A performance-first, highly-available AMQP 1.0 broker in Rust: transient, durable, and Raft-replicated quorum queues."
 license = "MIT"
@@ -22,7 +22,7 @@ features = ["store-redb", "tls"]
 [dependencies]
 # SCRAM's crypto backend is chosen by this crate's `rustcrypto` (default) or
 # `fips` feature.
-ramqp-core = { path = "../ramqp-core", version = "0.2.7", features = ["transaction"] }
+ramqp-core = { path = "../ramqp-core", version = "0.2.8", features = ["transaction"] }
 bytes = { version = "1", features = ["serde"] }
 futures-util = "0.3"
 tokio = { version = "1", features = ["sync", "io-util", "net", "rt", "rt-multi-thread", "macros", "time", "signal"] }
