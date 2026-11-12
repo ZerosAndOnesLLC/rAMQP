@@ -1,0 +1,21 @@
+# Pre-release QA harness (`qa/prerelease.sh` drives it): workloads with a
+# delivery-guarantee checker, a fault-injecting TCP proxy, benchmarks with
+# baselines, differential runs against other brokers, and resource sampling.
+#
+# A workspace member, but off the default build and never published:
+# build explicitly with `cargo build -p ramqp-qa --release`.
+[package]
+name = "ramqp-qa"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Pre-release QA harness for ramqp and ramqp-broker."
+
+[dependencies]
+ramqp = { path = "../ramqp" }
+tokio = { version = "1", features = ["full"] }
+futures-util = "0.3"
+bytes = "1"
+clap = { version = "4.6.7", features = ["derive"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"

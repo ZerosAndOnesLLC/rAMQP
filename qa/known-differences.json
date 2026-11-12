@@ -1,0 +1,5 @@
+{
+  "rabbitmq": {
+    "missing_queue_attach": "by design: ramqp-broker auto-declares a transient queue for an undeclared /queues/<name> (RabbitMQ 4.x requires a declared queue)"
+  }
+}

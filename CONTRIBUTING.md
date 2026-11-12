@@ -12,7 +12,7 @@ Thank you for your interest in contributing to ramqp. This document covers the p
 
 ## Workspace layout
 
-The repo is a Cargo workspace of four crates — know where your change goes:
+The repo is a Cargo workspace — know where your change goes:
 
 | Crate | Contents |
 |---|---|
@@ -20,10 +20,11 @@ The repo is a Cargo workspace of four crates — know where your change goes:
 | `ramqp/` | The published client (public API, resilience, dial-side transport, client driver). Its public surface is locked by `ramqp/tests/public_api.rs` — if that test breaks, you changed the API. |
 | `ramqp-broker/` | The broker (acceptor, connection driver, queues, cluster). Plan + status: [`broker.md`](broker.md). |
 | `bench-compare/` | Dev-only benchmark harness (never published; the only place `fe2o3-amqp` may appear). |
+| `qa/` | Pre-release QA harness (`ramqp-qa`, never published) and `qa/prerelease.sh`, which runs every check before a release. See [`qa/README.md`](qa/README.md). |
 
 All the usual commands run from the repo root and cover the workspace's
-default members. `bench-compare` is off the default set — build it explicitly
-with `-p ramqp-bench-compare`.
+default members. `bench-compare` and `qa` are off the default set — build them
+explicitly with `-p ramqp-bench-compare` / `-p ramqp-qa`.
 
 ## Development Setup
 

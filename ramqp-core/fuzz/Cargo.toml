@@ -1,8 +1,8 @@
 # Fuzz targets for ramqp-core's untrusted-wire decoders. Its own `[workspace]`
 # table decouples it from the parent workspace, so a normal `cargo build` /
 # `cargo check --all-targets` at the repo root never pulls in libfuzzer or the
-# nightly sanitizer toolchain. Run via `scripts/60-fuzz.sh` (needs nightly +
-# cargo-fuzz).
+# nightly sanitizer toolchain. Run via `qa/prerelease.sh --only fuzz` (needs
+# nightly + cargo-fuzz), or `cargo +nightly fuzz run <target>` from ramqp-core.
 [package]
 name = "ramqp-core-fuzz"
 version = "0.0.0"
