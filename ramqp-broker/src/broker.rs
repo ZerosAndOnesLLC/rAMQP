@@ -188,6 +188,26 @@ impl Broker {
                 });
             }
         }
+        // Start the queues on disk once the on-disk state is loaded (#50):
+        // until then a restarted broker's queue listing and `/metrics` miss
+        // every persisted backlog nobody has attached to yet. In the
+        // background: recovery reads stores and starts Raft groups.
+        {
+            let weak = Arc::downgrade(&self.registry);
+            tokio::spawn(async move {
+                loop {
+                    let Some(registry) = weak.upgrade() else {
+                        return;
+                    };
+                    if registry.ensure_defs_loaded().await {
+                        registry.recover_disk_queues().await;
+                        return;
+                    }
+                    drop(registry);
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
+            });
+        }
         if self.registry.cluster().is_none() && !self.registry.ensure_exchanges_loaded().await {
             // Standalone with a store that is not openable yet (e.g. the
             // previous instance's lock lingers): exchange attaches/changes

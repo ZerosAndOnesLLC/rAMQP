@@ -254,7 +254,11 @@ user with `admin = true`. Reads are open unless `management_auth_reads = true`
 Runtime users, permissions and per-queue policies persist: in the store
 (`data_dir`) standalone, in the metadata Raft group when clustered — where
 they need every node on a version that supports them (`503` otherwise).
-Without either they last until the broker stops. Runtime users need the
+Without either they last until the broker stops. After a restart, the
+queues on disk (durable, and standalone quorum) are started in the
+background as soon as the definitions are loaded, so `GET /queues` and
+`/metrics` report a backlog that survived the restart before any client
+attaches. Runtime users need the
 built-in user store (`[[users]]` in the config file, or
 `Broker::with_runtime_users` when embedding).
 

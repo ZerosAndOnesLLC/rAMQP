@@ -139,6 +139,9 @@ enum InitAbort {
     Orphaned,
 }
 
+/// Queues started at once by [`QueueRegistry::recover_disk_queues`].
+const RECOVERY_CONCURRENCY: usize = 8;
+
 /// Resolves addresses to queue actors, declaring queues on first use.
 ///
 /// The map is guarded by a *std* mutex held only for the O(1) get-or-insert of
@@ -1092,9 +1095,9 @@ impl QueueRegistry {
     }
 
     /// Find a declared queue (of `kind`, or any kind preferring quorum,
-    /// durable, transient). A durable queue with persisted messages but no
-    /// live actor (not attached since a restart) is recovered so callers see
-    /// its real contents.
+    /// durable, transient). A durable or standalone quorum queue on disk but
+    /// with no live actor (not attached since a restart) is recovered so
+    /// callers see its real contents.
     pub async fn find_queue(
         &self,
         kind: Option<QueueKind>,
@@ -1121,6 +1124,22 @@ impl QueueRegistry {
                 return Some((QueueKind::Quorum, h));
             }
         }
+        // A standalone quorum queue on disk (#50): the admin API must see a
+        // backlog that survived a restart before anything attaches — an
+        // autoscaler reads it to decide whether to start a consumer at all.
+        if kinds.contains(&QueueKind::Quorum)
+            && self.cluster.get().is_none()
+            && self
+                .disk_quorum
+                .lock()
+                .expect("disk index lock")
+                .contains(qualified)
+        {
+            let vhost = qualified.split_once('/').map_or("", |(v, _)| v);
+            if let Some(h) = self.resolve_name(QueueKind::Quorum, qualified, vhost).await {
+                return Some((QueueKind::Quorum, h));
+            }
+        }
         #[cfg(feature = "store-redb")]
         if kinds.contains(&QueueKind::Durable)
             && self.data_dir.is_some()
@@ -1136,6 +1155,47 @@ impl QueueRegistry {
             }
         }
         None
+    }
+
+    /// Start every queue this node has on disk — durable queues, and
+    /// standalone quorum queues at their current incarnation — so the queue
+    /// listing and `/metrics` report a backlog that survived a restart
+    /// before anything attaches (#50). A few at a time: each one reads its
+    /// rows (durable) or starts its Raft group (quorum). Call once the
+    /// on-disk state is loaded; a queue already running is left as is.
+    pub async fn recover_disk_queues(&self) {
+        use futures_util::StreamExt;
+        let mut names: Vec<(QueueKind, String)> = Vec::new();
+        if self.cluster.get().is_none() {
+            names.extend(
+                self.disk_quorum
+                    .lock()
+                    .expect("disk index lock")
+                    .iter()
+                    .map(|n| (QueueKind::Quorum, n.clone())),
+            );
+        }
+        names.extend(
+            self.disk_durable
+                .lock()
+                .expect("disk index lock")
+                .iter()
+                .map(|n| (QueueKind::Durable, n.clone())),
+        );
+        if names.is_empty() {
+            return;
+        }
+        let total = names.len();
+        let recovered = futures_util::stream::iter(names)
+            .map(|(kind, name)| async move {
+                let vhost = name.split_once('/').map_or("", |(v, _)| v).to_owned();
+                self.resolve_name(kind, &name, &vhost).await.is_some()
+            })
+            .buffer_unordered(RECOVERY_CONCURRENCY)
+            .filter(|ok| std::future::ready(*ok))
+            .count()
+            .await;
+        tracing::info!(recovered, total, "queues on disk recovered at startup");
     }
 
     /// Which kinds currently have a live queue under this qualified name.

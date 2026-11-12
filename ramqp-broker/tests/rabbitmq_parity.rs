@@ -1247,3 +1247,110 @@ async fn transactional_reject_dead_letters_on_commit_only() {
     conn.close().await.unwrap();
     r.shutdown.shutdown();
 }
+
+// ---------------------------------------------------------------- #50
+
+/// After a restart the admin API and `/metrics` report the queues on disk
+/// before anything attaches: a standalone quorum queue's `GET` is its
+/// backlog (not `404`), and the listing and metrics include both durable and
+/// quorum queues. An autoscaler reading them must see the backlog to start
+/// a consumer at all.
+#[cfg(feature = "store-redb")]
+#[tokio::test]
+async fn queues_on_disk_are_visible_after_restart_before_any_attach() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = BrokerConfig::default();
+    config.data_dir = Some(dir.path().to_path_buf());
+    let r = start(config.clone(), None).await;
+    for (name, kind) in [("qq", "quorum"), ("dq", "durable")] {
+        let body = format!(r#"{{"kind":"{kind}"}}"#);
+        let path = format!("/queues/%2F/{name}");
+        assert_eq!(http(&r.mgmt, "PUT", &path, &body).await.0, 201);
+    }
+    let conn = ConnectionBuilder::new(format!("amqp://{}", r.addr))
+        .connect()
+        .await
+        .unwrap();
+    let s = conn.begin_session().await.unwrap();
+    for address in ["/queues/qq", "/queues/dq"] {
+        let p = s.create_producer(address).await.unwrap();
+        for _ in 0..5 {
+            p.send(Message::text("backlog")).await.unwrap();
+        }
+    }
+    conn.close().await.unwrap();
+    r.shutdown.shutdown();
+    drop(r); // releases the store
+
+    let r = start(config, None).await;
+    // The listing and metrics fill in as the queues on disk are recovered.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let listed = loop {
+        let (status, body) = http(&r.mgmt, "GET", "/queues", "").await;
+        assert_eq!(status, 200, "{body}");
+        if body.contains("\"name\":\"qq\"") && body.contains("\"name\":\"dq\"") {
+            break body;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "queues on disk never listed: {body}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    let listed: serde_json::Value = serde_json::from_str(&listed).unwrap();
+    for q in listed.as_array().unwrap() {
+        assert_eq!(q["ready"], 5, "{q}");
+    }
+    let (_, metrics) = http(&r.mgmt, "GET", "/metrics", "").await;
+    for line in [
+        r#"ramqp_queue_ready{queue="qq",kind="quorum"} 5"#,
+        r#"ramqp_queue_ready{queue="dq",kind="durable"} 5"#,
+    ] {
+        assert!(metrics.contains(line), "missing `{line}` in:\n{metrics}");
+    }
+    for name in ["qq", "dq"] {
+        let (status, body) = http(&r.mgmt, "GET", &format!("/queues/%2F/{name}"), "").await;
+        assert_eq!(status, 200, "{name}: {body}");
+        let q: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(q["ready"], 5, "{name}: {body}");
+    }
+    r.shutdown.shutdown();
+}
+
+/// A standalone quorum queue on disk is found by `GET` even if nothing has
+/// started it yet (the lookup recovers it itself, like a durable queue).
+#[cfg(feature = "store-redb")]
+#[tokio::test]
+async fn quorum_queue_get_recovers_it_on_demand() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = BrokerConfig::default();
+    config.data_dir = Some(dir.path().to_path_buf());
+    let r = start(config.clone(), None).await;
+    assert_eq!(
+        http(&r.mgmt, "PUT", "/queues/%2F/lazy", r#"{"kind":"quorum"}"#)
+            .await
+            .0,
+        201
+    );
+    let conn = ConnectionBuilder::new(format!("amqp://{}", r.addr))
+        .connect()
+        .await
+        .unwrap();
+    let s = conn.begin_session().await.unwrap();
+    let p = s.create_producer("/quorum/lazy").await.unwrap();
+    for _ in 0..3 {
+        p.send(Message::text("x")).await.unwrap();
+    }
+    conn.close().await.unwrap();
+    r.shutdown.shutdown();
+    drop(r);
+
+    // Straight after the restart, whether or not startup recovery has
+    // reached it yet.
+    let r = start(config, None).await;
+    let (status, body) = http(&r.mgmt, "GET", "/queues/%2F/lazy?kind=quorum", "").await;
+    assert_eq!(status, 200, "{body}");
+    let q: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(q["ready"], 3, "{body}");
+    r.shutdown.shutdown();
+}

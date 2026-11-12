@@ -881,10 +881,10 @@ impl<S: IoStream> BrokerConnection<S> {
     }
 
     /// Forward only settlements that are resolved RIGHT NOW — no wait. Used
-    /// on the coordinator control path, where the client's pipelined
-    /// transactional dispositions were already processed synchronously by
+    /// where the peer's dispositions were already processed synchronously by
     /// the session in an earlier frame, so their settlement futures are
-    /// ready (or never will be). `unconstrained` bypasses the tokio-coop
+    /// ready (or never will be): on the coordinator control path, and before
+    /// a consumer's `Unsubscribe` on detach or session end (#50). `unconstrained` bypasses the tokio-coop
     /// budget so a ready oneshot isn't misread as pending; unlike the 20 ms
     /// cleanup drain this adds no per-control-message latency (MED-13: every
     /// declare/discharge previously stalled the whole connection ~20 ms).
@@ -2231,6 +2231,15 @@ impl<S: IoStream> BrokerConnection<S> {
                 LinkEvent::Detached { handle, .. } => {
                     match self.bindings.remove(&(channel, handle.0)) {
                         Some(Binding::Consumer { queue, sub, .. }) => {
+                            // Settlements the peer sent before this detach
+                            // (#50) go to the queue first: `Unsubscribe`
+                            // requeues whatever the subscriber still holds,
+                            // so an accept forwarded after it matches nothing
+                            // and the message is redelivered. The session has
+                            // already processed those dispositions, so their
+                            // settlement futures are ready; the queue's
+                            // mailbox keeps the order.
+                            self.drain_ready_settlements_now().await;
                             let _ = queue.tx.send(QueueMsg::Unsubscribe { sub }).await;
                         }
                         // A coordinator link detaching orphans this
@@ -2333,8 +2342,11 @@ impl<S: IoStream> BrokerConnection<S> {
         self.release_session_bindings(local).await;
     }
 
-    /// Unbind every link on a session, unsubscribing its consumers.
+    /// Unbind every link on a session, unsubscribing its consumers — after
+    /// forwarding the settlements the peer sent before its `end` (#50; see
+    /// the detach path).
     async fn release_session_bindings(&mut self, local: u16) {
+        self.drain_ready_settlements_now().await;
         let keys: Vec<_> = self
             .bindings
             .keys()
