@@ -252,6 +252,17 @@ struct Stored {
     enqueued_ms: u64,
 }
 
+/// Put a message back on the ready list at its place by id. Ids grow with
+/// enqueue order and `ready` is kept sorted, so redelivery stays in publish
+/// order however many messages come back, and in whatever order (#50: a
+/// departing consumer's in-flights arrive as individual requeues, in no
+/// particular order, ahead of its unsubscribe). A requeued message is
+/// almost always near the head, where the insert is cheap.
+fn requeue(ready: &mut VecDeque<Stored>, stored: Stored) {
+    let at = ready.partition_point(|m| m.id < stored.id);
+    ready.insert(at, stored);
+}
+
 /// Spawn a queue actor; the returned handle is its only address.
 pub(crate) fn spawn(name: String, policy: EffectivePolicy) -> QueueHandle {
     let (tx, rx) = mpsc::channel(1024);
@@ -378,14 +389,14 @@ async fn run(name: String, mut rx: mpsc::Receiver<QueueMsg>, policy: EffectivePo
                             bytes = bytes.saturating_sub(stored.body.len());
                             policy.dead_letter(&name, "rejected", stored.body);
                         }
-                        SettleOutcome::Requeue => ready.push_front(stored),
+                        SettleOutcome::Requeue => requeue(&mut ready, stored),
                         SettleOutcome::RequeueFailed => {
                             stored.failures += 1;
                             if policy.attempts_exhausted(stored.failures) {
                                 bytes = bytes.saturating_sub(stored.body.len());
                                 policy.dead_letter(&name, "delivery-limit", stored.body);
                             } else {
-                                ready.push_front(stored);
+                                requeue(&mut ready, stored);
                             }
                         }
                     }
@@ -407,16 +418,15 @@ async fn run(name: String, mut rx: mpsc::Receiver<QueueMsg>, policy: EffectivePo
             }
             QueueMsg::Unsubscribe { sub } => {
                 subs.retain(|s| s.id != sub);
-                // Requeue everything that subscriber held, oldest first.
-                let mut orphaned: Vec<u64> = unacked
+                // Requeue everything that subscriber held, in id order.
+                let orphaned: Vec<u64> = unacked
                     .iter()
                     .filter(|(_, (_, owner))| *owner == sub)
                     .map(|(id, _)| *id)
                     .collect();
-                orphaned.sort_unstable();
-                for id in orphaned.into_iter().rev() {
+                for id in orphaned {
                     if let Some((stored, _)) = unacked.remove(&id) {
-                        ready.push_front(stored);
+                        requeue(&mut ready, stored);
                     }
                 }
             }
@@ -544,16 +554,15 @@ async fn dispatch(
             // and requeue everything ELSE it held (without a clean
             // Unsubscribe those in-flights would strand forever, MED-9).
             tracing::debug!(queue = %name, sub = sub_id, "subscriber connection closed");
-            ready.push_front(msg);
-            let mut orphaned: Vec<u64> = unacked
+            requeue(ready, msg);
+            let orphaned: Vec<u64> = unacked
                 .iter()
                 .filter(|(_, (_, owner))| *owner == sub_id)
                 .map(|(id, _)| *id)
                 .collect();
-            orphaned.sort_unstable();
-            for id in orphaned.into_iter().rev() {
+            for id in orphaned {
                 if let Some((stored, _)) = unacked.remove(&id) {
-                    ready.push_front(stored);
+                    requeue(ready, stored);
                 }
             }
             subs.retain(|s| s.id != sub_id);

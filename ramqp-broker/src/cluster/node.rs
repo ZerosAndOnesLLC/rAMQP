@@ -319,6 +319,24 @@ impl ClusterNode {
             .ok_or_else(|| std::io::Error::other("no leader after wait"))
     }
 
+    /// Wait until the metadata group has a leader and this node has applied
+    /// every entry it holds — so its view of the runtime definitions (queue
+    /// policies, …) is current after a restart, not just whatever its last
+    /// snapshot held. `false` on timeout.
+    pub(crate) async fn await_meta_caught_up(&self, timeout: Duration) -> bool {
+        self.meta
+            .wait(Some(timeout))
+            .metrics(
+                |m| {
+                    m.current_leader.is_some()
+                        && m.last_applied.map(|id| id.index) >= m.last_log_index
+                },
+                "metadata caught up",
+            )
+            .await
+            .is_ok()
+    }
+
     /// Whether [`stop`](ClusterNode::stop) has begun (proxies abort their
     /// leader-rebind loops instead of spinning against a dead node).
     pub(crate) fn is_stopping(&self) -> bool {

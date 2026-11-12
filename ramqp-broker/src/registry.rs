@@ -139,6 +139,9 @@ enum InitAbort {
     Orphaned,
 }
 
+/// Queues started at once by [`QueueRegistry::recover_disk_queues`].
+const RECOVERY_CONCURRENCY: usize = 8;
+
 /// Resolves addresses to queue actors, declaring queues on first use.
 ///
 /// The map is guarded by a *std* mutex held only for the O(1) get-or-insert of
@@ -187,6 +190,9 @@ pub(crate) struct QueueRegistry {
     disk_durable: std::sync::Mutex<std::collections::HashSet<String>>,
     /// Standalone quorum queues on disk at their current incarnation.
     disk_quorum: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Whether the startup recovery of queues on disk has been started
+    /// (once per broker, however many listeners it binds).
+    disk_recovery_claimed: std::sync::atomic::AtomicBool,
     /// Declarations of one name are serialized (striped by name hash), so
     /// two kinds can never be declared under one name concurrently.
     declare_locks: Vec<tokio::sync::Mutex<()>>,
@@ -240,6 +246,7 @@ impl QueueRegistry {
             ),
             disk_durable: std::sync::Mutex::new(std::collections::HashSet::new()),
             disk_quorum: std::sync::Mutex::new(std::collections::HashSet::new()),
+            disk_recovery_claimed: std::sync::atomic::AtomicBool::new(false),
             declare_locks: (0..64).map(|_| tokio::sync::Mutex::new(())).collect(),
             defs_write: tokio::sync::Mutex::new(()),
             defs_hook: OnceLock::new(),
@@ -1092,9 +1099,9 @@ impl QueueRegistry {
     }
 
     /// Find a declared queue (of `kind`, or any kind preferring quorum,
-    /// durable, transient). A durable queue with persisted messages but no
-    /// live actor (not attached since a restart) is recovered so callers see
-    /// its real contents.
+    /// durable, transient). A durable or standalone quorum queue on disk but
+    /// with no live actor (not attached since a restart) is recovered so
+    /// callers see its real contents.
     pub async fn find_queue(
         &self,
         kind: Option<QueueKind>,
@@ -1121,21 +1128,118 @@ impl QueueRegistry {
                 return Some((QueueKind::Quorum, h));
             }
         }
+        // A standalone quorum queue on disk (#50): the admin API must see a
+        // backlog that survived a restart before anything attaches — an
+        // autoscaler reads it to decide whether to start a consumer at all.
+        // The on-disk index is loaded first (it may not be yet, if the store
+        // wasn't openable at startup).
+        if kinds.contains(&QueueKind::Quorum)
+            && self.cluster.get().is_none()
+            && self.ensure_defs_loaded().await
+            && let Some(h) = self.recover_from_disk(QueueKind::Quorum, qualified).await
+        {
+            return Some((QueueKind::Quorum, h));
+        }
         #[cfg(feature = "store-redb")]
         if kinds.contains(&QueueKind::Durable)
             && self.data_dir.is_some()
-            && let Some(store) = self.store().await
-            && store.has_queue(qualified).unwrap_or(false)
+            && let Some(h) = self.recover_from_disk(QueueKind::Durable, qualified).await
         {
-            let vhost = qualified.split_once('/').map_or("", |(v, _)| v);
-            if let Some(h) = self
-                .resolve_name(QueueKind::Durable, qualified, vhost)
-                .await
-            {
-                return Some((QueueKind::Durable, h));
-            }
+            return Some((QueueKind::Durable, h));
         }
         None
+    }
+
+    /// Start a queue of `kind` that is on disk but not running — under the
+    /// name's declaration lock, re-checking it is still on disk there. A
+    /// delete holds the same lock until the queue is gone from disk, so a
+    /// lookup racing it can never re-create the queue it is deleting (#50).
+    /// `None` if it isn't on disk (any more).
+    async fn recover_from_disk(&self, kind: QueueKind, qualified: &str) -> Option<QueueHandle> {
+        let _declaring = self.declare_lock(qualified).lock().await;
+        if let Some(h) = self.lookup(kind, qualified) {
+            return Some(h);
+        }
+        if !self.on_disk(kind, qualified).await {
+            return None;
+        }
+        let vhost = qualified.split_once('/').map_or("", |(v, _)| v);
+        self.resolve_name(kind, qualified, vhost).await
+    }
+
+    /// Whether a queue of `kind` is on disk: the standalone quorum index, or
+    /// the durable store (which a durable delete purges before it returns).
+    async fn on_disk(&self, kind: QueueKind, qualified: &str) -> bool {
+        match kind {
+            QueueKind::Quorum => self
+                .disk_quorum
+                .lock()
+                .expect("disk index lock")
+                .contains(qualified),
+            #[cfg(feature = "store-redb")]
+            QueueKind::Durable => match self.store().await {
+                Some(store) => store.has_queue(qualified).unwrap_or(false),
+                None => false,
+            },
+            _ => false,
+        }
+    }
+
+    /// `true` exactly once: whoever gets it runs the startup recovery of the
+    /// queues on disk ([`recover_disk_queues`](Self::recover_disk_queues)).
+    pub fn claim_disk_recovery(&self) -> bool {
+        !self
+            .disk_recovery_claimed
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+    }
+
+    /// Start every queue this node has on disk — durable queues, and
+    /// standalone quorum queues at their current incarnation — so the queue
+    /// listing and `/metrics` report a backlog that survived a restart
+    /// before anything attaches (#50). A few at a time: each one reads its
+    /// rows (durable) or starts its Raft group (quorum). Call once the
+    /// on-disk state is loaded; a queue already running is left as is.
+    pub async fn recover_disk_queues(&self) {
+        use futures_util::StreamExt;
+        let mut names: Vec<(QueueKind, String)> = Vec::new();
+        if self.cluster.get().is_none() {
+            names.extend(
+                self.disk_quorum
+                    .lock()
+                    .expect("disk index lock")
+                    .iter()
+                    .map(|n| (QueueKind::Quorum, n.clone())),
+            );
+        }
+        names.extend(
+            self.disk_durable
+                .lock()
+                .expect("disk index lock")
+                .iter()
+                .map(|n| (QueueKind::Durable, n.clone())),
+        );
+        if names.is_empty() {
+            return;
+        }
+        let total = names.len();
+        // Each one re-checked under its name's lock: a queue deleted since
+        // the names were read is skipped, never re-created.
+        let recovered = futures_util::stream::iter(names)
+            .map(|(kind, name)| async move { self.recover_from_disk(kind, &name).await.is_some() })
+            .buffer_unordered(RECOVERY_CONCURRENCY)
+            .filter(|ok| std::future::ready(*ok))
+            .count()
+            .await;
+        if recovered < total {
+            tracing::warn!(
+                recovered,
+                total,
+                "not every queue on disk was recovered at startup (deleted meanwhile, or over \
+                 max_queues / max_queues_per_vhost); the rest start on first use"
+            );
+        } else {
+            tracing::info!(recovered, total, "queues on disk recovered at startup");
+        }
     }
 
     /// Which kinds currently have a live queue under this qualified name.
@@ -1163,6 +1267,9 @@ impl QueueRegistry {
             .find_queue(Some(kind), qualified)
             .await
             .ok_or(QueueDeleteError::NotFound)?;
+        // Held until the queue is gone from disk: a lookup racing this delete
+        // must not start the queue again from its rows (#50).
+        let _deleting = self.declare_lock(qualified).lock().await;
         let (tx, rx) = tokio::sync::oneshot::channel();
         if handle
             .tx
@@ -1233,6 +1340,10 @@ impl QueueRegistry {
                 .find_queue(Some(QueueKind::Quorum), qualified)
                 .await
                 .ok_or(QueueDeleteError::NotFound)?;
+            // Held until the queue is gone from disk, and the name leaves the
+            // on-disk index first: a lookup racing this delete must not start
+            // a fresh group at the new incarnation (#50).
+            let _deleting = self.declare_lock(qualified).lock().await;
             let current = self
                 .standalone_incarnation(qualified)
                 .await
@@ -1240,6 +1351,7 @@ impl QueueRegistry {
             self.set_standalone_incarnation(qualified, current + 1)
                 .await
                 .map_err(QueueDeleteError::Unavailable)?;
+            self.note_deleted(QueueKind::Quorum, qualified);
             let (tx, rx) = tokio::sync::oneshot::channel();
             let _ = handle.tx.send(QueueMsg::Delete { reply: tx }).await;
             let _ = rx.await;
