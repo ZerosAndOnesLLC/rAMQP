@@ -1,5 +1,9 @@
 {
   "rabbitmq": {
     "missing_queue_attach": "by design: ramqp-broker auto-declares a transient queue for an undeclared /queues/<name> (RabbitMQ 4.x requires a declared queue)"
+  },
+  "artemis": {
+    "unsettled_close_redelivers": "Artemis does not count a delivery lost with its consumer in delivery-count; ramqp-broker follows RabbitMQ 4.x (it does, #54)",
+    "first_acquirer": "Artemis never sets first-acquirer; ramqp-broker follows RabbitMQ 4.x (true on a first delivery, #54)"
   }
 }

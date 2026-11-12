@@ -522,21 +522,21 @@ async fn first_acquirer(url: &str, address: &str) -> Result<String, String> {
     send(&s, address, vec![Message::text("fa")]).await?;
     let mut c = s.create_consumer(address).await.map_err(err)?;
     let d = recv(&mut c, 5000).await.ok_or("nothing delivered")?;
+    // An absent header means the defaults (AMQP 1.0 §3.2.1): first-acquirer
+    // false. Compare the value, not whether a header was sent.
     let first = d
         .message()
         .ok()
-        .and_then(|m| m.header)
-        .map(|h| h.first_acquirer);
+        .map(|m| m.header.unwrap_or_default().first_acquirer);
     c.release(&d).await.map_err(err)?;
     let d2 = recv(&mut c, 5000).await.ok_or("not redelivered")?;
     let second = d2
         .message()
         .ok()
-        .and_then(|m| m.header)
-        .map(|h| h.first_acquirer);
+        .map(|m| m.header.unwrap_or_default().first_acquirer);
     c.accept(&d2).await.map_err(err)?;
     let _ = conn.close().await;
-    let show = |v: Option<bool>| v.map_or("no header".into(), |b| b.to_string());
+    let show = |v: Option<bool>| v.map_or("undecodable".into(), |b| b.to_string());
     Ok(format!(
         "first {}, after release {}",
         show(first),
