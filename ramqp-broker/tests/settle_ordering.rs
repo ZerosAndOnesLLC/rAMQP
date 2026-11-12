@@ -83,26 +83,38 @@ enum Exit {
     Close,
 }
 
-/// Messages left on `address` (drained over a direct connection).
-async fn remaining(addr: SocketAddr, address: &str) -> usize {
+/// The next `count` messages on `address` (over a direct connection), by
+/// body. Queues redeliver in publish order, so a redelivered accept (an
+/// earlier message) would show up first — no idle wait needed to spot it.
+async fn next_messages(addr: SocketAddr, address: &str, count: usize) -> Vec<String> {
+    use ramqp::codec::Value;
+    use ramqp::types::messaging::Body;
     let conn = ConnectionBuilder::new(format!("amqp://{addr}"))
         .connect()
         .await
         .unwrap();
     let s = conn.begin_session().await.unwrap();
     let mut c = s.create_consumer(address).await.unwrap();
-    let mut n = 0;
-    while let Ok(Ok(d)) = tokio::time::timeout(Duration::from_millis(300), c.recv()).await {
+    let mut got = Vec::new();
+    for _ in 0..count {
+        let d = tokio::time::timeout(Duration::from_secs(10), c.recv())
+            .await
+            .unwrap_or_else(|_| panic!("{address}: only {got:?} arrived"))
+            .unwrap();
+        got.push(match d.message().unwrap().body {
+            Body::Value(Value::String(text)) => text,
+            other => panic!("unexpected body {other:?}"),
+        });
         c.accept(&d).await.unwrap();
-        n += 1;
     }
     conn.close().await.ok();
-    n
+    got
 }
 
 /// Run `ROUNDS` rounds (a fresh queue each): publish `MESSAGES`, accept
 /// `ACCEPTED` through `client`, exit at once, and check exactly the
-/// accepted ones are gone.
+/// accepted ones are gone and the rest come back in publish order (the
+/// departing consumer's unsettled in-flights included).
 async fn rounds(addr: SocketAddr, client: SocketAddr, prefix: &str, tag: &str, exit: Exit) {
     for round in 0..ROUNDS {
         let address = format!("{prefix}{tag}-{exit:?}-{round}");
@@ -154,10 +166,11 @@ async fn rounds(addr: SocketAddr, client: SocketAddr, prefix: &str, tag: &str, e
                 drop(c);
             }
         }
+        let expected: Vec<String> = (ACCEPTED..MESSAGES).map(|i| format!("msg-{i}")).collect();
         assert_eq!(
-            remaining(addr, &address).await,
-            MESSAGES - ACCEPTED,
-            "{address}: accepted messages were redelivered"
+            next_messages(addr, &address, MESSAGES - ACCEPTED).await,
+            expected,
+            "{address}: accepted messages redelivered, or the rest out of order"
         );
     }
 }

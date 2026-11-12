@@ -170,40 +170,58 @@ impl Broker {
             // Standalone: finish any quorum-queue delete a crash interrupted.
             self.registry.gc_quorum_groups().await;
             // Runtime definitions (per-queue policies, users, permissions):
-            // retried in the background if the store is not openable yet.
+            // retried in the background (by the recovery task below) if the
+            // store is not openable yet.
             if let Err(e) = self.registry.load_defs().await {
                 tracing::warn!(error = %e, "runtime definitions not loaded yet; retrying");
-                let weak = Arc::downgrade(&self.registry);
-                tokio::spawn(async move {
-                    loop {
-                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                        let Some(registry) = weak.upgrade() else {
-                            return;
-                        };
-                        if registry.load_defs().await.is_ok() {
-                            tracing::info!("runtime definitions loaded");
-                            return;
-                        }
-                    }
-                });
             }
         }
         // Start the queues on disk once the on-disk state is loaded (#50):
         // until then a restarted broker's queue listing and `/metrics` miss
         // every persisted backlog nobody has attached to yet. In the
-        // background: recovery reads stores and starts Raft groups.
-        {
+        // background (recovery reads stores and starts Raft groups), and once
+        // per broker however many listeners it binds.
+        if self.registry.claim_disk_recovery() {
             let weak = Arc::downgrade(&self.registry);
             tokio::spawn(async move {
+                let mut retried = false;
                 loop {
                     let Some(registry) = weak.upgrade() else {
                         return;
                     };
                     if registry.ensure_defs_loaded().await {
-                        registry.recover_disk_queues().await;
+                        if retried {
+                            tracing::info!("runtime definitions loaded");
+                        }
+                        // Clustered: the queues' own policies come from the
+                        // metadata group — wait for this node to catch up on
+                        // it, or a queue would start with a stale policy and
+                        // keep it (durable queues on disk recover here).
+                        if let Some(node) = registry.cluster().cloned() {
+                            drop(registry);
+                            while !node
+                                .await_meta_caught_up(std::time::Duration::from_secs(30))
+                                .await
+                            {
+                                if node.is_stopping() {
+                                    return;
+                                }
+                                tracing::info!(
+                                    "waiting for the metadata group before recovering queues on disk"
+                                );
+                            }
+                            let Some(registry) = weak.upgrade() else {
+                                return;
+                            };
+                            registry.sync_defs();
+                            registry.recover_disk_queues().await;
+                        } else {
+                            registry.recover_disk_queues().await;
+                        }
                         return;
                     }
                     drop(registry);
+                    retried = true;
                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 }
             });

@@ -18,16 +18,23 @@ Broker fixes for issue #50. `ramqp` and `ramqp-core` are unchanged.
   every time the frames arrived together (a proxy, `kubectl
   port-forward`), and often even over loopback. The broker now passes on
   every settlement it has already received before releasing the consumer.
-  Closing the connection was already handled.
+  Closing the connection was already handled. A transient queue also puts
+  messages coming back to it (released, or held by a departing consumer)
+  at their place by id, so redelivery stays in publish order.
 - **The admin API and `/metrics` see queues on disk right after a
   restart** (#50). A standalone quorum queue nobody had attached to since
   the restart returned `404` from `GET /queues/<vhost>/<name>`, and both
   quorum and durable queues were missing from `GET /queues` and `/metrics`
   until something touched them. An autoscaler reading the backlog would
   never start a consumer for it. The broker now starts every queue on disk
-  once its definitions are loaded (a few at a time, in the background),
-  and the single-queue lookup also recovers a standalone quorum queue on
-  demand.
+  once its definitions are loaded (a few at a time, in the background;
+  clustered, once the node has caught up with the metadata group, so a
+  queue never starts with a stale policy), and the single-queue lookup also
+  recovers a standalone quorum queue on demand.
+- **A `GET` racing a `DELETE` no longer brings the queue back.** A delete
+  now holds the name's declaration lock until the queue is gone from disk,
+  and recovering a queue from disk (by a lookup or at startup) re-checks
+  it under the same lock.
 
 ## [0.8.4] - 2026-11-11
 

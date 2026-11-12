@@ -1354,3 +1354,44 @@ async fn quorum_queue_get_recovers_it_on_demand() {
     assert_eq!(q["ready"], 3, "{body}");
     r.shutdown.shutdown();
 }
+
+/// A `GET` racing a `DELETE` never brings the deleted queue back: once the
+/// delete returns, the queue is gone for good (not re-created, empty, from
+/// what was left on disk).
+#[cfg(feature = "store-redb")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn get_racing_delete_never_resurrects_the_queue() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = BrokerConfig::default();
+    config.data_dir = Some(dir.path().to_path_buf());
+    let r = start(config, None).await;
+    for kind in ["quorum", "durable"] {
+        for round in 0..15 {
+            let name = format!("{kind}-race-{round}");
+            let path = format!("/queues/%2F/{name}");
+            let body = format!(r#"{{"kind":"{kind}"}}"#);
+            assert_eq!(http(&r.mgmt, "PUT", &path, &body).await.0, 201);
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let poller = {
+                let (mgmt, path, stop) = (r.mgmt, path.clone(), stop.clone());
+                tokio::spawn(async move {
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        let _ = http(&mgmt, "GET", &path, "").await;
+                    }
+                })
+            };
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            let (st, b) = http(&r.mgmt, "DELETE", &format!("{path}?kind={kind}"), "").await;
+            assert_eq!(st, 204, "{name}: {b}");
+            // Let the poller keep racing for a moment after the delete.
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            poller.await.unwrap();
+            let (st, b) = http(&r.mgmt, "GET", &path, "").await;
+            assert_eq!(st, 404, "{name} came back after its delete: {b}");
+        }
+    }
+    let (_, listed) = http(&r.mgmt, "GET", "/queues", "").await;
+    assert!(!listed.contains("-race-"), "{listed}");
+    r.shutdown.shutdown();
+}

@@ -884,8 +884,9 @@ impl<S: IoStream> BrokerConnection<S> {
     /// where the peer's dispositions were already processed synchronously by
     /// the session in an earlier frame, so their settlement futures are
     /// ready (or never will be): on the coordinator control path, and before
-    /// a consumer's `Unsubscribe` on detach or session end (#50). `unconstrained` bypasses the tokio-coop
-    /// budget so a ready oneshot isn't misread as pending; unlike the 20 ms
+    /// a consumer's `Unsubscribe` on detach or session end (#50).
+    /// `unconstrained` bypasses the tokio-coop budget so a ready oneshot
+    /// isn't misread as pending; unlike the 20 ms
     /// cleanup drain this adds no per-control-message latency (MED-13: every
     /// declare/discharge previously stalled the whole connection ~20 ms).
     async fn drain_ready_settlements_now(&mut self) {
