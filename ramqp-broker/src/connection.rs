@@ -856,6 +856,11 @@ impl<S: IoStream> BrokerConnection<S> {
         //   without settling): the per-item timeout stops the drain there;
         //   whatever remains requeues via the unsubscribes below
         //   (at-least-once, as before).
+        // Dropping the sessions first fails every delivery the peer still
+        // held, so it is forwarded as a failed attempt (counted in its
+        // `delivery-count`) before the unsubscribes below requeue anything
+        // (#54).
+        self.sessions.clear();
         self.drain_ready_settlements().await;
         for ((_, _), binding) in self.bindings.drain() {
             if let Binding::Consumer { queue, sub, .. } = binding {
@@ -1096,9 +1101,13 @@ impl<S: IoStream> BrokerConnection<S> {
                             ),
                             None => SettleAction::Now(state_to_outcome(&state)),
                         },
-                        // Link/connection died before a terminal outcome:
-                        // requeue (no-op if an unsubscribe already did).
-                        Ok(Err(_)) | Err(_) => SettleAction::Now(SettleOutcome::Requeue),
+                        // Link/connection died with the delivery unsettled:
+                        // requeue it as a failed attempt, as RabbitMQ 4.x
+                        // does (AMQP 1.0 §3.2.1 `delivery-count` counts
+                        // unsuccessful attempts; #54). It counts towards a
+                        // delivery limit too. A no-op if an unsubscribe
+                        // already requeued it.
+                        Ok(Err(_)) | Err(_) => SettleAction::Now(SettleOutcome::RequeueFailed),
                     };
                     (queue_tx, sub, msg_id, action)
                 }));

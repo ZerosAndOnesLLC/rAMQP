@@ -27,7 +27,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::cluster::fabric::{ConnState, OpenSubError, PublishStatus, RequestKind, SubEvent};
 use crate::cluster::node::ClusterNode;
-use crate::dispatch::{confirm_publish, refuse_publish};
+use crate::dispatch::{Orphans, confirm_publish, refuse_publish};
 use crate::queue::{ConnCmd, PublishAck, QueueHandle, QueueMsg, SettleOutcome, SubId};
 
 /// How many times a publish is retried across leader changes before the
@@ -74,6 +74,9 @@ struct ProxSub {
     outstanding: u32,
     /// The downstream identity under the current binding.
     down: Option<DownSub>,
+    /// Its connection is gone: deliveries go back downstream, and it is
+    /// unsubscribed once its settlements already queued are forwarded.
+    gone: bool,
 }
 
 enum DownSub {
@@ -132,6 +135,11 @@ struct Proxy {
     /// The queue incarnation this proxy serves: a newer one in the catalog
     /// means the queue was deleted underneath it.
     incarnation: u64,
+    /// Subscribers just found gone (by key), not yet scheduled.
+    newly_gone: Vec<u32>,
+    /// Gone subscribers waiting for the mailbox entries queued before them
+    /// (their settlements) to be forwarded first (issue #54).
+    orphans: Orphans,
 }
 
 impl Proxy {
@@ -147,6 +155,8 @@ impl Proxy {
             remote_events: None,
             remote_events_tx: None,
             remote_chans: HashMap::new(),
+            newly_gone: Vec::new(),
+            orphans: Orphans::default(),
             pubs: FuturesUnordered::new(),
             binding_epoch: 0,
             deleted: false,
@@ -166,6 +176,7 @@ impl Proxy {
 
                 msg = rx.recv() => {
                     let Some(msg) = msg else { break };
+                    self.orphans.processed_one();
                     if !self.handle_msg(msg).await { break }
                 }
 
@@ -202,6 +213,19 @@ impl Proxy {
                         }
                     }
                 }
+            }
+            // Subscribers found gone: unsubscribe them (downstream too) once
+            // the settlements their connection queued before going are
+            // forwarded (see `Orphans`).
+            for key in std::mem::take(&mut self.newly_gone) {
+                self.orphans.defer(u64::from(key), rx.len());
+            }
+            let mut open = true;
+            for sub in self.orphans.due() {
+                open = open && self.handle_msg(QueueMsg::Unsubscribe { sub }).await;
+            }
+            if !open {
+                break;
             }
         }
         if self.deleted {
@@ -447,6 +471,7 @@ impl Proxy {
                     binding_gen,
                     outstanding: 0,
                     down: None,
+                    gone: false,
                 };
                 if let Err(e) = self.bind_sub(key, &mut sub).await {
                     tracing::debug!(queue = %self.name, error = %e, "subscribe bind failed; rebinding");
@@ -796,6 +821,10 @@ impl Proxy {
             return;
         };
         sub.outstanding = sub.outstanding.saturating_sub(1);
+        if sub.gone {
+            self.requeue_downstream(key, msg_id);
+            return;
+        }
         let cmd = ConnCmd::Deliver {
             channel: sub.channel,
             handle: sub.handle,
@@ -804,30 +833,41 @@ impl Proxy {
             body,
         };
         if sub.conn.send(cmd).is_err() {
-            // Subscriber connection gone: requeue downstream + drop the sub.
+            // Subscriber connection gone: put this message back downstream
+            // and stop delivering to it. It is unsubscribed (downstream too)
+            // only after the settlements its connection already queued here
+            // are forwarded — unsubscribing first would requeue messages it
+            // accepted (issue #54).
             tracing::debug!(queue = %self.name, key, "proxied subscriber connection closed");
-            let down = self.subs.remove(&key).and_then(|s| s.down);
-            match (down, &self.downstream) {
-                (Some(DownSub::Local { sub }), Some(Downstream::Local { queue })) => {
-                    let tx = queue.tx.clone();
-                    tokio::spawn(async move {
-                        let _ = tx
-                            .send(QueueMsg::Settle {
-                                sub,
-                                msg_id,
-                                outcome: SettleOutcome::Requeue,
-                            })
-                            .await;
-                        let _ = tx.send(QueueMsg::Unsubscribe { sub }).await;
-                    });
-                }
-                (Some(DownSub::Remote { sub_chan }), Some(Downstream::Remote { conn, .. })) => {
-                    conn.send_settle(sub_chan, msg_id, SettleOutcome::Requeue.into());
-                    self.remote_chans.remove(&sub_chan);
-                    conn.close_sub(sub_chan);
-                }
-                _ => {}
+            sub.gone = true;
+            self.newly_gone.push(key);
+            self.requeue_downstream(key, msg_id);
+        }
+    }
+
+    /// Return one undelivered message to the queue under `key`'s
+    /// downstream subscription.
+    fn requeue_downstream(&self, key: u32, msg_id: u64) {
+        let Some(down) = self.subs.get(&key).and_then(|s| s.down.as_ref()) else {
+            return;
+        };
+        match (down, &self.downstream) {
+            (DownSub::Local { sub }, Some(Downstream::Local { queue })) => {
+                let (tx, sub) = (queue.tx.clone(), *sub);
+                tokio::spawn(async move {
+                    let _ = tx
+                        .send(QueueMsg::Settle {
+                            sub,
+                            msg_id,
+                            outcome: SettleOutcome::Requeue,
+                        })
+                        .await;
+                });
             }
+            (DownSub::Remote { sub_chan }, Some(Downstream::Remote { conn, .. })) => {
+                conn.send_settle(*sub_chan, msg_id, SettleOutcome::Requeue.into());
+            }
+            _ => {}
         }
     }
 }

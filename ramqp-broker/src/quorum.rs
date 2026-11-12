@@ -29,7 +29,7 @@
 //! Slice status (broker.md Phase 6): groups are single-replica here — the
 //! multi-node placement + forwarding fabric is the next slice.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::pin::Pin;
 
 use futures_util::StreamExt;
@@ -37,7 +37,9 @@ use futures_util::stream::FuturesUnordered;
 use tokio::sync::mpsc;
 
 use crate::cluster::queue_group::{QueueCommand, QueueRaft, QueueResponse, QueueStore};
-use crate::dispatch::{Subscriber, complete_drains, confirm_publish, pick_ready, refuse_publish};
+use crate::dispatch::{
+    Orphans, Subscriber, complete_drains, confirm_publish, pick_ready, refuse_publish,
+};
 use crate::policy::{EffectivePolicy, now_ms};
 use crate::queue::{ConnCmd, PublishAck, QueueHandle, QueueMsg, SettleOutcome, SubId};
 
@@ -60,9 +62,114 @@ enum Committed {
     },
     /// A failure-count proposal finished (best-effort).
     CountFailure { result: Result<(), String> },
+    /// A batch of proposals committed together, in proposal order.
+    Many(Vec<Committed>),
 }
 
 type CommitFuture = Pin<Box<dyn Future<Output = Committed> + Send>>;
+
+/// Most mailbox messages handled (and their proposals batched) per turn.
+const MAILBOX_BATCH_MAX: usize = 256;
+
+/// What a proposal resolves once it commits.
+enum Pending {
+    Publish {
+        ack: Option<PublishAck>,
+        len: usize,
+    },
+    Remove {
+        msg_id: u64,
+        on_failure: OnRemoveFailure,
+    },
+    CountFailure,
+}
+
+impl Pending {
+    fn committed(self, result: Result<QueueResponse, String>) -> Committed {
+        match self {
+            Pending::Publish { ack, len } => {
+                let result = match result {
+                    Ok(QueueResponse::Enqueued { msg_id }) => Ok(msg_id),
+                    Ok(other) => Err(format!("unexpected enqueue response: {other:?}")),
+                    Err(e) => Err(e),
+                };
+                Committed::Publish { ack, result, len }
+            }
+            Pending::Remove { msg_id, on_failure } => Committed::Remove {
+                msg_id,
+                result: result.map(|_| ()),
+                on_failure,
+            },
+            Pending::CountFailure => Committed::CountFailure {
+                result: result.map(|_| ()),
+            },
+        }
+    }
+}
+
+/// Proposals collected over one turn of the actor loop, then written to the
+/// log together (#54): openraft 0.9 appends — and fsyncs — one client write
+/// at a time, so one entry per message capped a queue at roughly one
+/// message per fsync. A turn's publishes, acks and failure counts now share
+/// one `QueueCommand::Batch` entry (applied in order: FIFO holds) when the
+/// group may batch; otherwise, or for a single proposal, each is written on
+/// its own as before.
+#[derive(Default)]
+struct Proposals(Vec<(QueueCommand, Pending)>);
+
+impl Proposals {
+    fn push(&mut self, command: QueueCommand, pending: Pending) {
+        self.0.push((command, pending));
+    }
+
+    fn flush(
+        &mut self,
+        raft: &QueueRaft,
+        commits: &mut FuturesUnordered<CommitFuture>,
+        batching: bool,
+    ) {
+        let items = std::mem::take(&mut self.0);
+        if items.is_empty() {
+            return;
+        }
+        if !batching || items.len() == 1 {
+            for (command, pending) in items {
+                let raft = raft.clone();
+                commits.push(Box::pin(async move {
+                    let result = raft
+                        .client_write(command)
+                        .await
+                        .map(|r| r.data)
+                        .map_err(|e| e.to_string());
+                    pending.committed(result)
+                }));
+            }
+            return;
+        }
+        let (commands, pendings): (Vec<_>, Vec<_>) = items.into_iter().unzip();
+        let raft = raft.clone();
+        commits.push(Box::pin(async move {
+            let n = pendings.len();
+            let result = raft
+                .client_write(QueueCommand::Batch(commands))
+                .await
+                .map(|r| r.data)
+                .map_err(|e| e.to_string());
+            let responses: Vec<Result<QueueResponse, String>> = match result {
+                Ok(QueueResponse::Batch(rs)) if rs.len() == n => rs.into_iter().map(Ok).collect(),
+                Ok(other) => vec![Err(format!("unexpected batch response: {other:?}")); n],
+                Err(e) => vec![Err(e); n],
+            };
+            Committed::Many(
+                pendings
+                    .into_iter()
+                    .zip(responses)
+                    .map(|(p, r)| p.committed(r))
+                    .collect(),
+            )
+        }));
+    }
+}
 
 /// How a removal that failed to commit is recovered.
 #[derive(Debug, Clone, Copy)]
@@ -95,13 +202,22 @@ pub(crate) fn spawn(
     store: QueueStore,
     policy: EffectivePolicy,
     exit_on_demotion: bool,
+    batching: bool,
 ) -> QueueHandle {
     let (tx, rx) = mpsc::channel(1024);
     let handle = QueueHandle {
         name: name.clone(),
         tx,
     };
-    tokio::spawn(run(name, raft, store, rx, policy, exit_on_demotion));
+    tokio::spawn(run(
+        name,
+        raft,
+        store,
+        rx,
+        policy,
+        exit_on_demotion,
+        batching,
+    ));
     handle
 }
 
@@ -112,6 +228,7 @@ async fn run(
     mut rx: mpsc::Receiver<QueueMsg>,
     policy: EffectivePolicy,
     exit_on_demotion: bool,
+    batching: bool,
 ) {
     // A recovered (or newly-led) group may still be REPLAYING committed log
     // entries into the state machine; seeding the ready-set before the
@@ -134,6 +251,8 @@ async fn run(
     }
 
     let mut subs: Vec<Subscriber> = Vec::new();
+    let mut orphans = Orphans::default();
+    let mut gone: Vec<SubId> = Vec::new();
     // Which subscriber holds each in-flight (dispatched, unsettled) message.
     let mut inflight: HashMap<u64, SubId> = HashMap::new();
     // Leader-local failed-delivery counts, seeded lazily from applied state.
@@ -143,12 +262,18 @@ async fn run(
     // failing to commit. This map is exact while this leader lives; a
     // failover re-seeds from whatever committed (at-least-once).
     let mut failures: HashMap<u64, u32> = HashMap::new();
+    // Messages some link has acquired (`first-acquirer` false from then on);
+    // leader-local, so after a failover every message counts as unacquired.
+    let mut acquired: HashSet<u64> = HashSet::new();
+    // Messages whose own `header.ttl` ran out at dispatch.
+    let mut expired_ids: Vec<u64> = Vec::new();
     // Dispatchable message ids, in FIFO (id) order. Maintained incrementally;
     // seeded from applied state so a takeover/restart redelivers everything
     // not currently held.
     let mut ready: BTreeSet<u64> = store.with_state(|s| s.messages.keys().copied().collect());
     // In-flight commit proposals (publishes + settles), pipelined.
     let mut commits: FuturesUnordered<CommitFuture> = FuturesUnordered::new();
+    let mut proposals = Proposals::default();
     let mut publishes_pending: usize = 0;
     // Bytes pinned by in-flight enqueue proposals (applied bodies are
     // counted by the state machine's own resident_bytes).
@@ -189,12 +314,19 @@ async fn run(
             }
 
             msg = rx.recv(), if mailbox_open => {
-                let Some(msg) = msg else {
+                let Some(first) = msg else {
                     // Mailbox closed: stop accepting, drain outstanding commits.
                     mailbox_open = false;
                     continue;
                 };
+                // Take what else is already waiting too, so its proposals
+                // share one log entry (see `Proposals`).
+                let mut next = Some(first);
+                let mut taken = 0;
+                while let Some(msg) = next.take() {
                 if let QueueMsg::Delete { reply } = msg {
+                    // Publishes taken this turn get their answer too.
+                    proposals.flush(&raft, &mut commits, batching);
                     // Let in-flight proposals finish so their producers get
                     // an answer, then detach every subscriber, stop the
                     // Raft member (standalone owns it; clustered, the node's
@@ -202,10 +334,15 @@ async fn run(
                     while let Ok(Some(done)) =
                         tokio::time::timeout(std::time::Duration::from_secs(2), commits.next()).await
                     {
-                        if let Committed::Publish { ack, result, .. } = done {
-                            match result {
-                                Ok(_) => confirm_publish(ack),
-                                Err(_) => refuse_publish(&name, ack),
+                        let mut stack = vec![done];
+                        while let Some(done) = stack.pop() {
+                            match done {
+                                Committed::Publish { ack, result, .. } => match result {
+                                    Ok(_) => confirm_publish(ack),
+                                    Err(_) => refuse_publish(&name, ack),
+                                },
+                                Committed::Many(all) => stack.extend(all.into_iter().rev()),
+                                _ => {}
                             }
                         }
                     }
@@ -218,6 +355,7 @@ async fn run(
                     tracing::info!(queue = %name, "quorum queue deleted");
                     return;
                 }
+                orphans.processed_one();
                 handle_msg(
                     msg,
                     &name,
@@ -229,14 +367,23 @@ async fn run(
                     &mut ready,
                     &mut failures,
                     &mut commits,
+                    &mut proposals,
                     &mut publishes_pending,
                     &mut pending_bytes,
                     &mut reserved,
                     &mut next_sub_id,
                 );
+                taken += 1;
+                if taken < MAILBOX_BATCH_MAX {
+                    next = rx.try_recv().ok();
+                }
+                }
             }
             Some(done) = commits.next() => {
+                let mut stack = vec![done];
+                while let Some(done) = stack.pop() {
                 match done {
+                    Committed::Many(all) => stack.extend(all.into_iter().rev()),
                     Committed::Publish { ack, result, len } => {
                         publishes_pending -= 1;
                         pending_bytes = pending_bytes.saturating_sub(len);
@@ -284,19 +431,41 @@ async fn run(
                         }
                     }
                 }
+                }
             }
         }
+        proposals.flush(&raft, &mut commits, batching);
 
         expire_head(&name, &policy, &raft, &store, &mut ready, &mut commits);
-        dispatch(
-            &name,
-            &store,
-            &failures,
-            &mut inflight,
-            &mut ready,
-            &mut subs,
-            &mut rr,
-        );
+        // A subscriber found gone has its messages requeued once what is
+        // already in the mailbox has been processed (see `Orphans`).
+        loop {
+            for sub in orphans.due() {
+                requeue_held(&mut ready, &mut inflight, sub);
+            }
+            dispatch(
+                &name,
+                &store,
+                &failures,
+                &mut acquired,
+                &mut inflight,
+                &mut ready,
+                &mut subs,
+                &mut rr,
+                &mut gone,
+                &mut expired_ids,
+            );
+            for id in expired_ids.drain(..) {
+                failures.remove(&id);
+                dead_letter_then_remove(&name, &policy, &store, &raft, &mut commits, id, "expired");
+            }
+            if gone.is_empty() {
+                break;
+            }
+            for sub in gone.drain(..) {
+                orphans.defer(sub, rx.len());
+            }
+        }
     }
     tracing::debug!(queue = %name, "quorum queue actor stopped");
 }
@@ -313,6 +482,7 @@ fn handle_msg(
     ready: &mut BTreeSet<u64>,
     failures: &mut HashMap<u64, u32>,
     commits: &mut FuturesUnordered<CommitFuture>,
+    proposals: &mut Proposals,
     publishes_pending: &mut usize,
     pending_bytes: &mut usize,
     reserved: &mut usize,
@@ -364,21 +534,11 @@ fn handle_msg(
             *publishes_pending += 1;
             let len = body.len();
             *pending_bytes = pending_bytes.saturating_add(len);
-            let raft = raft.clone();
             let enqueued_ms = now_ms();
-            commits.push(Box::pin(async move {
-                let result = match raft
-                    .client_write(QueueCommand::Enqueue { body, enqueued_ms })
-                    .await
-                {
-                    Ok(resp) => match resp.data {
-                        QueueResponse::Enqueued { msg_id } => Ok(msg_id),
-                        other => Err(format!("unexpected enqueue response: {other:?}")),
-                    },
-                    Err(e) => Err(e.to_string()),
-                };
-                Committed::Publish { ack, result, len }
-            }));
+            proposals.push(
+                QueueCommand::Enqueue { body, enqueued_ms },
+                Pending::Publish { ack, len },
+            );
         }
         QueueMsg::Reserve { count, reply } => {
             let ok = policy.drop_head
@@ -434,7 +594,16 @@ fn handle_msg(
                 // Accepted, or rejected with nowhere to dead-letter: remove.
                 SettleOutcome::Ack | SettleOutcome::Reject => {
                     failures.remove(&msg_id);
-                    push_remove(commits, raft, msg_id, OnRemoveFailure::Readd, None);
+                    proposals.push(
+                        QueueCommand::Settle {
+                            msg_id,
+                            requeue: false,
+                        },
+                        Pending::Remove {
+                            msg_id,
+                            on_failure: OnRemoveFailure::Readd,
+                        },
+                    );
                 }
                 SettleOutcome::Requeue => {
                     // Released: dispatchable again, no penalty, no log write
@@ -465,18 +634,13 @@ fn handle_msg(
                         );
                     } else {
                         ready.insert(msg_id);
-                        let raft = raft.clone();
-                        commits.push(Box::pin(async move {
-                            let result = raft
-                                .client_write(QueueCommand::Settle {
-                                    msg_id,
-                                    requeue: true,
-                                })
-                                .await
-                                .map(|_| ())
-                                .map_err(|e| e.to_string());
-                            Committed::CountFailure { result }
-                        }));
+                        proposals.push(
+                            QueueCommand::Settle {
+                                msg_id,
+                                requeue: true,
+                            },
+                            Pending::CountFailure,
+                        );
                     }
                 }
             }
@@ -493,14 +657,7 @@ fn handle_msg(
         QueueMsg::Unsubscribe { sub } => {
             subs.retain(|s| s.id != sub);
             // Everything that subscriber held becomes dispatchable again.
-            inflight.retain(|msg_id, owner| {
-                if *owner == sub {
-                    ready.insert(*msg_id);
-                    false
-                } else {
-                    true
-                }
-            });
+            requeue_held(ready, inflight, sub);
         }
     }
 }
@@ -573,6 +730,19 @@ fn dead_letter_then_remove(
     );
 }
 
+/// Requeue everything `sub` still holds (it unsubscribed, or its connection
+/// is gone).
+fn requeue_held(ready: &mut BTreeSet<u64>, inflight: &mut HashMap<u64, SubId>, sub: SubId) {
+    inflight.retain(|msg_id, owner| {
+        if *owner == sub {
+            ready.insert(*msg_id);
+            false
+        } else {
+            true
+        }
+    });
+}
+
 /// Lazy TTL: expire ready messages from the head (dead-letter + propose
 /// removal) before dispatching.
 fn expire_head(
@@ -601,15 +771,24 @@ fn expire_head(
 
 /// Round-robin dispatch: the oldest ready message to the next subscriber with
 /// demand. Bodies come out of applied state as refcount clones.
+#[allow(clippy::too_many_arguments)]
 fn dispatch(
     name: &str,
     store: &QueueStore,
     failures: &HashMap<u64, u32>,
+    acquired: &mut HashSet<u64>,
     inflight: &mut HashMap<u64, SubId>,
     ready: &mut BTreeSet<u64>,
     subs: &mut Vec<Subscriber>,
     rr: &mut usize,
+    gone: &mut Vec<SubId>,
+    expired: &mut Vec<u64>,
 ) {
+    // Forget acquisitions of messages that are gone (cheap, amortized).
+    if acquired.len() > 2 * (ready.len() + inflight.len()) + 1024 {
+        acquired.retain(|id| ready.contains(id) || inflight.contains_key(id));
+    }
+    let now = now_ms();
     while !ready.is_empty() {
         // Next subscriber with demand (round-robin); stop if none want work.
         let Some(idx) = pick_ready(subs, *rr) else {
@@ -637,12 +816,18 @@ fn dispatch(
         };
         // The leader-local count is exact; the replicated one (which a new
         // leader starts from) lags only its own pipelined increments.
-        let failed = failures.get(&msg_id).copied().unwrap_or_else(|| {
-            store
-                .with_state(|s| s.meta_of(msg_id).map(|(_, f)| f))
-                .unwrap_or(0)
-        });
-        let body = crate::redelivery::with_delivery_count(&body, failed);
+        let (enqueued_ms, stored_failures) =
+            store.with_state(|s| s.meta_of(msg_id)).unwrap_or((now, 0));
+        // Its own `header.ttl` ran out: dead-letter (or drop) it instead —
+        // the caller does, once dispatch is done.
+        if crate::redelivery::expired(&body, enqueued_ms, now) {
+            ready.remove(&msg_id);
+            expired.push(msg_id);
+            continue;
+        }
+        let failed = failures.get(&msg_id).copied().unwrap_or(stored_failures);
+        let body = crate::redelivery::for_delivery(&body, failed, !acquired.contains(&msg_id));
+        acquired.insert(msg_id);
         ready.remove(&msg_id);
         *rr = (idx + 1) % subs.len();
 
@@ -659,20 +844,13 @@ fn dispatch(
         if sub.conn.send(cmd).is_ok() {
             inflight.insert(msg_id, sub_id);
         } else {
+            // Put this message back and stop dispatching to the subscriber;
+            // what else it holds is requeued once its settlements already in
+            // the mailbox are applied (`Orphans`).
             tracing::debug!(queue = %name, sub = sub_id, "subscriber connection closed");
             ready.insert(msg_id);
-            // Requeue everything ELSE the dead subscriber held: without a
-            // clean Unsubscribe its in-flights would stay undeliverable on a
-            // live actor forever (MED-9).
-            inflight.retain(|id, owner| {
-                if *owner == sub_id {
-                    ready.insert(*id);
-                    false
-                } else {
-                    true
-                }
-            });
             subs.retain(|s| s.id != sub_id);
+            gone.push(sub_id);
         }
     }
 

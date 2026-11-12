@@ -209,3 +209,90 @@ async fn quorum_accepts_survive_an_immediate_exit() {
 async fn durable_accepts_survive_an_immediate_exit() {
     every_exit("/durable/d").await;
 }
+
+/// Issue #54: consumers churning fast — each takes a few messages, accepts
+/// them and leaves at once by a rotating route — never see an accepted
+/// message again. (The queue used to requeue a departed consumer's messages
+/// as soon as a dispatch to it failed, ahead of the accepts its connection
+/// had already queued.)
+async fn churn_never_redelivers_accepted(prefix: &str, messages: usize) {
+    use std::collections::HashSet;
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = BrokerConfig::default();
+    config.data_dir = Some(dir.path().to_path_buf());
+    let (addr, shutdown) = start(config).await;
+    let address = format!("{prefix}churn");
+    let conn = ConnectionBuilder::new(format!("amqp://{addr}"))
+        .connect()
+        .await
+        .unwrap();
+    let s = conn.begin_session().await.unwrap();
+    let p = s.create_producer(&address).await.unwrap();
+    for i in 0..messages {
+        p.send(Message::text(format!("msg-{i}"))).await.unwrap();
+    }
+    conn.close().await.unwrap();
+
+    let mut accepted: HashSet<String> = HashSet::new();
+    let mut round = 0usize;
+    while accepted.len() < messages {
+        round += 1;
+        assert!(
+            round < messages * 4,
+            "no progress: {} accepted",
+            accepted.len()
+        );
+        let conn = ConnectionBuilder::new(format!("amqp://{addr}"))
+            .connect()
+            .await
+            .unwrap();
+        let s = conn.begin_session().await.unwrap();
+        let mut c = s.create_consumer(&address).await.unwrap();
+        for _ in 0..(1 + round % 7) {
+            let Ok(Ok(d)) = tokio::time::timeout(Duration::from_secs(5), c.recv()).await else {
+                break;
+            };
+            let text = match d.message().unwrap().body {
+                ramqp::types::messaging::Body::Value(ramqp::codec::Value::String(t)) => t,
+                other => panic!("unexpected body {other:?}"),
+            };
+            assert!(
+                !accepted.contains(&text),
+                "{address}: accepted {text} was delivered again (round {round})"
+            );
+            c.accept(&d).await.unwrap();
+            accepted.insert(text);
+        }
+        match round % 3 {
+            0 => {
+                c.detach().await.ok();
+                conn.close().await.ok();
+            }
+            1 => {
+                drop(c);
+                conn.close().await.ok();
+            }
+            _ => {
+                conn.close().await.ok();
+                drop(c);
+            }
+        }
+    }
+    shutdown.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn transient_churn_never_redelivers_accepted() {
+    churn_never_redelivers_accepted("/queues/", 1500).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn quorum_churn_never_redelivers_accepted() {
+    churn_never_redelivers_accepted("/quorum/", 400).await;
+}
+
+#[cfg(feature = "store-redb")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn durable_churn_never_redelivers_accepted() {
+    churn_never_redelivers_accepted("/durable/", 800).await;
+}

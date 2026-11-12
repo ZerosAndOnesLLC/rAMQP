@@ -1791,7 +1791,9 @@ async fn spawn_quorum_group(
         .map_err(|e| tracing::error!(queue = %name, error = %e, "quorum leader-wait failed"))
         .ok()?;
     // A single-replica standalone group can never be demoted.
-    Some(quorum::spawn(name, raft, store, policy, false))
+    // Standalone: the one node writes and reads its own log, so batching is
+    // always safe.
+    Some(quorum::spawn(name, raft, store, policy, false, true))
 }
 
 #[cfg(test)]

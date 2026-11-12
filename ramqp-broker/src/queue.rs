@@ -27,7 +27,9 @@ use std::collections::{HashMap, VecDeque};
 use bytes::Bytes;
 use tokio::sync::mpsc;
 
-use crate::dispatch::{Subscriber, complete_drains, confirm_publish, pick_ready, refuse_publish};
+use crate::dispatch::{
+    Orphans, Subscriber, complete_drains, confirm_publish, pick_ready, refuse_publish,
+};
 use crate::policy::{EffectivePolicy, now_ms};
 
 /// A queue's identity + mailbox, cheap to clone.
@@ -250,6 +252,27 @@ struct Stored {
     failures: u32,
     /// Enqueue time (ms since epoch), for lazy TTL expiry.
     enqueued_ms: u64,
+    /// Some link has acquired it before (`first-acquirer` is then false).
+    acquired: bool,
+}
+
+/// Requeue everything `sub` still holds (it unsubscribed, or its connection
+/// is gone), in id order.
+fn requeue_held(
+    ready: &mut VecDeque<Stored>,
+    unacked: &mut HashMap<u64, (Stored, SubId)>,
+    sub: SubId,
+) {
+    let held: Vec<u64> = unacked
+        .iter()
+        .filter(|(_, (_, owner))| *owner == sub)
+        .map(|(id, _)| *id)
+        .collect();
+    for id in held {
+        if let Some((stored, _)) = unacked.remove(&id) {
+            requeue(ready, stored);
+        }
+    }
 }
 
 /// Put a message back on the ready list at its place by id. Ids grow with
@@ -287,162 +310,173 @@ async fn run(name: String, mut rx: mpsc::Receiver<QueueMsg>, policy: EffectivePo
     let mut next_msg_id: u64 = 0;
     let mut next_sub_id: SubId = 0;
     let mut rr: usize = 0;
+    let mut orphans = Orphans::default();
+    let mut gone: Vec<SubId> = Vec::new();
 
     while let Some(msg) = rx.recv().await {
         let from_reserved = matches!(msg, QueueMsg::PublishReserved { .. });
-        match msg {
-            QueueMsg::Publish { body, ack } | QueueMsg::PublishReserved { body, ack } => {
-                if from_reserved {
-                    reserved = reserved.saturating_sub(1);
-                }
-                // At a bound (depth or bytes): drop-head makes room
-                // (dead-lettering displaced messages); otherwise refuse —
-                // never grow without bound (broker.md §3.2).
-                let over = |ready_len: usize, unacked_len: usize, bytes_now: usize| {
-                    ready_len + unacked_len + reserved >= policy.max_len
-                        || bytes_now.saturating_add(body.len()) > policy.max_bytes
-                };
-                let mut needs_room = over(ready.len(), unacked.len(), bytes);
-                if needs_room && policy.drop_head {
-                    while needs_room {
-                        let Some(old) = ready.pop_front() else { break };
-                        bytes = bytes.saturating_sub(old.body.len());
-                        policy.dead_letter(&name, "maxlen", old.body);
-                        needs_room = over(ready.len(), unacked.len(), bytes);
+        'handled: {
+            match msg {
+                QueueMsg::Publish { body, ack } | QueueMsg::PublishReserved { body, ack } => {
+                    if from_reserved {
+                        reserved = reserved.saturating_sub(1);
                     }
+                    // At a bound (depth or bytes): drop-head makes room
+                    // (dead-lettering displaced messages); otherwise refuse —
+                    // never grow without bound (broker.md §3.2).
+                    let over = |ready_len: usize, unacked_len: usize, bytes_now: usize| {
+                        ready_len + unacked_len + reserved >= policy.max_len
+                            || bytes_now.saturating_add(body.len()) > policy.max_bytes
+                    };
+                    let mut needs_room = over(ready.len(), unacked.len(), bytes);
+                    if needs_room && policy.drop_head {
+                        while needs_room {
+                            let Some(old) = ready.pop_front() else { break };
+                            bytes = bytes.saturating_sub(old.body.len());
+                            policy.dead_letter(&name, "maxlen", old.body);
+                            needs_room = over(ready.len(), unacked.len(), bytes);
+                        }
+                    }
+                    // A reserved publish is never refused for depth: its slot was
+                    // admitted at Reserve time (`needs_room` can only persist
+                    // here if the reservation was lost to a failover, or unacked
+                    // messages pin the byte budget).
+                    if needs_room && !from_reserved {
+                        refuse_publish(&name, ack);
+                        break 'handled;
+                    }
+                    next_msg_id += 1;
+                    bytes = bytes.saturating_add(body.len());
+                    ready.push_back(Stored {
+                        id: next_msg_id,
+                        body,
+                        failures: 0,
+                        enqueued_ms: now_ms(),
+                        acquired: false,
+                    });
+                    // In-memory transient queue: stored == settled. (A durable /
+                    // quorum queue confirms here only after fsync / Raft commit.)
+                    confirm_publish(ack);
                 }
-                // A reserved publish is never refused for depth: its slot was
-                // admitted at Reserve time (`needs_room` can only persist
-                // here if the reservation was lost to a failover, or unacked
-                // messages pin the byte budget).
-                if needs_room && !from_reserved {
-                    refuse_publish(&name, ack);
-                    continue;
+                QueueMsg::Reserve { count, reply } => {
+                    // Drop-head queues always accept (a publish makes its own
+                    // room), so their slots are never actually held.
+                    let ok = policy.drop_head
+                        || ready.len() + unacked.len() + reserved + count as usize
+                            <= policy.max_len;
+                    if ok && !policy.drop_head {
+                        reserved += count as usize;
+                    }
+                    let _ = reply.send(ok);
                 }
-                next_msg_id += 1;
-                bytes = bytes.saturating_add(body.len());
-                ready.push_back(Stored {
-                    id: next_msg_id,
-                    body,
-                    failures: 0,
-                    enqueued_ms: now_ms(),
-                });
-                // In-memory transient queue: stored == settled. (A durable /
-                // quorum queue confirms here only after fsync / Raft commit.)
-                confirm_publish(ack);
-            }
-            QueueMsg::Reserve { count, reply } => {
-                // Drop-head queues always accept (a publish makes its own
-                // room), so their slots are never actually held.
-                let ok = policy.drop_head
-                    || ready.len() + unacked.len() + reserved + count as usize <= policy.max_len;
-                if ok && !policy.drop_head {
-                    reserved += count as usize;
+                QueueMsg::Unreserve { count } => {
+                    reserved = reserved.saturating_sub(count as usize);
                 }
-                let _ = reply.send(ok);
-            }
-            QueueMsg::Unreserve { count } => {
-                reserved = reserved.saturating_sub(count as usize);
-            }
-            QueueMsg::Subscribe {
-                conn,
-                channel,
-                handle,
-                binding_gen,
-                reply,
-            } => {
-                next_sub_id += 1;
-                subs.push(Subscriber::new(
-                    next_sub_id,
+                QueueMsg::Subscribe {
                     conn,
                     channel,
                     handle,
                     binding_gen,
-                ));
-                let _ = reply.send(next_sub_id);
-            }
-            QueueMsg::Demand { sub, credit, drain } => {
-                if let Some(s) = subs.iter_mut().find(|s| s.id == sub) {
-                    // A drain zeros whatever is left *after* this cycle's
-                    // dispatch, so the consumer's "then stop" is honored without
-                    // stranding messages that are available right now.
-                    s.grant(credit, drain);
+                    reply,
+                } => {
+                    next_sub_id += 1;
+                    subs.push(Subscriber::new(
+                        next_sub_id,
+                        conn,
+                        channel,
+                        handle,
+                        binding_gen,
+                    ));
+                    let _ = reply.send(next_sub_id);
                 }
-            }
-            QueueMsg::Settle {
-                sub,
-                msg_id,
-                outcome,
-            } => {
-                // Only the current owner may settle: a message requeued (by
-                // unsubscribe) and redispatched belongs to someone else now,
-                // and a late settle from the former owner must not touch it.
-                if unacked.get(&msg_id).is_none_or(|(_, owner)| *owner != sub) {
-                    continue;
+                QueueMsg::Demand { sub, credit, drain } => {
+                    if let Some(s) = subs.iter_mut().find(|s| s.id == sub) {
+                        // A drain zeros whatever is left *after* this cycle's
+                        // dispatch, so the consumer's "then stop" is honored without
+                        // stranding messages that are available right now.
+                        s.grant(credit, drain);
+                    }
                 }
-                if let Some((mut stored, _)) = unacked.remove(&msg_id) {
-                    match outcome {
-                        SettleOutcome::Ack => {
-                            bytes = bytes.saturating_sub(stored.body.len());
-                        }
-                        SettleOutcome::Reject => {
-                            bytes = bytes.saturating_sub(stored.body.len());
-                            policy.dead_letter(&name, "rejected", stored.body);
-                        }
-                        SettleOutcome::Requeue => requeue(&mut ready, stored),
-                        SettleOutcome::RequeueFailed => {
-                            stored.failures += 1;
-                            if policy.attempts_exhausted(stored.failures) {
+                QueueMsg::Settle {
+                    sub,
+                    msg_id,
+                    outcome,
+                } => {
+                    // Only the current owner may settle: a message requeued (by
+                    // unsubscribe) and redispatched belongs to someone else now,
+                    // and a late settle from the former owner must not touch it.
+                    if unacked.get(&msg_id).is_none_or(|(_, owner)| *owner != sub) {
+                        break 'handled;
+                    }
+                    if let Some((mut stored, _)) = unacked.remove(&msg_id) {
+                        match outcome {
+                            SettleOutcome::Ack => {
                                 bytes = bytes.saturating_sub(stored.body.len());
-                                policy.dead_letter(&name, "delivery-limit", stored.body);
-                            } else {
-                                requeue(&mut ready, stored);
+                            }
+                            SettleOutcome::Reject => {
+                                bytes = bytes.saturating_sub(stored.body.len());
+                                policy.dead_letter(&name, "rejected", stored.body);
+                            }
+                            SettleOutcome::Requeue => requeue(&mut ready, stored),
+                            SettleOutcome::RequeueFailed => {
+                                stored.failures += 1;
+                                if policy.attempts_exhausted(stored.failures) {
+                                    bytes = bytes.saturating_sub(stored.body.len());
+                                    policy.dead_letter(&name, "delivery-limit", stored.body);
+                                } else {
+                                    requeue(&mut ready, stored);
+                                }
                             }
                         }
                     }
                 }
-            }
-            QueueMsg::Stats { reply, .. } => {
-                let _ = reply.send(QueueStats {
-                    ready: ready.len(),
-                    unacked: unacked.len(),
-                    consumers: subs.len(),
-                });
-            }
-            QueueMsg::Delete { reply } => {
-                notify_deleted(&subs);
-                let _ = reply.send(true);
-                tracing::info!(queue = %name, dropped = ready.len() + unacked.len(), "queue deleted");
-                drain_after_delete(&name, &mut rx, next_sub_id).await;
-                return;
-            }
-            QueueMsg::Unsubscribe { sub } => {
-                subs.retain(|s| s.id != sub);
-                // Requeue everything that subscriber held, in id order.
-                let orphaned: Vec<u64> = unacked
-                    .iter()
-                    .filter(|(_, (_, owner))| *owner == sub)
-                    .map(|(id, _)| *id)
-                    .collect();
-                for id in orphaned {
-                    if let Some((stored, _)) = unacked.remove(&id) {
-                        requeue(&mut ready, stored);
-                    }
+                QueueMsg::Stats { reply, .. } => {
+                    let _ = reply.send(QueueStats {
+                        ready: ready.len(),
+                        unacked: unacked.len(),
+                        consumers: subs.len(),
+                    });
+                }
+                QueueMsg::Delete { reply } => {
+                    notify_deleted(&subs);
+                    let _ = reply.send(true);
+                    tracing::info!(queue = %name, dropped = ready.len() + unacked.len(), "queue deleted");
+                    drain_after_delete(&name, &mut rx, next_sub_id).await;
+                    return;
+                }
+                QueueMsg::Unsubscribe { sub } => {
+                    subs.retain(|s| s.id != sub);
+                    requeue_held(&mut ready, &mut unacked, sub);
                 }
             }
         }
+        orphans.processed_one();
 
-        // Dispatch: round-robin over subscribers with demand.
-        dispatch(
-            &name,
-            &policy,
-            &mut ready,
-            &mut unacked,
-            &mut subs,
-            &mut rr,
-            &mut bytes,
-        )
-        .await;
+        // Dispatch: round-robin over subscribers with demand. A subscriber
+        // found gone has its messages requeued once what is already in the
+        // mailbox has been processed (see `Orphans`) — then dispatch again.
+        loop {
+            for sub in orphans.due() {
+                requeue_held(&mut ready, &mut unacked, sub);
+            }
+            dispatch(
+                &name,
+                &policy,
+                &mut ready,
+                &mut unacked,
+                &mut subs,
+                &mut rr,
+                &mut bytes,
+                &mut gone,
+            )
+            .await;
+            if gone.is_empty() {
+                break;
+            }
+            for sub in gone.drain(..) {
+                orphans.defer(sub, rx.len());
+            }
+        }
     }
     tracing::debug!(queue = %name, "queue actor stopped");
 }
@@ -515,6 +549,7 @@ async fn dispatch(
     subs: &mut Vec<Subscriber>,
     rr: &mut usize,
     bytes: &mut usize,
+    gone: &mut Vec<SubId>,
 ) {
     // Lazy TTL: expire from the head before dispatching (RabbitMQ-classic
     // semantics — an expired message leaves when it reaches the front).
@@ -529,14 +564,22 @@ async fn dispatch(
             policy.dead_letter(name, "expired", expired.body);
         }
     }
+    let now = now_ms();
     while !ready.is_empty() {
         // Next subscriber with demand (round-robin); stop if none want work.
         let Some(idx) = pick_ready(subs, *rr) else {
             return;
         };
+        let mut msg = ready.pop_front().expect("non-empty");
+        // Its own `header.ttl` ran out: dead-letter (or drop) it instead.
+        if crate::redelivery::expired(&msg.body, msg.enqueued_ms, now) {
+            *bytes = bytes.saturating_sub(msg.body.len());
+            policy.dead_letter(name, "expired", msg.body);
+            continue;
+        }
         *rr = (idx + 1) % subs.len();
-
-        let msg = ready.pop_front().expect("non-empty");
+        let body = crate::redelivery::for_delivery(&msg.body, msg.failures, !msg.acquired);
+        msg.acquired = true;
         let sub = &mut subs[idx];
         sub.demand -= 1;
         let cmd = ConnCmd::Deliver {
@@ -544,28 +587,19 @@ async fn dispatch(
             handle: sub.handle,
             binding_gen: sub.binding_gen,
             msg_id: msg.id,
-            body: crate::redelivery::with_delivery_count(&msg.body, msg.failures),
+            body,
         };
         let sub_id = sub.id;
         if sub.conn.send(cmd).is_ok() {
             unacked.insert(msg.id, (msg, sub_id));
         } else {
-            // Connection gone: drop the subscriber, put the message back —
-            // and requeue everything ELSE it held (without a clean
-            // Unsubscribe those in-flights would strand forever, MED-9).
+            // Connection gone: put this message back and stop dispatching
+            // to the subscriber. What else it holds is requeued later, once
+            // its settlements already in the mailbox are applied (`Orphans`).
             tracing::debug!(queue = %name, sub = sub_id, "subscriber connection closed");
             requeue(ready, msg);
-            let orphaned: Vec<u64> = unacked
-                .iter()
-                .filter(|(_, (_, owner))| *owner == sub_id)
-                .map(|(id, _)| *id)
-                .collect();
-            for id in orphaned {
-                if let Some((stored, _)) = unacked.remove(&id) {
-                    requeue(ready, stored);
-                }
-            }
             subs.retain(|s| s.id != sub_id);
+            gone.push(sub_id);
         }
     }
 
@@ -648,6 +682,77 @@ mod tests {
         assert!(refused, "the publish behind the delete is refused");
         assert!(detached, "the racing subscriber is told the queue is gone");
         assert!(q.tx.is_closed(), "the actor stopped");
+    }
+
+    /// Issue #54: a subscriber whose connection is gone has its accepts
+    /// already queued in the mailbox. The dispatch that finds it gone must
+    /// not requeue what it held ahead of those accepts — an accepted message
+    /// would be delivered again.
+    #[tokio::test]
+    async fn accepts_queued_before_a_dead_connection_is_found_still_apply() {
+        let q = spawn("orphans".into(), EffectivePolicy::depth_only(100));
+        let (old_tx, mut old_rx) = mpsc::unbounded_channel();
+        let old = subscribe(&q, &old_tx, 1).await;
+        q.tx.send(QueueMsg::Demand {
+            sub: old,
+            credit: 10,
+            drain: false,
+        })
+        .await
+        .unwrap();
+        for body in [&b"m1"[..], b"m2"] {
+            q.tx.send(QueueMsg::Publish {
+                body: Bytes::copy_from_slice(body),
+                ack: None,
+            })
+            .await
+            .unwrap();
+        }
+        let mut ids = Vec::new();
+        while ids.len() < 2 {
+            if let ConnCmd::Deliver { msg_id, .. } = old_rx.recv().await.unwrap() {
+                ids.push(msg_id);
+            }
+        }
+        // The connection goes away after accepting m1. In the mailbox, the
+        // accept sits behind a publish whose dispatch finds the subscriber
+        // gone (queued together: the actor can't run in between on this
+        // single-threaded runtime).
+        drop(old_rx);
+        q.tx.try_send(QueueMsg::Publish {
+            body: Bytes::from_static(b"m3"),
+            ack: None,
+        })
+        .unwrap();
+        q.tx.try_send(QueueMsg::Settle {
+            sub: old,
+            msg_id: ids[0],
+            outcome: SettleOutcome::Ack,
+        })
+        .unwrap();
+        // A new consumer gets m2 and m3 — never the accepted m1.
+        let (new_tx, mut new_rx) = mpsc::unbounded_channel();
+        let new = subscribe(&q, &new_tx, 2).await;
+        q.tx.send(QueueMsg::Demand {
+            sub: new,
+            credit: 10,
+            drain: false,
+        })
+        .await
+        .unwrap();
+        let mut bodies = Vec::new();
+        while let Ok(Some(cmd)) =
+            tokio::time::timeout(std::time::Duration::from_millis(300), new_rx.recv()).await
+        {
+            if let ConnCmd::Deliver { body, .. } = cmd {
+                bodies.push(body.to_vec());
+            }
+        }
+        assert!(
+            !bodies.iter().any(|b| b == b"m1"),
+            "the accepted m1 was delivered again: {bodies:?}"
+        );
+        assert_eq!(bodies.len(), 2, "m2 and m3 come back: {bodies:?}");
     }
 
     #[tokio::test]

@@ -1395,3 +1395,116 @@ async fn get_racing_delete_never_resurrects_the_queue() {
     assert!(!listed.contains("-race-"), "{listed}");
     r.shutdown.shutdown();
 }
+
+// ---------------------------------------------------------------- #54
+
+/// The message header as RabbitMQ 4.x sets it, on every queue kind:
+/// - `delivery-count` counts a delivery lost with its consumer (it closed
+///   without settling) as a failed attempt;
+/// - a message whose own `header.ttl` ran out is not delivered (it goes to
+///   the dead-letter queue when there is one);
+/// - `first-acquirer` is true on a first delivery and false after.
+#[tokio::test]
+async fn header_semantics_match_rabbitmq_on_every_queue_kind() {
+    use ramqp::types::messaging::Header;
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = BrokerConfig::default();
+    config.data_dir = Some(dir.path().to_path_buf());
+    let r = start(config, None).await;
+    let kinds: &[&str] = if cfg!(feature = "store-redb") {
+        &["transient", "durable", "quorum"]
+    } else {
+        &["transient", "quorum"]
+    };
+    let header = |d: &ramqp::Delivery| d.message().unwrap().header.unwrap_or_default();
+    for &kind in kinds {
+        let q = format!("/queues/hdr-{kind}");
+        let dlq = format!("hdr-{kind}.dlq");
+        assert_eq!(
+            http(
+                &r.mgmt,
+                "PUT",
+                &format!("/queues/%2F/{dlq}"),
+                &format!(r#"{{"kind":"{kind}"}}"#)
+            )
+            .await
+            .0,
+            201
+        );
+        let decl = format!(r#"{{"kind":"{kind}","dead_letter":"/queues/{dlq}"}}"#);
+        assert_eq!(
+            http(&r.mgmt, "PUT", &format!("/queues/%2F/hdr-{kind}"), &decl)
+                .await
+                .0,
+            201,
+            "{kind}"
+        );
+
+        // delivery-count after the consumer closes without settling.
+        {
+            let conn = ConnectionBuilder::new(format!("amqp://{}", r.addr))
+                .connect()
+                .await
+                .unwrap();
+            let s = conn.begin_session().await.unwrap();
+            s.create_producer(&q)
+                .await
+                .unwrap()
+                .send(Message::text("lost"))
+                .await
+                .unwrap();
+            let mut c = s.create_consumer(&q).await.unwrap();
+            let d = recv(&mut c).await.expect("delivery");
+            assert!(header(&d).first_acquirer, "{kind}: first delivery");
+            conn.close().await.unwrap(); // unsettled
+        }
+        let conn = ConnectionBuilder::new(format!("amqp://{}", r.addr))
+            .connect()
+            .await
+            .unwrap();
+        let s = conn.begin_session().await.unwrap();
+        let mut c = s.create_consumer(&q).await.unwrap();
+        let d = recv(&mut c).await.expect("redelivery");
+        let h = header(&d);
+        assert_eq!(h.delivery_count, 1, "{kind}: a lost delivery counts");
+        assert!(!h.first_acquirer, "{kind}: acquired before");
+        c.accept(&d).await.unwrap();
+
+        // first-acquirer after a release.
+        let p = s.create_producer(&q).await.unwrap();
+        p.send(Message::text("released")).await.unwrap();
+        let d = recv(&mut c).await.expect("delivery");
+        assert!(header(&d).first_acquirer, "{kind}");
+        c.release(&d).await.unwrap();
+        let d = recv(&mut c).await.expect("after release");
+        let h = header(&d);
+        assert!(!h.first_acquirer, "{kind}: released, so acquired before");
+        assert_eq!(h.delivery_count, 0, "{kind}: a release is not a failure");
+        c.accept(&d).await.unwrap();
+        c.detach().await.unwrap();
+
+        // header.ttl: expired before anyone takes it → dead-lettered.
+        let mut m = Message::text("short-lived");
+        m.header = Some(Header {
+            ttl: Some(150),
+            ..Default::default()
+        });
+        p.send(m).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let mut c = s.create_consumer(&q).await.unwrap();
+        let none = tokio::time::timeout(Duration::from_millis(500), c.recv()).await;
+        assert!(none.is_err(), "{kind}: an expired message is not delivered");
+        let mut dl = s.create_consumer(&format!("/queues/{dlq}")).await.unwrap();
+        assert_eq!(
+            text(
+                &recv(&mut dl)
+                    .await
+                    .unwrap_or_else(|| panic!("{kind}: not dead-lettered on expiry"))
+            ),
+            "short-lived",
+            "{kind}"
+        );
+        conn.close().await.unwrap();
+    }
+    r.shutdown.shutdown();
+}

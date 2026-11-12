@@ -82,8 +82,11 @@ const CAP_QUEUE_DELETE: u64 = 2;
 /// Capability bit: applies `MetaCommand::Def` (runtime definitions:
 /// per-queue policies, users, permissions).
 const CAP_DEFS: u64 = 4;
+/// Capability bit: applies `QueueCommand::Batch` (several queue commands in
+/// one log entry).
+const CAP_QUEUE_BATCH: u64 = 8;
 /// What this node supports (answered to `RequestKind::Capabilities`).
-const CAPABILITIES: u64 = CAP_EXCHANGES | CAP_QUEUE_DELETE | CAP_DEFS;
+const CAPABILITIES: u64 = CAP_EXCHANGES | CAP_QUEUE_DELETE | CAP_DEFS | CAP_QUEUE_BATCH;
 
 /// One local member of a per-queue Raft group.
 struct GroupMember {
@@ -120,6 +123,8 @@ pub struct ClusterNode {
     delete_capable: std::sync::atomic::AtomicBool,
     /// Every voter has confirmed it supports runtime definitions.
     defs_capable: std::sync::atomic::AtomicBool,
+    /// Every voter has confirmed it applies batched queue commands.
+    batch_capable: std::sync::atomic::AtomicBool,
     /// Resolves a queue's effective policy (installed by the registry, so
     /// per-queue definitions apply to clustered queues too).
     policy_resolver: std::sync::OnceLock<PolicyResolver>,
@@ -255,6 +260,7 @@ impl ClusterNode {
             exchanges_capable: std::sync::atomic::AtomicBool::new(false),
             delete_capable: std::sync::atomic::AtomicBool::new(false),
             defs_capable: std::sync::atomic::AtomicBool::new(false),
+            batch_capable: std::sync::atomic::AtomicBool::new(false),
             policy_resolver: std::sync::OnceLock::new(),
         });
 
@@ -750,6 +756,17 @@ impl ClusterNode {
             return Err(None);
         };
         let leader = member.raft.metrics().borrow().current_leader;
+        // Batch queue commands only once every voter can apply them (an
+        // older node could not decode the log entry). Sticky once true.
+        let batching = leader == Some(self.node_id)
+            && self
+                .ensure_capable(
+                    &self.batch_capable,
+                    CAP_QUEUE_BATCH,
+                    "batched queue commands",
+                )
+                .await
+                .is_ok();
         match leader {
             Some(id) if id == self.node_id => {
                 let gid = self.current_gid(name);
@@ -792,6 +809,7 @@ impl ClusterNode {
                     member.store.clone(),
                     policy,
                     true, // exit when leadership is lost
+                    batching,
                 );
                 actors.insert(gid, handle.clone());
                 Ok(handle)

@@ -63,6 +63,11 @@ pub enum QueueCommand {
         /// failed delivery attempt (requeue).
         requeue: bool,
     },
+    /// Several commands in ONE log entry, applied in order: one fsync (and,
+    /// clustered, one replication round) for all of them (#54). Proposed
+    /// only once every voter understands it (`CAP_QUEUE_BATCH`); an older
+    /// node could not decode it.
+    Batch(Vec<QueueCommand>),
 }
 
 /// The applied result of a [`QueueCommand`].
@@ -75,6 +80,8 @@ pub enum QueueResponse {
     },
     /// The settle was applied.
     Settled,
+    /// A [`QueueCommand::Batch`]'s responses, one per command, in order.
+    Batch(Vec<QueueResponse>),
     /// No such message (already settled, or never existed).
     NotFound,
     /// Non-app log entry (blank/membership).
@@ -295,6 +302,9 @@ impl ReplicatedState for QueueState {
                     QueueResponse::NotFound
                 }
             }
+            QueueCommand::Batch(commands) => {
+                QueueResponse::Batch(commands.iter().map(|c| self.apply(c)).collect())
+            }
         }
     }
 
@@ -501,6 +511,52 @@ mod tests {
         }
         assert_eq!(state.resident_bytes(), 0);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A batch is one log entry applying its commands in order, with one
+    /// response per command (#54).
+    #[tokio::test]
+    async fn a_batch_applies_its_commands_in_order() {
+        let (raft, store) = single_node_group().await;
+        let resp = raft
+            .client_write(QueueCommand::Batch(vec![
+                QueueCommand::Enqueue {
+                    body: Bytes::from_static(b"a"),
+                    enqueued_ms: 1,
+                },
+                QueueCommand::Enqueue {
+                    body: Bytes::from_static(b"b"),
+                    enqueued_ms: 2,
+                },
+                QueueCommand::Settle {
+                    msg_id: 1,
+                    requeue: false,
+                },
+                QueueCommand::Settle {
+                    msg_id: 2,
+                    requeue: true,
+                },
+                QueueCommand::Settle {
+                    msg_id: 99,
+                    requeue: false,
+                },
+            ]))
+            .await
+            .expect("committed");
+        assert_eq!(
+            resp.data,
+            QueueResponse::Batch(vec![
+                QueueResponse::Enqueued { msg_id: 1 },
+                QueueResponse::Enqueued { msg_id: 2 },
+                QueueResponse::Settled,
+                QueueResponse::Settled,
+                QueueResponse::NotFound,
+            ])
+        );
+        store.with_state(|s| {
+            assert_eq!(s.messages.len(), 1, "m1 removed, m2 kept");
+            assert_eq!(s.meta_of(2), Some((2, 1)), "m2's failure counted");
+        });
     }
 
     #[tokio::test]

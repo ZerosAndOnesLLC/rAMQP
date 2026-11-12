@@ -107,3 +107,67 @@ pub(crate) fn refuse_publish(name: &str, ack: Option<PublishAck>) {
         None => tracing::warn!(queue = %name, "pre-settled publish dropped: queue full"),
     }
 }
+
+/// Subscribers whose connection was found gone while dispatching to them,
+/// waiting for their in-flight messages to be requeued (issue #54).
+///
+/// A connection forwards its consumers' settlements, then their
+/// `Unsubscribe`, into the queue's mailbox before it goes away — so by the
+/// time a send to it fails, all of that is already queued. Requeuing the
+/// subscriber's in-flight messages at once would get ahead of those
+/// settlements: an accepted message would be requeued, its `Settle(Ack)`
+/// would then match nothing, and the message would be delivered again.
+/// So the requeue waits until the mailbox entries queued at that moment
+/// have been processed (usually the connection's own `Unsubscribe` gets
+/// there first and leaves nothing to do). Without the wait it would still
+/// be needed: a connection that never sends an `Unsubscribe` must not strand
+/// its messages (MED-9).
+#[derive(Debug, Default)]
+pub(crate) struct Orphans(Vec<(SubId, usize)>);
+
+impl Orphans {
+    /// `sub`'s connection is gone; `queued` messages are waiting in the
+    /// mailbox right now.
+    pub(crate) fn defer(&mut self, sub: SubId, queued: usize) {
+        self.0.push((sub, queued));
+    }
+
+    /// One mailbox message has been processed.
+    pub(crate) fn processed_one(&mut self) {
+        for (_, left) in &mut self.0 {
+            *left = left.saturating_sub(1);
+        }
+    }
+
+    /// The subscribers whose wait is over (removed from the set).
+    pub(crate) fn due(&mut self) -> Vec<SubId> {
+        let mut due = Vec::new();
+        self.0.retain(|(sub, left)| {
+            if *left == 0 {
+                due.push(*sub);
+                false
+            } else {
+                true
+            }
+        });
+        due
+    }
+}
+
+#[cfg(test)]
+mod orphan_tests {
+    use super::Orphans;
+
+    #[test]
+    fn an_orphan_waits_for_what_was_queued_before_it() {
+        let mut o = Orphans::default();
+        o.defer(1, 2);
+        o.defer(2, 0);
+        assert_eq!(o.due(), vec![2], "nothing was queued: due at once");
+        assert!(o.due().is_empty());
+        o.processed_one();
+        assert!(o.due().is_empty(), "one of two processed");
+        o.processed_one();
+        assert_eq!(o.due(), vec![1]);
+    }
+}

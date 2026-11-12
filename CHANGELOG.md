@@ -5,6 +5,45 @@ All notable changes to ramqp will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+Broker fixes for the pre-release QA harness's findings (issue #54).
+`ramqp` and `ramqp-core` are unchanged.
+
+**Upgrade note (delivery limits):** a delivery lost with its consumer (the
+link or connection closed before it was settled) now counts as a failed
+attempt, as in RabbitMQ 4.x: it raises `header.delivery-count` and counts
+towards `max_delivery_attempts`. A queue with a delivery limit now
+dead-letters a message whose consumers keep crashing on it (a poison
+message), where before it was redelivered forever.
+
+### Fixed
+- **Accepted messages are no longer redelivered when a consumer leaves**
+  (#54). When a dispatch found a subscriber's connection gone, the queue
+  requeued everything that subscriber held at once — ahead of the accepts
+  its connection had already queued — so those accepted messages were
+  delivered again. It now requeues them only after the mailbox entries
+  queued at that moment are processed. Transient, durable and quorum
+  queues, and the cluster proxy (which also dropped such accepts).
+- **`delivery-count`** counts a delivery lost with its consumer (see the
+  upgrade note).
+- **Per-message TTL** (`header.ttl`, AMQP 1.0 §3.2.1) is honoured: a
+  message whose own TTL ran out by the time it would be dispatched is
+  dead-lettered (reason `expired`) or dropped, on every queue kind. A dead
+  letter loses its `header.ttl`, so it can't expire again in the
+  dead-letter queue (as in RabbitMQ).
+- **`first-acquirer`** is set on a message's first delivery and cleared on
+  any later one. (Leader-local: after a restart or failover a message counts
+  as unacquired again.)
+
+### Changed
+- **Quorum queues write a turn's publishes, acks and failure counts in one
+  log entry** (one fsync). On a real disk a single-producer quorum queue
+  went from about 390 to about 13,900 msg/s (21,800 with four producers):
+  openraft 0.9 appends one client write at a time, so one entry per message
+  meant one fsync per message. Clustered, batching starts once every node
+  supports it (a new capability), so mixed-version clusters keep working.
+
 ## [ramqp-broker 0.12.1] - 2026-11-12
 
 Broker-only release: fixes for issue #50. `ramqp` (0.8.4) and `ramqp-core`
