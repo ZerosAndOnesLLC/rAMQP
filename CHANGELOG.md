@@ -5,10 +5,10 @@ All notable changes to ramqp will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [ramqp-broker 0.13.0] - 2026-11-13
 
-Broker fixes for the pre-release QA harness's findings (issue #54).
-`ramqp` and `ramqp-core` are unchanged.
+Broker-only release: fixes for the pre-release QA harness's findings
+(issue #54). `ramqp` (0.8.4) and `ramqp-core` (0.2.8) are unchanged.
 
 **Upgrade note (delivery limits):** a delivery lost with its consumer (the
 link or connection closed before it was settled) now counts as a failed

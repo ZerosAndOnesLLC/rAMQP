@@ -14,7 +14,7 @@ broker — with no external AMQP dependencies anywhere.
 |---|---|---|
 | [`ramqp`](https://crates.io/crates/ramqp) | The async **client** — connects to RabbitMQ 4.x, ActiveMQ Artemis, and other AMQP 1.0 brokers | Published (0.8.4 — see [Upgrading to 0.8](#upgrading-to-08)) |
 | [`ramqp-core`](https://crates.io/crates/ramqp-core) | The role-agnostic **engine**: clean-room codec + type system, framing, session/link state machines, SASL (both directions) | Published (0.2.8) |
-| [`ramqp-broker`](https://crates.io/crates/ramqp-broker) | The **broker**: store-and-forward AMQP 1.0 server with transient, durable, and Raft-replicated quorum queues | Published (0.12.1, pre-1.0) — see [The broker](#the-broker-ramqp-broker) |
+| [`ramqp-broker`](https://crates.io/crates/ramqp-broker) | The **broker**: store-and-forward AMQP 1.0 server with transient, durable, and Raft-replicated quorum queues | Published (0.13.0, pre-1.0) — see [The broker](#the-broker-ramqp-broker) |
 
 Everything is `#![forbid(unsafe_code)]`, async-first, and MIT.
 
@@ -106,7 +106,7 @@ What's new is *optional*, for your `Cargo.toml` only if you want it:
 ```toml
 ramqp = "0.8"          # the client, exactly as before
 ramqp-core = "0.2"     # just the engine (codec/types/state machines), no client
-ramqp-broker = "0.12"  # embed the broker (working, pre-1.0; config API still settling)
+ramqp-broker = "0.13"  # embed the broker (working, pre-1.0; config API still settling)
 ```
 
 A client-only build never compiles broker code, and vice versa — isolation is
