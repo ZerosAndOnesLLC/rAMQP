@@ -218,6 +218,12 @@ RAMQP_BROKER_ADDRESS=/queues/ramqp_it \
 cargo run -p ramqp-bench-compare --release --bin latency
 ```
 
+Before a release, `qa/prerelease.sh` runs everything in one command: the
+gates, fuzzing, interop, a cross-broker behaviour comparison against
+RabbitMQ 4.x and Artemis, delivery-guarantee workloads (consumer churn,
+coalesced frames, cut connections), `kill -9` crash recovery, benchmarks
+against a per-machine baseline, and a soak. See [`qa/README.md`](qa/README.md).
+
 ## CI & Releases
 
 - **Pull requests** (`ci.yml`) run checks only, on GitHub-hosted `ubuntu-latest`

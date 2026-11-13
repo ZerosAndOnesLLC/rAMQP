@@ -5,13 +5,14 @@
 #   ramqp-core    — role-agnostic engine shared by client and broker (Phase 1 fills it)
 #   ramqp-broker  — the performance-first, HA AMQP 1.0 BROKER (Phase 3+ fills it)
 #   bench-compare — dev-only comparison harness vs fe2o3-amqp
+#   qa            — pre-release QA harness (ramqp-qa; driven by qa/prerelease.sh)
 #
-# `default-members` excludes bench-compare so `cargo build`/`cargo test`/`cargo check`
+# `default-members` excludes bench-compare and qa so `cargo build`/`cargo test`/`cargo check`
 # at the root never pull in its `fe2o3-amqp` dependency; build it explicitly with
 # `-p ramqp-bench-compare`.
 [workspace]
 resolver = "2"
-members = ["ramqp", "ramqp-core", "ramqp-broker", "bench-compare"]
+members = ["ramqp", "ramqp-core", "ramqp-broker", "bench-compare", "qa"]
 default-members = ["ramqp", "ramqp-core", "ramqp-broker"]
 
 # Profiles are workspace-global and must live in the root manifest (not in members).

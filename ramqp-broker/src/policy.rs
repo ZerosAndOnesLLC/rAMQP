@@ -258,7 +258,7 @@ impl EffectivePolicy {
             (Some(target), Some(dlx)) => {
                 let _ = dlx.send(DeadLetter {
                     target: target.clone(),
-                    body,
+                    body: crate::redelivery::without_ttl(body),
                     confirm: None,
                 });
             }
@@ -291,7 +291,7 @@ impl EffectivePolicy {
                 // the receiver resolves immediately and the caller proceeds.
                 let _ = dlx.send(DeadLetter {
                     target: target.clone(),
-                    body,
+                    body: crate::redelivery::without_ttl(body),
                     confirm: Some(confirm),
                 });
                 Some(resolved)

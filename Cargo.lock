@@ -1733,6 +1733,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "ramqp-qa"
+version = "0.0.0"
+dependencies = [
+ "bytes",
+ "clap",
+ "futures-util",
+ "ramqp",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "rand"
 version = "0.8.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"

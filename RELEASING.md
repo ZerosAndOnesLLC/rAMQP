@@ -79,7 +79,13 @@ Other manifest facts worth knowing:
    and sync the dependents' pins as above. Update `CHANGELOG.md`: change the
    `## [X.Y.Z] - unreleased` heading to `## [X.Y.Z] - YYYY-MM-DD` (today's date)
    and confirm the entries are accurate.
-2. `cargo test --all-features && cargo clippy --all-targets --all-features -- -D warnings`
+2. Run the pre-release QA: `qa/prerelease.sh` (quick, ~30-40 min), or
+   `qa/prerelease.sh --full` (~2-3 h) for a release with broker or protocol
+   changes. It covers the gates (fmt, clippy, docs, every test suite, the
+   publish dry-run), fuzzing, interop, cross-broker behaviour, delivery
+   guarantees, crash recovery, benchmarks against this machine's baseline,
+   and a soak. Every stage must pass, or be skipped for a reason you accept.
+   See [`qa/README.md`](qa/README.md).
 3. Dry-run the packaging (catches stripped-path/readme/include mistakes):
    `cargo publish -p ramqp-core --dry-run`, then
    `cargo publish -p ramqp --dry-run`

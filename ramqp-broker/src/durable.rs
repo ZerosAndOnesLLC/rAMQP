@@ -12,14 +12,16 @@
 //! group-commit writer (one fsync per burst, across all durable queues);
 //! the actor never blocks on a commit round trip.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::pin::Pin;
 
 use futures_util::StreamExt;
 use futures_util::stream::FuturesUnordered;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::dispatch::{Subscriber, complete_drains, confirm_publish, pick_ready, refuse_publish};
+use crate::dispatch::{
+    Orphans, Subscriber, complete_drains, confirm_publish, pick_ready, refuse_publish,
+};
 use crate::policy::{EffectivePolicy, now_ms};
 use crate::queue::{ConnCmd, PublishAck, QueueHandle, QueueMsg, SettleOutcome, SubId};
 use crate::store::{Store, StoreOp};
@@ -72,6 +74,9 @@ async fn run(
         .map(|(id, _, ms, len)| (*id, (*ms, *len)))
         .collect();
     // Failed-attempt counters (only entries with failures).
+    // Messages some link has acquired (`first-acquirer` false from then on);
+    // in memory, so after a restart every message counts as unacquired.
+    let mut acquired: HashSet<u64> = HashSet::new();
     let mut failures: HashMap<u64, u32> = recovered
         .iter()
         .filter(|(_, f, _, _)| *f > 0)
@@ -87,6 +92,8 @@ async fn run(
     let mut next_sub_id: SubId = 0;
     let mut rr: usize = 0;
     let mut mailbox_open = true;
+    let mut orphans = Orphans::default();
+    let mut gone: Vec<SubId> = Vec::new();
 
     if !ready.is_empty() {
         tracing::info!(queue = %name, recovered = ready.len(), "durable queue recovered");
@@ -100,6 +107,8 @@ async fn run(
                     continue;
                 };
                 let from_reserved = matches!(msg, QueueMsg::PublishReserved { .. });
+                orphans.processed_one();
+                'handled: {
                 match msg {
                     QueueMsg::Publish { body, ack } | QueueMsg::PublishReserved { body, ack } => {
                         if from_reserved {
@@ -132,7 +141,7 @@ async fn run(
                         // slot was admitted at Reserve time.
                         if needs_room && !from_reserved {
                             refuse_publish(&name, ack);
-                            continue;
+                            break 'handled;
                         }
                         next_msg_id += 1;
                         let msg_id = next_msg_id;
@@ -186,10 +195,10 @@ async fn run(
                     }
                     QueueMsg::Settle { sub, msg_id, outcome } => {
                         if inflight.get(&msg_id).map(|(owner, _, _)| owner) != Some(&sub) {
-                            continue;
+                            break 'handled;
                         }
                         let Some((_, enqueue_time, len)) = inflight.remove(&msg_id) else {
-                            continue;
+                            break 'handled;
                         };
                         match outcome {
                             SettleOutcome::Ack => {
@@ -262,7 +271,7 @@ async fn run(
                         if !purged {
                             tracing::error!(queue = %name, "durable queue purge failed; queue kept");
                             let _ = reply.send(false);
-                            continue;
+                            break 'handled;
                         }
                         crate::queue::notify_deleted(&subs);
                         let _ = reply.send(true);
@@ -272,19 +281,9 @@ async fn run(
                     }
                     QueueMsg::Unsubscribe { sub } => {
                         subs.retain(|s| s.id != sub);
-                        let mut requeued: Vec<(u64, u64, usize)> = Vec::new();
-                        inflight.retain(|msg_id, (owner, ms, len)| {
-                            if *owner == sub {
-                                requeued.push((*msg_id, *ms, *len));
-                                false
-                            } else {
-                                true
-                            }
-                        });
-                        for (id, ms, len) in requeued {
-                            ready.insert(id, (ms, len));
-                        }
+                        requeue_held(&mut ready, &mut inflight, sub);
                     }
+                }
                 }
             }
             Some(done) = commits.next() => {
@@ -300,21 +299,53 @@ async fn run(
             }
         }
 
-        dispatch(
-            &name,
-            &policy,
-            &store,
-            queue_id,
-            &mut inflight,
-            &mut ready,
-            &mut failures,
-            &mut subs,
-            &mut rr,
-            &mut bytes,
-        )
-        .await;
+        // A subscriber found gone has its messages requeued once what is
+        // already in the mailbox has been processed (see `Orphans`).
+        loop {
+            for sub in orphans.due() {
+                requeue_held(&mut ready, &mut inflight, sub);
+            }
+            dispatch(
+                &name,
+                &policy,
+                &store,
+                queue_id,
+                &mut inflight,
+                &mut ready,
+                &mut failures,
+                &mut acquired,
+                &mut subs,
+                &mut rr,
+                &mut bytes,
+                &mut gone,
+            )
+            .await;
+            if gone.is_empty() {
+                break;
+            }
+            for sub in gone.drain(..) {
+                orphans.defer(sub, rx.len());
+            }
+        }
     }
     tracing::debug!(queue = %name, "durable queue actor stopped");
+}
+
+/// Requeue everything `sub` still holds (it unsubscribed, or its connection
+/// is gone).
+fn requeue_held(
+    ready: &mut BTreeMap<u64, (u64, usize)>,
+    inflight: &mut HashMap<u64, (SubId, u64, usize)>,
+    sub: SubId,
+) {
+    inflight.retain(|msg_id, (owner, ms, len)| {
+        if *owner == sub {
+            ready.insert(*msg_id, (*ms, *len));
+            false
+        } else {
+            true
+        }
+    });
 }
 
 /// Dead-letter a stored message, then durably remove the source copy only
@@ -370,10 +401,17 @@ async fn dispatch(
     inflight: &mut HashMap<u64, (SubId, u64, usize)>,
     ready: &mut BTreeMap<u64, (u64, usize)>,
     failures: &mut HashMap<u64, u32>,
+    acquired: &mut HashSet<u64>,
     subs: &mut Vec<Subscriber>,
     rr: &mut usize,
     bytes: &mut usize,
+    gone: &mut Vec<SubId>,
 ) {
+    // Forget acquisitions of messages that are gone (cheap, amortized).
+    if acquired.len() > 2 * (ready.len() + inflight.len()) + 1024 {
+        acquired.retain(|id| ready.contains_key(id) || inflight.contains_key(id));
+    }
+    let now = now_ms();
     // Lazy TTL: expire from the head before dispatching.
     if policy.ttl_ms.is_some() {
         let now = now_ms();
@@ -399,10 +437,20 @@ async fn dispatch(
             ready.remove(&msg_id);
             continue;
         };
-        let body = crate::redelivery::with_delivery_count(
+        // Its own `header.ttl` ran out: dead-letter (or drop) it instead.
+        if crate::redelivery::expired(&body, enqueued_ms, now) {
+            ready.remove(&msg_id);
+            failures.remove(&msg_id);
+            *bytes = bytes.saturating_sub(len);
+            dead_letter_then_remove(name, policy, store, queue_id, msg_id, "expired").await;
+            continue;
+        }
+        let body = crate::redelivery::for_delivery(
             &body,
             failures.get(&msg_id).copied().unwrap_or(0),
+            !acquired.contains(&msg_id),
         );
+        acquired.insert(msg_id);
         ready.remove(&msg_id);
         *rr = (idx + 1) % subs.len();
 
@@ -419,22 +467,13 @@ async fn dispatch(
         if sub.conn.send(cmd).is_ok() {
             inflight.insert(msg_id, (sub_id, enqueued_ms, len));
         } else {
+            // Put this message back and stop dispatching to the subscriber;
+            // what else it holds is requeued once its settlements already in
+            // the mailbox are applied (`Orphans`).
             tracing::debug!(queue = %name, sub = sub_id, "subscriber connection closed");
             ready.insert(msg_id, (enqueued_ms, len));
-            // Requeue everything ELSE the dead subscriber held (MED-9).
-            let mut orphaned: Vec<(u64, u64, usize)> = Vec::new();
-            inflight.retain(|id, (owner, ms, l)| {
-                if *owner == sub_id {
-                    orphaned.push((*id, *ms, *l));
-                    false
-                } else {
-                    true
-                }
-            });
-            for (id, ms, l) in orphaned {
-                ready.insert(id, (ms, l));
-            }
             subs.retain(|s| s.id != sub_id);
+            gone.push(sub_id);
         }
     }
 

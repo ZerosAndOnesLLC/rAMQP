@@ -1,0 +1,116 @@
+[
+  {
+    "consumers": 1,
+    "latency_us": {
+      "max": 993,
+      "p50": 344,
+      "p90": 478,
+      "p99": 683,
+      "p999": 835
+    },
+    "messages": 100000,
+    "mib_per_sec": 47.9405860685316,
+    "msgs_per_sec": 196364.64053670544,
+    "name": "transient-256B-1p1c",
+    "producers": 1,
+    "rate": 0,
+    "secs": 0.509256655,
+    "size": 256,
+    "window": 64
+  },
+  {
+    "consumers": 4,
+    "latency_us": {
+      "max": 2498,
+      "p50": 395,
+      "p90": 600,
+      "p99": 837,
+      "p999": 1613
+    },
+    "messages": 100000,
+    "mib_per_sec": 117.50050857077721,
+    "msgs_per_sec": 481282.08310590347,
+    "name": "transient-256B-4p4c",
+    "producers": 4,
+    "rate": 0,
+    "secs": 0.207778356,
+    "size": 256,
+    "window": 64
+  },
+  {
+    "consumers": 1,
+    "latency_us": {
+      "max": 12203,
+      "p50": 3998,
+      "p90": 6978,
+      "p99": 9162,
+      "p999": 12014
+    },
+    "messages": 5000,
+    "mib_per_sec": 888.4394386699182,
+    "msgs_per_sec": 14215.031018718691,
+    "name": "transient-64KiB-1p1c",
+    "producers": 1,
+    "rate": 0,
+    "secs": 0.351740351,
+    "size": 65536,
+    "window": 64
+  },
+  {
+    "consumers": 1,
+    "latency_us": {
+      "max": 12364,
+      "p50": 73,
+      "p90": 819,
+      "p99": 4560,
+      "p999": 10383
+    },
+    "messages": 20000,
+    "mib_per_sec": 2.4413688665392312,
+    "msgs_per_sec": 9999.846877344691,
+    "name": "transient-256B-rate10k",
+    "producers": 1,
+    "rate": 10000,
+    "secs": 2.000030625,
+    "size": 256,
+    "window": 64
+  },
+  {
+    "consumers": 1,
+    "latency_us": {
+      "max": 2054,
+      "p50": 1163,
+      "p90": 1371,
+      "p99": 1595,
+      "p999": 1863
+    },
+    "messages": 50000,
+    "mib_per_sec": 13.365498547164611,
+    "msgs_per_sec": 54745.08204918625,
+    "name": "durable-256B-1p1c",
+    "producers": 1,
+    "rate": 0,
+    "secs": 0.913324049,
+    "size": 256,
+    "window": 64
+  },
+  {
+    "consumers": 1,
+    "latency_us": {
+      "max": 23583,
+      "p50": 3576,
+      "p90": 7624,
+      "p99": 16191,
+      "p999": 23498
+    },
+    "messages": 50000,
+    "mib_per_sec": 3.5316547461318666,
+    "msgs_per_sec": 14465.657840156126,
+    "name": "quorum-256B-1p1c",
+    "producers": 1,
+    "rate": 0,
+    "secs": 3.456462233,
+    "size": 256,
+    "window": 64
+  }
+]
