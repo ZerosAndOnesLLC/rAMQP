@@ -29,7 +29,6 @@ futures-util = "0.3"
 pin-project-lite = "0.2"
 slab = "0.4"
 url = "2"
-tracing = "0.1"
 
 [features]
 default = []

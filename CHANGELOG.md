@@ -5,6 +5,22 @@ All notable changes to ramqp will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- **Dependency refresh.** `redb` 4 → 5 (store-redb feature). The broker's
+  tables use no `Option<&str|String|bool|char>` columns and no custom
+  `Value` impls, so redb 5's encoding change does not touch them: existing
+  data directories open unchanged, with no code changes needed. redb 5 locks
+  the file with byte-range locks only, so do not open a data directory that
+  a redb-5 broker has open with a build on redb 4.2 or earlier. Also:
+  openraft 0.9.26, clap 4.6.10, and patch updates across `Cargo.lock`.
+  openraft stays on 0.9: 0.10 changes the positional Raft RPC wire layout
+  (`VoteRequest`, `ForwardToLeader`, `StorageError`), so it needs its own
+  migration and a planned cluster upgrade path.
+- `ramqp`: dropped the unused `tracing` dependency (flagged by cargo's
+  unused-dependency lint; nothing in the client used it).
+
 ## [ramqp-broker 0.13.0] - 2026-11-13
 
 Broker-only release: fixes for the pre-release QA harness's findings
